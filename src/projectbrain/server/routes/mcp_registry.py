@@ -80,7 +80,10 @@ def register_mcp(req: RegisterMCPRequest):
             env_vars = {}
             for k, v in os.environ.items():
                 if k.startswith("PB_") or k.startswith("OM_") or k == "GEMINI_API_KEY":
-                    env_vars[k] = v
+                    if (k == "OM_DB_PATH" or k == "PB_DB_PATH") and v:
+                        env_vars[k] = str(Path(v).resolve())
+                    else:
+                        env_vars[k] = v
             # override default user and tags if provided
             if req.user_id:
                 env_vars["PB_DEFAULT_USER_ID"] = req.user_id
