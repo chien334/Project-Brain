@@ -208,6 +208,17 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
         print(f"Codegraph database not found at {db_path}. Checking for 'codegraph' CLI...")
         codegraph_bin = shutil.which("codegraph")
         if not codegraph_bin:
+            # Check if automatic installation is allowed
+            allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
+            if not allow_auto:
+                print(f"Error: Codegraph database not found at {db_path} and 'codegraph' CLI is not installed.")
+                print("Automatic installation of dependencies is disabled for security and compliance.")
+                print("Please install the dependency manually:")
+                print("  npm install -g @colbymchenry/codegraph")
+                print("or with sudo:")
+                print("  sudo npm install -g @colbymchenry/codegraph")
+                sys.exit(1)
+                
             print("'codegraph' CLI not found. Attempting to install it globally via npm...")
             try:
                 res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)

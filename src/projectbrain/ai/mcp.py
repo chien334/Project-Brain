@@ -523,6 +523,18 @@ async def projectbrain_sync_codegraph(
         # Check if codegraph command is available
         codegraph_bin = shutil.which("codegraph")
         if not codegraph_bin:
+            # Check if automatic installation is allowed
+            allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
+            if not allow_auto:
+                return (
+                    f"Error: Codegraph database not found at {db_path} and 'codegraph' CLI is not installed.\n"
+                    f"Automatic installation of dependencies is disabled for security and compliance.\n"
+                    f"Please install the dependency manually using:\n"
+                    f"  npm install -g @colbymchenry/codegraph\n"
+                    f"or, if permissions are required:\n"
+                    f"  sudo npm install -g @colbymchenry/codegraph"
+                )
+            
             # Force install it via npm globally
             try:
                 res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)

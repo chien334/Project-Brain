@@ -130,7 +130,8 @@ async def test_sync_db_missing_cli_missing_install_success(mock_sync, mock_conne
     
     mock_sync.return_value = {"status": "success"}
     
-    res = await projectbrain_sync_codegraph("test-project", "tester")
+    with patch.dict(os.environ, {"PB_ALLOW_AUTO_INSTALL": "true"}):
+        res = await projectbrain_sync_codegraph("test-project", "tester")
     
     # Assertions
     assert mock_which.call_count == 3
@@ -146,8 +147,7 @@ async def test_sync_db_missing_cli_missing_install_success(mock_sync, mock_conne
 @patch("subprocess.run")
 async def test_sync_db_missing_cli_missing_install_fails(mock_run, mock_which, mock_exists):
     """
-    Test scenario: Database and codegraph CLI are missing, and npm install fails (permissions or other errors).
-    It should return a descriptive error instructing the user on how to install manually.
+    Test scenario: Database and codegraph CLI are missing, and npm install fails.
     """
     mock_exists.return_value = False
     mock_which.return_value = None
@@ -158,7 +158,8 @@ async def test_sync_db_missing_cli_missing_install_fails(mock_run, mock_which, m
     mock_npm_res.stderr = "EACCES: permission denied"
     mock_run.return_value = mock_npm_res
     
-    res = await projectbrain_sync_codegraph("test-project", "tester")
+    with patch.dict(os.environ, {"PB_ALLOW_AUTO_INSTALL": "true"}):
+        res = await projectbrain_sync_codegraph("test-project", "tester")
     
     # Assertions
     mock_which.assert_called_once_with("codegraph")
@@ -166,3 +167,24 @@ async def test_sync_db_missing_cli_missing_install_fails(mock_run, mock_which, m
     assert "EACCES" in res
     assert "npm install -g @colbymchenry/codegraph" in res
     assert "sudo npm install" in res
+
+
+@pytest.mark.asyncio
+@patch("os.path.exists")
+@patch("shutil.which")
+@patch("subprocess.run")
+async def test_sync_db_missing_cli_missing_install_disabled(mock_run, mock_which, mock_exists):
+    """
+    Test scenario: Database and codegraph CLI are missing, but auto-install is disabled.
+    It should return a descriptive error without executing any installer.
+    """
+    mock_exists.return_value = False
+    mock_which.return_value = None
+    
+    res = await projectbrain_sync_codegraph("test-project", "tester")
+    
+    # Assertions
+    mock_which.assert_called_once_with("codegraph")
+    mock_run.assert_not_called()
+    assert "Automatic installation of dependencies is disabled" in res
+    assert "npm install -g @colbymchenry/codegraph" in res
