@@ -26,7 +26,7 @@ async def upload_document(
         
         # 1. Parse document to markdown using our utility
         from ...utils.doc_parser import parse_document
-        markdown_content = parse_document(filename, file_bytes)
+        markdown_content = await parse_document(filename, file_bytes)
         
         if not markdown_content.strip():
             raise HTTPException(400, "Document content is empty or could not be parsed.")

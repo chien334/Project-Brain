@@ -4,7 +4,29 @@ import pypdf
 import mammoth
 import markdownify
 
-def pdf_to_markdown(file_bytes: bytes) -> str:
+async def call_ocr_if_available(image_bytes: bytes, mime_type: str) -> str:
+    """Helper to call vision MCP tool to transcribe image content if credentials are set."""
+    try:
+        from extensions_mcp.image_to_markdown.vision_client import extract_text_from_image, DEFAULT_PROMPT
+        from extensions_mcp.image_to_markdown.config import CONFIG
+        
+        # If API key is not present, skip OCR call and fallback to standard placeholder
+        if not getattr(CONFIG, "api_key", None):
+            return "![Image]"
+            
+        ocr_text = await extract_text_from_image(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            prompt=DEFAULT_PROMPT,
+            model=CONFIG.model
+        )
+        if ocr_text:
+            return f"\n\n<!-- Start Embedded Image OCR -->\n{ocr_text.strip()}\n<!-- End Embedded Image OCR -->\n\n"
+    except Exception:
+        pass
+    return "![Image]"
+
+async def pdf_to_markdown(file_bytes: bytes) -> str:
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -33,6 +55,29 @@ def pdf_to_markdown(file_bytes: bytes) -> str:
                                 body_rows = [normalize_row(row) for row in table[1:]]
                                 body = "\n".join(body_rows) if body_rows else ""
                                 text_parts.append(f"\n{header}\n{separator}\n{body}\n")
+                
+                # Extract images and perform OCR if possible
+                if hasattr(page, "images") and page.images:
+                    for img in page.images:
+                        if img.get("width", 0) > 0 and img.get("height", 0) > 0:
+                            try:
+                                x0 = img.get("x0")
+                                top = img.get("top")
+                                x1 = img.get("x1")
+                                bottom = img.get("bottom")
+                                if None not in (x0, top, x1, bottom) and x1 > x0 and bottom > top:
+                                    cropped = page.crop((x0, top, x1, bottom))
+                                    # Convert cropped to PIL image
+                                    img_obj = cropped.to_image(resolution=150)
+                                    pil_img = img_obj.original
+                                    img_buf = io.BytesIO()
+                                    pil_img.save(img_buf, format="PNG")
+                                    img_bytes = img_buf.getvalue()
+                                    
+                                    ocr_result = await call_ocr_if_available(img_bytes, "image/png")
+                                    text_parts.append(ocr_result + "\n")
+                            except Exception:
+                                text_parts.append("![Image]\n")
                                 
             return "\n".join(text_parts)
     except ImportError:
@@ -42,15 +87,32 @@ def pdf_to_markdown(file_bytes: bytes) -> str:
             text_parts = []
             for page_num, page in enumerate(reader.pages):
                 text = page.extract_text()
+                page_text = []
                 if text:
-                    text_parts.append(f"## Page {page_num + 1}\n\n{text}")
+                    page_text.append(text)
+                
+                # Extract images in pypdf if available
+                if hasattr(page, "images") and page.images:
+                    for img_file in page.images:
+                        try:
+                            img_bytes = getattr(img_file, "data", None)
+                            if img_bytes:
+                                name = getattr(img_file, "name", "image.png")
+                                mime_type = "image/jpeg" if name.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                                ocr_result = await call_ocr_if_available(img_bytes, mime_type)
+                                page_text.append(ocr_result)
+                        except Exception:
+                            page_text.append("![Image]\n")
+                
+                if page_text:
+                    text_parts.append(f"## Page {page_num + 1}\n\n" + "\n".join(page_text))
             return "\n\n".join(text_parts)
         except Exception as e:
             raise ValueError(f"Failed to parse PDF: {str(e)}")
     except Exception as e:
         raise ValueError(f"Failed to parse PDF: {str(e)}")
 
-def docx_to_markdown(file_bytes: bytes) -> str:
+async def docx_to_markdown(file_bytes: bytes) -> str:
     try:
         file_obj = io.BytesIO(file_bytes)
         result = mammoth.convert_to_html(file_obj)
@@ -60,7 +122,7 @@ def docx_to_markdown(file_bytes: bytes) -> str:
     except Exception as e:
         raise ValueError(f"Failed to parse DOCX: {str(e)}")
 
-def excel_to_markdown(file_bytes: bytes) -> str:
+async def excel_to_markdown(file_bytes: bytes) -> str:
     try:
         import openpyxl
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
@@ -103,7 +165,7 @@ def excel_to_markdown(file_bytes: bytes) -> str:
     except Exception as e:
         raise ValueError(f"Failed to parse Excel: {str(e)}")
 
-def pptx_to_markdown(file_bytes: bytes) -> str:
+async def pptx_to_markdown(file_bytes: bytes) -> str:
     try:
         from pptx import Presentation
         prs = Presentation(io.BytesIO(file_bytes))
@@ -132,23 +194,29 @@ def pptx_to_markdown(file_bytes: bytes) -> str:
                             markdown_text.append(f"{prefix}{para_text}")
                         markdown_text.append("")
                 elif hasattr(shape, 'image'):
-                    markdown_text.append("![Image]\n")
+                    try:
+                        img_bytes = shape.image.blob
+                        mime_type = shape.image.content_type
+                        ocr_result = await call_ocr_if_available(img_bytes, mime_type)
+                        markdown_text.append(ocr_result)
+                    except Exception:
+                        markdown_text.append("![Image]\n")
         return "\n".join(markdown_text).strip()
     except ImportError:
         return "PowerPoint parsing requires 'python-pptx'. Run: pip install python-pptx"
     except Exception as e:
         raise ValueError(f"Failed to parse PPTX: {str(e)}")
 
-def parse_document(filename: str, file_bytes: bytes) -> str:
+async def parse_document(filename: str, file_bytes: bytes) -> str:
     _, ext = os.path.splitext(filename.lower())
     if ext == ".pdf":
-        return pdf_to_markdown(file_bytes)
+        return await pdf_to_markdown(file_bytes)
     elif ext == ".docx":
-        return docx_to_markdown(file_bytes)
+        return await docx_to_markdown(file_bytes)
     elif ext in [".xlsx", ".xls"]:
-        return excel_to_markdown(file_bytes)
+        return await excel_to_markdown(file_bytes)
     elif ext == ".pptx":
-        return pptx_to_markdown(file_bytes)
+        return await pptx_to_markdown(file_bytes)
     elif ext in [".txt", ".md", ".json", ".yml", ".yaml", ".ini", ".conf"]:
         return file_bytes.decode("utf-8", errors="ignore")
     else:

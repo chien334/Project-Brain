@@ -214,8 +214,9 @@ async def test_plan_execution_phases_fallback(mock_open, mock_exists, mock_run_p
 
 from projectbrain.utils.doc_parser import parse_document
 
+@pytest.mark.asyncio
 @patch("pdfplumber.open")
-def test_parse_pdf_via_doc_parser(mock_pdfplumber_open):
+async def test_parse_pdf_via_doc_parser(mock_pdfplumber_open):
     # Mock pdfplumber structures
     mock_pdf = MagicMock()
     mock_page = MagicMock()
@@ -224,13 +225,14 @@ def test_parse_pdf_via_doc_parser(mock_pdfplumber_open):
     mock_pdf.pages = [mock_page]
     mock_pdfplumber_open.return_value.__enter__.return_value = mock_pdf
     
-    res = parse_document("test.pdf", b"pdfbytes")
+    res = await parse_document("test.pdf", b"pdfbytes")
     assert "Page 1" in res or "Page 2" not in res
     assert "hello pdf" in res
     assert "header | val" in res
 
+@pytest.mark.asyncio
 @patch("openpyxl.load_workbook")
-def test_parse_excel_via_doc_parser(mock_load_workbook):
+async def test_parse_excel_via_doc_parser(mock_load_workbook):
     mock_wb = MagicMock()
     mock_wb.sheetnames = ["Sheet1"]
     mock_ws = MagicMock()
@@ -238,13 +240,14 @@ def test_parse_excel_via_doc_parser(mock_load_workbook):
     mock_wb.__getitem__.return_value = mock_ws
     mock_load_workbook.return_value = mock_wb
     
-    res = parse_document("test.xlsx", b"excelbytes")
+    res = await parse_document("test.xlsx", b"excelbytes")
     assert "Sheet: Sheet1" in res
     assert "col1 | col2" in res
     assert "v1 | v2" in res
 
+@pytest.mark.asyncio
 @patch("pptx.Presentation")
-def test_parse_pptx_via_doc_parser(mock_presentation):
+async def test_parse_pptx_via_doc_parser(mock_presentation):
     mock_prs = MagicMock()
     mock_slide = MagicMock()
     mock_shape = MagicMock()
@@ -257,8 +260,120 @@ def test_parse_pptx_via_doc_parser(mock_presentation):
     mock_prs.slides = [mock_slide]
     mock_presentation.return_value = mock_prs
     
-    res = parse_document("test.pptx", b"pptxbytes")
+    res = await parse_document("test.pptx", b"pptxbytes")
     assert "Slide 1" in res
     assert "Slide Title" in res
+
+@pytest.mark.asyncio
+@patch("extensions_mcp.image_to_markdown.vision_client.extract_text_from_image", new_callable=AsyncMock)
+@patch("pdfplumber.open")
+async def test_pdf_with_image_ocr(mock_pdfplumber_open, mock_extract):
+    mock_pdf = MagicMock()
+    mock_page = MagicMock()
+    mock_page.extract_text.return_value = "PDF text content"
+    mock_page.extract_tables.return_value = []
+    
+    mock_img = {"width": 10, "height": 10, "x0": 0, "top": 0, "x1": 10, "bottom": 10}
+    mock_page.images = [mock_img]
+    
+    mock_crop = MagicMock()
+    mock_crop.to_image.return_value.original = MagicMock()
+    mock_page.crop.return_value = mock_crop
+    
+    mock_pdf.pages = [mock_page]
+    mock_pdfplumber_open.return_value.__enter__.return_value = mock_pdf
+    
+    mock_extract.return_value = "Extracted Image Text Markdown!"
+    
+    from extensions_mcp.image_to_markdown.config import Config
+    mock_config = Config("gemini", "mock-api-key", None, "gemini-3.1-pro-preview", 3)
+    with patch("extensions_mcp.image_to_markdown.config.CONFIG", mock_config):
+        res = await parse_document("test.pdf", b"pdfbytes")
+            
+    assert "PDF text content" in res
+    assert "Extracted Image Text Markdown!" in res
+    mock_extract.assert_called_once()
+
+@pytest.mark.asyncio
+@patch("extensions_mcp.image_to_markdown.vision_client.extract_text_from_image", new_callable=AsyncMock)
+@patch("pptx.Presentation")
+async def test_pptx_with_image_ocr(mock_presentation, mock_extract):
+    mock_prs = MagicMock()
+    mock_slide = MagicMock()
+    mock_shape = MagicMock()
+    mock_shape.has_text_frame = False
+    
+    mock_image = MagicMock()
+    mock_image.blob = b"fake-image-bytes"
+    mock_image.content_type = "image/png"
+    mock_shape.image = mock_image
+    mock_shape.top = 10
+    
+    mock_slide.shapes = [mock_shape]
+    mock_prs.slides = [mock_slide]
+    mock_presentation.return_value = mock_prs
+    
+    mock_extract.return_value = "PPTX OCR Text!"
+    
+    from extensions_mcp.image_to_markdown.config import Config
+    mock_config = Config("gemini", "mock-api-key", None, "gemini-3.1-pro-preview", 3)
+    with patch("extensions_mcp.image_to_markdown.config.CONFIG", mock_config):
+        res = await parse_document("test.pptx", b"pptxbytes")
+            
+    assert "PPTX OCR Text!" in res
+    mock_extract.assert_called_once()
+
+@pytest.mark.asyncio
+@patch("pptx.Presentation")
+async def test_pptx_image_ocr_fallback(mock_presentation):
+    mock_prs = MagicMock()
+    mock_slide = MagicMock()
+    mock_shape = MagicMock()
+    mock_shape.has_text_frame = False
+    
+    mock_image = MagicMock()
+    mock_image.blob = b"fake-image-bytes"
+    mock_image.content_type = "image/png"
+    mock_shape.image = mock_image
+    mock_shape.top = 10
+    
+    mock_slide.shapes = [mock_shape]
+    mock_prs.slides = [mock_slide]
+    mock_presentation.return_value = mock_prs
+    
+    from extensions_mcp.image_to_markdown.config import Config
+    mock_config = Config("gemini", "", None, "gemini-3.1-pro-preview", 3)
+    with patch("extensions_mcp.image_to_markdown.config.CONFIG", mock_config):
+        res = await parse_document("test.pptx", b"pptxbytes")
+        
+    assert "![Image]" in res
+
+@pytest.mark.asyncio
+@patch("extensions_mcp.image_to_markdown.vision_client.extract_text_from_image", new_callable=AsyncMock)
+@patch("pptx.Presentation")
+async def test_pptx_image_ocr_exception_fallback(mock_presentation, mock_extract):
+    mock_prs = MagicMock()
+    mock_slide = MagicMock()
+    mock_shape = MagicMock()
+    mock_shape.has_text_frame = False
+    
+    mock_image = MagicMock()
+    mock_image.blob = b"fake-image-bytes"
+    mock_image.content_type = "image/png"
+    mock_shape.image = mock_image
+    mock_shape.top = 10
+    
+    mock_slide.shapes = [mock_shape]
+    mock_prs.slides = [mock_slide]
+    mock_presentation.return_value = mock_prs
+    
+    mock_extract.side_effect = Exception("API connection error")
+    
+    from extensions_mcp.image_to_markdown.config import Config
+    mock_config = Config("gemini", "some-key", None, "gemini-3.1-pro-preview", 3)
+    with patch("extensions_mcp.image_to_markdown.config.CONFIG", mock_config):
+        res = await parse_document("test.pptx", b"pptxbytes")
+        
+    assert "![Image]" in res
 
 
