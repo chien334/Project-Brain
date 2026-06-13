@@ -105,7 +105,7 @@ async def run_batch_scan_logic(project_root, project_id):
         return {"status": "success", "processed": 0, "message": "No functions found to scan."}
         
     api_key = os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
-    model = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+    model = os.getenv("LLM_MODEL", "gemma-4-26b-a4b-it")
     
     drafts = []
     for fn in functions:

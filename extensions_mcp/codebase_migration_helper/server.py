@@ -12,7 +12,7 @@ async def call_gemini(prompt: str, system_instruction: str = None) -> str:
     if not api_key:
         raise ValueError("Missing LLM_API_KEY or GEMINI_API_KEY in environment.")
         
-    model = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+    model = os.getenv("LLM_MODEL", "gemma-4-26b-a4b-it")
     if "models/" not in model:
         model = f"models/{model}"
         
