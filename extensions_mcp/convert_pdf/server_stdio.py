@@ -346,15 +346,22 @@ async def pdf_convert_to_markdown(
     On error returns: "Error: <message>"
     """
     try:
-        if include_images and not images_dir:
-            return "Error: images_dir is required when include_images is True"
+        import sys
+        from pathlib import Path
+        project_root = str(Path(__file__).resolve().parents[2])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+            
+        from projectbrain.utils.doc_parser import pdf_to_markdown
         
-        markdown = _pdf_to_markdown(
-            file_path,
-            include_tables=include_tables,
-            include_images=include_images,
-            images_dir=images_dir
-        )
+        path = Path(file_path).resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+            
+        with open(path, "rb") as f:
+            file_bytes = f.read()
+            
+        markdown = await pdf_to_markdown(file_bytes)
         return markdown
     except (FileNotFoundError, ValueError) as e:
         return f"Error: {e}"

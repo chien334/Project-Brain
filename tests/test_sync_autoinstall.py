@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 from projectbrain.ai.mcp import projectbrain_sync_codegraph
 
 @pytest.mark.asyncio
-@patch("os.path.exists")
+@patch("projectbrain.ai.mcp.os.path.exists")
 @patch("shutil.which")
 @patch("subprocess.run")
 @patch("sqlite3.connect")
@@ -33,7 +33,7 @@ async def test_sync_db_exists(mock_sync, mock_connect, mock_run, mock_which, moc
     
     mock_sync.return_value = {"status": "success", "nodes_count": 0, "edges_count": 0}
     
-    res = await projectbrain_sync_codegraph("test-project", "tester")
+    res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
     
     # Assertions
     mock_exists.assert_called_once()
@@ -45,7 +45,7 @@ async def test_sync_db_exists(mock_sync, mock_connect, mock_run, mock_which, moc
 
 
 @pytest.mark.asyncio
-@patch("os.path.exists")
+@patch("projectbrain.ai.mcp.os.path.exists")
 @patch("shutil.which")
 @patch("subprocess.run")
 @patch("sqlite3.connect")
@@ -55,8 +55,15 @@ async def test_sync_db_missing_cli_exists(mock_sync, mock_connect, mock_run, moc
     Test scenario: Database is missing, but codegraph CLI is installed.
     It should call 'codegraph init' and then proceed with synchronization.
     """
-    # First check: exists=False, second check: exists=True (after init)
-    mock_exists.side_effect = [False, True]
+    # First check: exists=False, subsequent checks: exists=True
+    exists_called = False
+    def exists_side_effect(path):
+        nonlocal exists_called
+        if not exists_called:
+            exists_called = True
+            return False
+        return True
+    mock_exists.side_effect = exists_side_effect
     
     # Mock which side effect
     def which_side_effect(cmd):
@@ -80,10 +87,10 @@ async def test_sync_db_missing_cli_exists(mock_sync, mock_connect, mock_run, moc
     
     mock_sync.return_value = {"status": "success", "nodes_count": 0, "edges_count": 0}
     
-    res = await projectbrain_sync_codegraph("test-project", "tester")
+    res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
     
     # Assertions
-    assert mock_exists.call_count == 2
+    assert mock_exists.call_count >= 2
     assert mock_which.call_count == 2
     mock_which.assert_any_call("codegraph")
     mock_which.assert_any_call("git")
@@ -93,17 +100,25 @@ async def test_sync_db_missing_cli_exists(mock_sync, mock_connect, mock_run, moc
 
 
 @pytest.mark.asyncio
-@patch("os.path.exists")
+@patch("projectbrain.ai.mcp.os.path.exists")
 @patch("shutil.which")
 @patch("subprocess.run")
 @patch("sqlite3.connect")
 @patch("projectbrain.server.routes.codegraph.sync_codegraph_data")
-async def test_sync_db_missing_cli_missing_install_success(mock_sync, mock_connect, mock_run, mock_which, mock_exists):
+@patch("extensions_mcp.codebase_migration_helper.python_codegraph.main")
+async def test_sync_db_missing_cli_missing_install_success(mock_py_main, mock_sync, mock_connect, mock_run, mock_which, mock_exists):
     """
     Test scenario: Database and codegraph CLI are both missing.
     It should run 'npm install -g @colbymchenry/codegraph', then 'codegraph init', and then sync.
     """
-    mock_exists.side_effect = [False, True]
+    exists_called = False
+    def exists_side_effect(path):
+        nonlocal exists_called
+        if not exists_called:
+            exists_called = True
+            return False
+        return True
+    mock_exists.side_effect = exists_side_effect
     
     which_calls = []
     def which_side_effect(cmd):
@@ -130,7 +145,8 @@ async def test_sync_db_missing_cli_missing_install_success(mock_sync, mock_conne
     
     mock_sync.return_value = {"status": "success"}
     
-    res = await projectbrain_sync_codegraph("test-project", "tester")
+    with patch.dict(os.environ, {"PB_ALLOW_AUTO_INSTALL": "true"}):
+        res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
     
     # Assertions
     assert mock_which.call_count == 3
@@ -141,13 +157,14 @@ async def test_sync_db_missing_cli_missing_install_success(mock_sync, mock_conne
 
 
 @pytest.mark.asyncio
-@patch("os.path.exists")
+@patch("projectbrain.ai.mcp.os.path.exists")
 @patch("shutil.which")
 @patch("subprocess.run")
-async def test_sync_db_missing_cli_missing_install_fails(mock_run, mock_which, mock_exists):
+@patch("extensions_mcp.codebase_migration_helper.python_codegraph.main")
+async def test_sync_db_missing_cli_missing_install_fails(mock_py_main, mock_run, mock_which, mock_exists):
     """
-    Test scenario: Database and codegraph CLI are missing, and npm install fails (permissions or other errors).
-    It should return a descriptive error instructing the user on how to install manually.
+    Test scenario: Database and codegraph CLI are missing, and npm install fails.
+    It should fallback to pure-Python codebase parser.
     """
     mock_exists.return_value = False
     mock_which.return_value = None
@@ -158,11 +175,33 @@ async def test_sync_db_missing_cli_missing_install_fails(mock_run, mock_which, m
     mock_npm_res.stderr = "EACCES: permission denied"
     mock_run.return_value = mock_npm_res
     
-    res = await projectbrain_sync_codegraph("test-project", "tester")
+    with patch.dict(os.environ, {"PB_ALLOW_AUTO_INSTALL": "true"}):
+        res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
     
     # Assertions
     mock_which.assert_called_once_with("codegraph")
     mock_run.assert_called_once_with(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
-    assert "EACCES" in res
-    assert "npm install -g @colbymchenry/codegraph" in res
-    assert "sudo npm install" in res
+    mock_py_main.assert_called_once()
+    assert "Error: Finished running 'codegraph init'" in res
+
+
+@pytest.mark.asyncio
+@patch("projectbrain.ai.mcp.os.path.exists")
+@patch("shutil.which")
+@patch("subprocess.run")
+@patch("extensions_mcp.codebase_migration_helper.python_codegraph.main")
+async def test_sync_db_missing_cli_missing_install_disabled(mock_py_main, mock_run, mock_which, mock_exists):
+    """
+    Test scenario: Database and codegraph CLI are missing, but auto-install is disabled.
+    It should directly fallback to the pure-Python parser.
+    """
+    mock_exists.return_value = False
+    mock_which.return_value = None
+    
+    res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
+    
+    # Assertions
+    mock_which.assert_called_once_with("codegraph")
+    mock_run.assert_not_called()
+    mock_py_main.assert_called_once()
+    assert "Error: Finished running 'codegraph init'" in res

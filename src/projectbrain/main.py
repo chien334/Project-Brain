@@ -208,36 +208,66 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
         print(f"Codegraph database not found at {db_path}. Checking for 'codegraph' CLI...")
         codegraph_bin = shutil.which("codegraph")
         if not codegraph_bin:
-            print("'codegraph' CLI not found. Attempting to install it globally via npm...")
-            try:
-                res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
-                if res.returncode != 0:
-                    print(f"Error: Automatic global installation of 'codegraph' CLI failed with exit code {res.returncode}.")
-                    print(f"Stdout: {res.stdout}")
-                    print(f"Stderr: {res.stderr}")
-                    print("Please install it manually: npm install -g @colbymchenry/codegraph (or with sudo)")
+            # Check if automatic installation is allowed
+            allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
+            if not allow_auto:
+                print("Automatic installation of dependencies is disabled. Falling back to pure-Python codebase parser...")
+                try:
+                    from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                    run_python_parser(target_dir)
+                    print(f"Successfully generated database fallback using pure-Python parser at {db_path}.")
+                except Exception as py_err:
+                    print(f"Error: Codegraph database not found at {db_path} and 'codegraph' CLI is not installed.")
+                    print(f"Attempted to fallback to the pure-Python codebase parser but failed: {str(py_err)}")
+                    print("Please install the dependency manually:")
+                    print("  npm install -g @colbymchenry/codegraph")
                     sys.exit(1)
-                codegraph_bin = shutil.which("codegraph")
-                if not codegraph_bin:
-                    print("Error: Successfully installed 'codegraph' via npm, but 'codegraph' command is still not found in PATH.")
-                    print("Please verify your npm global bin folder is in your PATH.")
-                    sys.exit(1)
-            except Exception as inst_err:
-                print(f"Error attempting to install 'codegraph' CLI: {str(inst_err)}")
-                sys.exit(1)
+            else:
+                print("'codegraph' CLI not found. Attempting to install it globally via npm...")
+                try:
+                    res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
+                    if res.returncode != 0:
+                        print(f"Warning: Automatic global installation of 'codegraph' CLI failed with exit code {res.returncode}. Falling back to Python parser...")
+                        try:
+                            from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                            run_python_parser(target_dir)
+                            print(f"Successfully generated database fallback using pure-Python parser at {db_path}.")
+                        except Exception as py_err:
+                            print(f"Error: Python fallback failed: {str(py_err)}")
+                            print("Please install it manually: npm install -g @colbymchenry/codegraph (or with sudo)")
+                            sys.exit(1)
+                    else:
+                        codegraph_bin = shutil.which("codegraph")
+                        if not codegraph_bin:
+                            print("Warning: Installed 'codegraph' successfully, but not found in PATH. Falling back to Python parser...")
+                            try:
+                                from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                                run_python_parser(target_dir)
+                            except Exception as py_err:
+                                print(f"Error: Python fallback failed: {str(py_err)}")
+                                sys.exit(1)
+                except Exception as inst_err:
+                    print(f"Warning: Failed to install 'codegraph' CLI: {str(inst_err)}. Falling back to Python parser...")
+                    try:
+                        from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                        run_python_parser(target_dir)
+                    except Exception as py_err:
+                        print(f"Error: Python fallback failed: {str(py_err)}")
+                        sys.exit(1)
         
-        target_dir = project_path if (project_path and os.path.isdir(project_path)) else os.getcwd()
-        print(f"Initializing codegraph database in directory '{target_dir}' using '{codegraph_bin} init'...")
-        try:
-            res_init = subprocess.run([codegraph_bin, "init"], cwd=target_dir, capture_output=True, text=True)
-            if res_init.returncode != 0:
-                print(f"Error running 'codegraph init' (exit code {res_init.returncode}):")
-                print(f"Stdout: {res_init.stdout}")
-                print(f"Stderr: {res_init.stderr}")
+        # Now run 'codegraph init' in the project directory if we have codegraph_bin and database is still missing
+        if codegraph_bin and not os.path.exists(db_path):
+            print(f"Initializing codegraph database in directory '{target_dir}' using '{codegraph_bin} init'...")
+            try:
+                res_init = subprocess.run([codegraph_bin, "init"], cwd=target_dir, capture_output=True, text=True)
+                if res_init.returncode != 0:
+                    print(f"Error running 'codegraph init' (exit code {res_init.returncode}):")
+                    print(f"Stdout: {res_init.stdout}")
+                    print(f"Stderr: {res_init.stderr}")
+                    sys.exit(1)
+            except Exception as init_err:
+                print(f"Error executing 'codegraph init' in directory {target_dir}: {str(init_err)}")
                 sys.exit(1)
-        except Exception as init_err:
-            print(f"Error running 'codegraph init': {str(init_err)}")
-            sys.exit(1)
             
         if not os.path.exists(db_path):
             print(f"Error: 'codegraph init' completed but database file was still not found at {db_path}.")

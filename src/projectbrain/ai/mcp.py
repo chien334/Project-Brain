@@ -520,50 +520,79 @@ async def projectbrain_sync_codegraph(
         db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
         
     if not os.path.exists(db_path):
+        python_parser_run = False
         # Check if codegraph command is available
         codegraph_bin = shutil.which("codegraph")
         if not codegraph_bin:
-            # Force install it via npm globally
-            try:
-                res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
-                if res.returncode != 0:
+            # Check if automatic installation is allowed
+            allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
+            if not allow_auto:
+                # Fallback: Run pure-Python codebase parser
+                try:
+                    from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                    run_python_parser(resolved_project_path)
+                    python_parser_run = True
+                except Exception as py_err:
                     return (
-                        f"Error: Codegraph database not found at {db_path}.\n"
-                        f"Automatic installation of 'codegraph' CLI failed with exit code {res.returncode}.\n"
-                        f"Command: npm install -g @colbymchenry/codegraph\n"
-                        f"Stdout: {res.stdout}\n"
-                        f"Stderr: {res.stderr}\n"
-                        f"Please install it manually using:\n"
-                        f"  npm install -g @colbymchenry/codegraph\n"
-                        f"or, if permissions are required:\n"
-                        f"  sudo npm install -g @colbymchenry/codegraph"
+                        f"Error: Codegraph database not found at {db_path} and 'codegraph' CLI is not installed.\n"
+                        f"Attempted to fallback to the pure-Python codebase parser but failed: {str(py_err)}.\n"
+                        f"Please install the dependency manually using:\n"
+                        f"  npm install -g @colbymchenry/codegraph"
                     )
-                # Re-check PATH
-                codegraph_bin = shutil.which("codegraph")
-                if not codegraph_bin:
-                    return (
-                        f"Error: Codegraph database not found at {db_path}.\n"
-                        f"Successfully ran 'npm install -g @colbymchenry/codegraph' but the 'codegraph' executable is still not found in your PATH.\n"
-                        f"Please ensure your npm global bin directory is included in your system's PATH."
-                    )
-            except Exception as inst_err:
-                return (
-                    f"Error: Codegraph database not found at {db_path}.\n"
-                    f"Attempted to install 'codegraph' CLI but encountered an error: {str(inst_err)}.\n"
-                    f"Please manually install it: npm install -g @colbymchenry/codegraph"
-                )
+            else:
+                # Force install it via npm globally
+                try:
+                    res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
+                    if res.returncode != 0:
+                        # Fallback to pure-Python parser if npm install fails
+                        try:
+                            from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                            run_python_parser(resolved_project_path)
+                            python_parser_run = True
+                        except Exception as py_err:
+                            return (
+                                f"Error: Codegraph database not found at {db_path}.\n"
+                                f"Automatic installation of 'codegraph' CLI failed, and Python fallback failed: {str(py_err)}.\n"
+                                f"Please install manually: npm install -g @colbymchenry/codegraph"
+                            )
+                    else:
+                        # Re-check PATH
+                        codegraph_bin = shutil.which("codegraph")
+                        if not codegraph_bin:
+                            # Fallback
+                            try:
+                                from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                                run_python_parser(resolved_project_path)
+                                python_parser_run = True
+                            except Exception as py_err:
+                                return (
+                                    f"Error: 'codegraph' executable is still not found in PATH.\n"
+                                    f"Fallback to Python codebase parser failed: {str(py_err)}."
+                                )
+                except Exception as inst_err:
+                    # Fallback
+                    try:
+                        from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                        run_python_parser(resolved_project_path)
+                        python_parser_run = True
+                    except Exception as py_err:
+                        return (
+                            f"Error: Codegraph database not found at {db_path}.\n"
+                            f"Attempted to install 'codegraph' CLI but failed: {str(inst_err)}, and Python fallback failed: {str(py_err)}."
+                        )
         
-        # Now we have codegraph_bin, let's run 'codegraph init' in the project directory
-        try:
-            res_init = subprocess.run([codegraph_bin, "init"], cwd=resolved_project_path, capture_output=True, text=True)
-            if res_init.returncode != 0:
-                return (
-                    f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}) in directory {resolved_project_path}.\n"
-                    f"Stdout: {res_init.stdout}\n"
-                    f"Stderr: {res_init.stderr}"
-                )
-        except Exception as init_err:
-            return f"Error executing 'codegraph init' in directory {resolved_project_path}: {str(init_err)}"
+        # Now run 'codegraph init' in the project directory if we have codegraph_bin and did not run the python parser
+        if codegraph_bin and not python_parser_run:
+            try:
+                res_init = subprocess.run([codegraph_bin, "init"], cwd=resolved_project_path, capture_output=True, text=True)
+                if res_init.returncode != 0:
+                    return (
+                        f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}) in directory {resolved_project_path}.\n"
+                        f"Stdout: {res_init.stdout}\n"
+                        f"Stderr: {res_init.stderr}"
+                    )
+            except Exception as init_err:
+                return f"Error executing 'codegraph init' in directory {resolved_project_path}: {str(init_err)}"
             
         # Re-check db path existence
         if not os.path.exists(db_path):
@@ -733,6 +762,64 @@ async def projectbrain_diff_project_versions(base_project_id: str, target_projec
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error performing project comparison: {str(e)}"
+
+@mcp_server.tool(name="projectbrain_register_mcp", description="Register or update the projectbrain MCP server in Claude Desktop config.")
+async def projectbrain_register_mcp_tool(
+    transport_type: str,
+    user_id: str = "default",
+    tags: str = "source:mcp",
+    sse_url: str = "http://localhost:8080/mcp/sse"
+) -> str:
+    """
+    Register or update the projectbrain MCP server in Claude Desktop config.
+    
+    Args:
+        transport_type: 'stdio' or 'sse'
+        user_id: The default user ID/project ID.
+        tags: Tags associated with the connection.
+        sse_url: The SSE endpoint URL (if sse transport type is used).
+    """
+    try:
+        from ..server.routes.mcp_registry import register_mcp, RegisterMCPRequest
+        req = RegisterMCPRequest(
+            transport_type=transport_type,
+            user_id=user_id,
+            tags=tags,
+            sse_url=sse_url
+        )
+        res = register_mcp(req)
+        return json.dumps(res, indent=2)
+    except Exception as e:
+        return f"Error registering MCP server: {str(e)}"
+
+@mcp_server.tool(name="projectbrain_register_external_mcp", description="Register or update an external/backup MCP server in Claude Desktop config.")
+async def projectbrain_register_external_mcp_tool(
+    name: str,
+    command: str,
+    args: list = None,
+    env: dict = None
+) -> str:
+    """
+    Register or update an external/backup MCP server in Claude Desktop config.
+    
+    Args:
+        name: Name of the external MCP server.
+        command: Command to run (e.g. 'npx', 'python3').
+        args: Command arguments list.
+        env: Dictionary of environment variables.
+    """
+    try:
+        from ..server.routes.mcp_registry import save_external_mcp_server, ExternalMCPRequest
+        req = ExternalMCPRequest(
+            name=name,
+            command=command,
+            args=args or [],
+            env=env or {}
+        )
+        res = save_external_mcp_server(req)
+        return json.dumps(res, indent=2)
+    except Exception as e:
+        return f"Error registering external MCP server: {str(e)}"
 
 # Dynamically register custom extensions
 try:

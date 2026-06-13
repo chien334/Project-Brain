@@ -104,39 +104,23 @@ async def extract_images(params: ExtractImagesInput) -> str:
 async def to_markdown(params: PptxFilePath) -> str:
     """Converts a PPTX file to a Markdown document."""
     try:
-        prs = Presentation(params.file_path)
-        markdown_text = ""
-        for i, slide in enumerate(prs.slides):
-            markdown_text += f"\n\n## Slide {i+1}\n\n"
+        import sys
+        from pathlib import Path
+        project_root = str(Path(__file__).resolve().parents[2])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
             
-            shapes = sorted(slide.shapes, key=lambda x: x.top)
-
-            for shape in shapes:
-                if shape.has_text_frame:
-                    if shape.is_placeholder and shape.placeholder_format.type in [1, 13, 14, 15, 16]:
-                         if shape.text:
-                            markdown_text += f"# {shape.text}\n\n"
-                    else:
-                        for paragraph in shape.text_frame.paragraphs:
-                            para_text = "".join(run.text for run in paragraph.runs)
-                            text = para_text.strip()
-                            if not text:
-                                continue
-                            
-                            prefix = ""
-                            if paragraph.level > 0:
-                                prefix = "  " * paragraph.level + "* "
-                            elif text.startswith(('•', '–', '-')):
-                                prefix = "* "
-                                text = text[1:].lstrip()
-
-                            markdown_text += f"{prefix}{text}\n"
-                        markdown_text += "\n"
-
-                elif hasattr(shape, 'image'):
-                    markdown_text += f"![Image]\n\n"
-
-        return markdown_text.strip()
+        from projectbrain.utils.doc_parser import pptx_to_markdown
+        
+        path = Path(params.file_path).resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+            
+        with open(path, "rb") as f:
+            file_bytes = f.read()
+            
+        markdown = await pptx_to_markdown(file_bytes)
+        return markdown
     except Exception as e:
         return f"Error converting {params.file_path} to Markdown: {e}"
 
