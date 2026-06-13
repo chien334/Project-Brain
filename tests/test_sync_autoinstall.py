@@ -17,6 +17,13 @@ async def test_sync_db_exists(mock_sync, mock_connect, mock_run, mock_which, moc
     """
     mock_exists.return_value = True
     
+    # Mock which to return None for git
+    def which_side_effect(cmd):
+        if cmd == "git":
+            return None
+        return "/mock/bin/codegraph"
+    mock_which.side_effect = which_side_effect
+    
     # Mock sqlite3 query results
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
@@ -30,7 +37,7 @@ async def test_sync_db_exists(mock_sync, mock_connect, mock_run, mock_which, moc
     
     # Assertions
     mock_exists.assert_called_once()
-    mock_which.assert_not_called()
+    mock_which.assert_called_once_with("git")
     mock_run.assert_not_called()
     mock_connect.assert_called_once()
     mock_sync.assert_called_once()
@@ -50,7 +57,13 @@ async def test_sync_db_missing_cli_exists(mock_sync, mock_connect, mock_run, moc
     """
     # First check: exists=False, second check: exists=True (after init)
     mock_exists.side_effect = [False, True]
-    mock_which.return_value = "/mock/bin/codegraph"
+    
+    # Mock which side effect
+    def which_side_effect(cmd):
+        if cmd == "git":
+            return None
+        return "/mock/bin/codegraph"
+    mock_which.side_effect = which_side_effect
     
     # Mock successful run of 'codegraph init'
     mock_run_res = MagicMock()
@@ -71,7 +84,9 @@ async def test_sync_db_missing_cli_exists(mock_sync, mock_connect, mock_run, moc
     
     # Assertions
     assert mock_exists.call_count == 2
-    mock_which.assert_called_once_with("codegraph")
+    assert mock_which.call_count == 2
+    mock_which.assert_any_call("codegraph")
+    mock_which.assert_any_call("git")
     mock_run.assert_called_once_with(["/mock/bin/codegraph", "init"], cwd=os.getcwd(), capture_output=True, text=True)
     mock_connect.assert_called_once()
     assert "success" in res
@@ -89,8 +104,16 @@ async def test_sync_db_missing_cli_missing_install_success(mock_sync, mock_conne
     It should run 'npm install -g @colbymchenry/codegraph', then 'codegraph init', and then sync.
     """
     mock_exists.side_effect = [False, True]
-    # First check: None, second check (after npm install): '/mock/bin/codegraph'
-    mock_which.side_effect = [None, "/mock/bin/codegraph"]
+    
+    which_calls = []
+    def which_side_effect(cmd):
+        which_calls.append(cmd)
+        if cmd == "git":
+            return None
+        if len(which_calls) == 1:
+            return None
+        return "/mock/bin/codegraph"
+    mock_which.side_effect = which_side_effect
     
     # Mock runs: npm install, then codegraph init
     mock_npm_res = MagicMock()
@@ -110,7 +133,7 @@ async def test_sync_db_missing_cli_missing_install_success(mock_sync, mock_conne
     res = await projectbrain_sync_codegraph("test-project", "tester")
     
     # Assertions
-    assert mock_which.call_count == 2
+    assert mock_which.call_count == 3
     assert mock_run.call_count == 2
     mock_run.assert_any_call(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
     mock_run.assert_any_call(["/mock/bin/codegraph", "init"], cwd=os.getcwd(), capture_output=True, text=True)

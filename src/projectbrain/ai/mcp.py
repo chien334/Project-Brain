@@ -356,15 +356,16 @@ async def projectbrain_ingest(source: str, creds: dict = None, filters: dict = N
         traceback.print_exc(file=sys.stderr)
         return f"Error: {str(e)}"
 
-@mcp_server.tool(name="projectbrain_sync_codegraph", description="Synchronize local codegraph database structure (nodes/edges) to ProjectBrain by project ID.")
-async def projectbrain_sync_codegraph(project_id: str, project_path: str = None, author: str = None) -> str:
+@mcp_server.tool(name="projectbrain_sync_codegraph", description="Synchronize local codegraph database structure (nodes/edges) to ProjectBrain by project ID and branch.")
+async def projectbrain_sync_codegraph(project_id: str, project_path: str = None, branch: str = None, author: str = None) -> str:
     """
     Synchronize the local codegraph database (.codegraph/codegraph.db in current working directory or specified project path)
-    to the ProjectBrain server under the specified project ID.
+    to the ProjectBrain server under the specified project ID and branch.
     
     Args:
         project_id: Unique identifier for the project (e.g. 'projectbrain-py').
         project_path: Optional local path to the project directory containing .codegraph/
+        branch: Optional branch name to associate with the synchronization. If not specified, tries to auto-detect the active git branch.
         author: Optional name of the user performing the sync.
     """
     import sqlite3
@@ -445,13 +446,34 @@ async def projectbrain_sync_codegraph(project_id: str, project_path: str = None,
         
         conn.close()
         
+        # Auto-detect git branch if branch is not explicitly provided
+        resolved_branch = branch
+        if not resolved_branch:
+            try:
+                git_bin = shutil.which("git")
+                if git_bin and os.path.exists(os.path.join(target_dir, ".git")):
+                    res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], cwd=target_dir, capture_output=True, text=True)
+                    if res_git.returncode == 0:
+                        resolved_branch = res_git.stdout.strip()
+            except Exception:
+                pass
+                
+        if resolved_branch:
+            if ":" in project_id:
+                base_id, _ = project_id.split(":", 1)
+                sync_project_id = f"{base_id}:{resolved_branch}"
+            else:
+                sync_project_id = f"{project_id}:{resolved_branch}"
+        else:
+            sync_project_id = project_id
+
         from ..server.routes.codegraph import sync_codegraph_data, SyncRequest
         
         resolved_author = author or os.getenv("PB_USER_NAME") or os.getenv("OM_USER_NAME") or os.getenv("USER") or getpass.getuser() or "anonymous-mcp"
         
         req = SyncRequest(
-            project_id=project_id,
-            project_name=project_id,
+            project_id=sync_project_id,
+            project_name=sync_project_id,
             nodes=nodes,
             edges=edges,
             author=resolved_author
