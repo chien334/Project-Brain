@@ -10,7 +10,7 @@ class GeminiAdapter(AIAdapter):
         self.api_key = api_key or env.gemini_key or os.getenv("GEMINI_API_KEY")
         if self.api_key:
             self.api_key = self.api_key.strip().strip('"').strip("'")
-        self.base_url = env.gemini_base_url or os.getenv("OM_GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta"
+        self.base_url = env.gemini_base_url or os.getenv("PB_GEMINI_BASE_URL") or os.getenv("OM_GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta"
 
     async def chat(self, messages: List[Dict[str, str]], model: str = None, **kwargs) -> str:
         if not self.api_key: raise ValueError("Gemini key missing")

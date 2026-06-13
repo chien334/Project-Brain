@@ -38,9 +38,9 @@ def get_mcp_status():
                 with open(config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
                     mcp_servers = config.get("mcpServers", {})
-                    if "projectbrain" in mcp_servers:
+                    if "projectbrain" in mcp_servers or "openmemory" in mcp_servers:
                         registered = True
-                        server_config = mcp_servers["projectbrain"]
+                        server_config = mcp_servers.get("projectbrain") or mcp_servers.get("openmemory")
             except Exception:
                 # config is corrupted or empty
                 pass
@@ -70,6 +70,10 @@ def register_mcp(req: RegisterMCPRequest):
                 
         if "mcpServers" not in config:
             config["mcpServers"] = {}
+            
+        # Clean up legacy openmemory entry if it exists to prevent conflict
+        if "openmemory" in config["mcpServers"]:
+            del config["mcpServers"]["openmemory"]
             
         if req.transport_type == "stdio":
             # Collect environment variables starting with PB_, OM_, or GEMINI_
@@ -122,15 +126,21 @@ def unregister_mcp():
             return {"success": True, "message": "Could not read Claude Desktop config, nothing to unregister."}
             
         mcp_servers = config.get("mcpServers", {})
+        changed = False
         if "projectbrain" in mcp_servers:
             del mcp_servers["projectbrain"]
-            config["mcpServers"] = mcp_servers
+            changed = True
+        if "openmemory" in mcp_servers:
+            del mcp_servers["openmemory"]
+            changed = True
             
+        if changed:
+            config["mcpServers"] = mcp_servers
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
-            return {"success": True, "message": "Successfully removed projectbrain server from Claude Desktop config."}
+            return {"success": True, "message": "Successfully removed projectbrain/openmemory server from Claude Desktop config."}
         else:
-            return {"success": True, "message": "projectbrain server is not registered in Claude Desktop config."}
+            return {"success": True, "message": "projectbrain/openmemory server is not registered in Claude Desktop config."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -151,7 +161,7 @@ def get_external_mcp_servers():
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
                 mcp_servers = config.get("mcpServers", {})
-                external_servers = {k: v for k, v in mcp_servers.items() if k != "projectbrain"}
+                external_servers = {k: v for k, v in mcp_servers.items() if k not in ["projectbrain", "openmemory"]}
                 return {"servers": external_servers}
         except Exception:
             return {"servers": {}}

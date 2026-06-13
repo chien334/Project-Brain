@@ -647,8 +647,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     mcpStdioConfig.style.display = 'block';
                     mcpSseConfig.style.display = 'none';
                     if (config.env) {
-                        mcpUserId.value = config.env.OM_DEFAULT_USER_ID || 'default';
-                        mcpTags.value = config.env.OM_DEFAULT_TAGS || 'source:mcp';
+                        mcpUserId.value = config.env.PB_DEFAULT_USER_ID || config.env.OM_DEFAULT_USER_ID || 'default';
+                        mcpTags.value = config.env.PB_DEFAULT_TAGS || config.env.OM_DEFAULT_TAGS || 'source:mcp';
                     }
                 }
             } else {

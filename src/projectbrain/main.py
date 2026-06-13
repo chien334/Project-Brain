@@ -12,9 +12,9 @@ logger = logging.getLogger("projectbrain")
 class Memory:
     def __init__(self, user: str = None, mode: str = None, url: str = None, api_key: str = None):
         self.default_user = user
-        self.mode = mode or os.getenv("OM_MODE", "local")
-        self.url = url or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
-        self.api_key = api_key or os.getenv("OM_API_KEY", "")
+        self.mode = mode or os.getenv("PB_MODE") or os.getenv("OM_MODE", "local")
+        self.url = url or os.getenv("PB_URL") or os.getenv("PB_API_URL") or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
+        self.api_key = api_key or os.getenv("PB_API_KEY") or os.getenv("OM_API_KEY", "")
         
         if self.mode == "local":
             db.connect()
@@ -183,7 +183,7 @@ def run_server():
     from .server.api import create_app
     app = create_app()
     # Read port from env or default to 8080
-    port = int(os.getenv("OM_PORT", 8080))
+    port = int(os.getenv("PB_PORT") or os.getenv("OM_PORT", 8080))
     print(f"Starting ProjectBrain Server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
 
@@ -240,7 +240,7 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
             print(f"Error: 'codegraph init' completed but database file was still not found at {db_path}.")
             sys.exit(1)
         
-    server_url = server_url or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
+    server_url = server_url or os.getenv("PB_URL") or os.getenv("PB_API_URL") or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
     
     print(f"Reading local codegraph database at {db_path}...")
     try:

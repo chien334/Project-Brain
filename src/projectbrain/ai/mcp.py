@@ -3,7 +3,10 @@ import os
 import json
 import traceback
 import datetime
+import logging
 from mcp.server.fastmcp import FastMCP
+
+logger = logging.getLogger("mcp")
 
 from ..main import Memory
 from ..core.config import env
@@ -54,7 +57,7 @@ async def projectbrain_query(
             qtype = "contextual"
 
         limit = k
-        uid = user_id or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("OM_USER_ID")
+        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
         
         at_date = datetime.datetime.fromisoformat(at) if at else datetime.datetime.now()
         at_ts = int(at_date.timestamp() * 1000)
@@ -153,11 +156,11 @@ async def projectbrain_store(
         if stype not in ["contextual", "factual", "both"]:
             stype = "contextual"
 
-        uid = user_id or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("OM_USER_ID") or "anonymous"
+        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID") or "anonymous"
         
         # Read tags from args, apply configured tags if present
         actual_tags = tags or []
-        env_tags_str = os.getenv("OM_DEFAULT_TAGS")
+        env_tags_str = os.getenv("PB_DEFAULT_TAGS") or os.getenv("OM_DEFAULT_TAGS")
         if env_tags_str:
             env_tags = [t.strip() for t in env_tags_str.split(",") if t.strip()]
             for et in env_tags:
@@ -256,7 +259,7 @@ async def projectbrain_get(id: str) -> str:
 async def projectbrain_delete(id: str, user_id: str = None) -> str:
     """Delete a memory by ID."""
     try:
-        uid = user_id or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("OM_USER_ID")
+        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
         m = await mem.get(id)
         if not m:
             return f"Memory {id} not found"
@@ -272,7 +275,7 @@ async def projectbrain_delete(id: str, user_id: str = None) -> str:
 async def projectbrain_list(limit: int = 20, user_id: str = None) -> str:
     """List recent memories."""
     try:
-        uid = user_id or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("OM_USER_ID")
+        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
         res = mem.history(user_id=uid, limit=limit)
         return json.dumps([dict(r) for r in res], default=str, indent=2)
     except Exception as e:
@@ -298,7 +301,7 @@ async def projectbrain_reinforce(id: str) -> str:
 async def projectbrain_delete_all(user_id: str = None) -> str:
     """Delete all memories for a user."""
     try:
-        uid = user_id or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("OM_USER_ID")
+        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
         await mem.delete_all(user_id=uid)
         return f"All memories deleted for user {uid or 'default'}"
     except Exception as e:
@@ -309,7 +312,7 @@ async def projectbrain_delete_all(user_id: str = None) -> str:
 async def projectbrain_stats(user_id: str = None) -> str:
     """Retrieve cognitive memory engine statistics (total count, sectors, tags)."""
     try:
-        uid = user_id or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("OM_USER_ID")
+        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
         if uid:
             total_res = db.fetchone("SELECT count(*) as c FROM memories WHERE user_id=?", (uid,))
             sector_res = db.fetchall("SELECT primary_sector, count(*) as c FROM memories WHERE user_id=? GROUP BY primary_sector", (uid,))
@@ -340,7 +343,7 @@ async def projectbrain_ingest(source: str, creds: dict = None, filters: dict = N
     try:
         actual_creds = creds or {}
         actual_filters = filters or {}
-        uid = user_id or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("OM_USER_ID")
+        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
         
         src = mem.source(source)
         if uid:
