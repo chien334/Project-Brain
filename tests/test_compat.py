@@ -14,20 +14,40 @@ from projectbrain.server.routes.mcp_registry import (
 async def test_mcp_env_fallbacks_query(mock_search):
     mock_search.return_value = []
     
+    import shutil
+    import subprocess
+    git_bin = shutil.which("git")
+    expected_branch = ""
+    if git_bin and os.path.exists(".git"):
+        res = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+        if res.returncode == 0:
+            expected_branch = res.stdout.strip()
+    suffix = f":{expected_branch}" if expected_branch and expected_branch != "HEAD" else ""
+    
     # Test 1: Using PB_DEFAULT_USER_ID
     with patch.dict(os.environ, {"PB_DEFAULT_USER_ID": "pb-user", "OM_DEFAULT_USER_ID": "om-user"}, clear=True):
         await projectbrain_query("test query")
-        mock_search.assert_called_with("test query", user_id="pb-user", limit=10)
+        mock_search.assert_called_with("test query", user_id=f"pb-user{suffix}", limit=10)
         
     # Test 2: Using OM_DEFAULT_USER_ID as fallback
     with patch.dict(os.environ, {"OM_DEFAULT_USER_ID": "om-user"}, clear=True):
         await projectbrain_query("test query")
-        mock_search.assert_called_with("test query", user_id="om-user", limit=10)
+        mock_search.assert_called_with("test query", user_id=f"om-user{suffix}", limit=10)
 
 @pytest.mark.asyncio
 @patch("projectbrain.ai.mcp.mem.add")
 async def test_mcp_env_fallbacks_store(mock_add):
     mock_add.return_value = {"id": "123", "primary_sector": "test"}
+    
+    import shutil
+    import subprocess
+    git_bin = shutil.which("git")
+    expected_branch = ""
+    if git_bin and os.path.exists(".git"):
+        res = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+        if res.returncode == 0:
+            expected_branch = res.stdout.strip()
+    suffix = f":{expected_branch}" if expected_branch and expected_branch != "HEAD" else ""
     
     # Test 1: Using PB_DEFAULT_TAGS and PB_DEFAULT_USER_ID
     with patch.dict(os.environ, {"PB_DEFAULT_USER_ID": "pb-user", "PB_DEFAULT_TAGS": "pb-tag,other-tag"}, clear=True):
@@ -35,7 +55,7 @@ async def test_mcp_env_fallbacks_store(mock_add):
         
         # Extract metadata and tags from mock call
         args, kwargs = mock_add.call_args
-        assert kwargs["user_id"] == "pb-user"
+        assert kwargs["user_id"] == f"pb-user{suffix}"
         assert "pb-tag" in kwargs["tags"]
         assert "other-tag" in kwargs["tags"]
 

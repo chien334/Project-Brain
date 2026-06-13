@@ -97,6 +97,13 @@ document.addEventListener('DOMContentLoaded', () => {
         loadMcpStatus();
         loadProjects();
         
+        // Sync initial active project to the server
+        fetch('/memory/active-project', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ project_id: activeUser })
+        }).catch(err => console.error('Failed to sync initial active project:', err));
+        
         // Listeners
         currentUser.value = localStorage.getItem('currentUser') || '';
         currentUser.addEventListener('input', () => {
@@ -107,6 +114,13 @@ document.addEventListener('DOMContentLoaded', () => {
             activeUser = e.target.value.trim() || 'default';
             loadStats();
             loadMemories();
+            
+            // Sync active project to the server
+            fetch('/memory/active-project', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ project_id: activeUser })
+            }).catch(err => console.error('Failed to sync active project to server:', err));
             
             // Sync with Code Graph selector
             if (cgProjectSelect) {

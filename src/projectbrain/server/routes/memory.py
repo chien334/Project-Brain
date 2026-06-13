@@ -139,3 +139,23 @@ async def reinforce_memory(memory_id: str):
         return {"success": True, "new_salience": new_sal}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+class ActiveProjectRequest(BaseModel):
+    project_id: str
+
+@router.post("/active-project")
+def set_active_project(req: ActiveProjectRequest):
+    try:
+        from ...core.config import env
+        env.active_project = req.project_id
+        return {"success": True, "active_project": env.active_project}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/active-project")
+def get_active_project():
+    try:
+        from ...core.config import env
+        return {"active_project": env.active_project or "default"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

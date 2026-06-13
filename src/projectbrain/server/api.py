@@ -25,6 +25,26 @@ def create_app() -> FastAPI:
         logger.info(f"{request.method} {request.url.path} - {response.status_code} ({process_time:.2f}ms)")
         return response
         
+    @app.middleware("http")
+    async def capture_mcp_project_id(request: Request, call_next):
+        project_id = request.query_params.get("project_id") or request.query_params.get("user_id")
+        token = None
+        if project_id:
+            try:
+                from ..ai.mcp import mcp_request_project_id
+                token = mcp_request_project_id.set(project_id)
+            except Exception:
+                pass
+        try:
+            return await call_next(request)
+        finally:
+            if token is not None:
+                try:
+                    from ..ai.mcp import mcp_request_project_id
+                    mcp_request_project_id.reset(token)
+                except Exception:
+                    pass
+        
     app.include_router(health.router)
     app.include_router(memory.router, prefix="/memory", tags=["memory"])
     app.include_router(mcp_registry.router, prefix="/memory/mcp", tags=["mcp"])

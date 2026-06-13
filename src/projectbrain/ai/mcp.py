@@ -19,6 +19,58 @@ from ..core.db import db
 mcp_server = FastMCP("projectbrain-mcp")
 mem = Memory()
 
+import contextvars
+from pathlib import Path
+
+# ContextVar to store project/user ID for the current request context (e.g. from query params)
+mcp_request_project_id = contextvars.ContextVar("mcp_request_project_id", default=None)
+
+def resolve_mcp_user_id(user_id: str = None) -> str:
+    # 1. Check if user_id is explicitly passed in the tool call arguments
+    uid = user_id
+    
+    # 2. Check ContextVar (set by FastAPI middleware for the current HTTP/SSE request)
+    if not uid:
+        uid = mcp_request_project_id.get()
+        
+    # 3. Check environment variables
+    if not uid:
+        uid = os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
+        
+    # 4. Check active project state (set by dashboard)
+    if not uid:
+        uid = env.active_project
+        
+    # 5. Detect project name dynamically from directory configuration or CWD
+    if not uid:
+        from ..core.config import detect_project_name
+        uid = detect_project_name()
+
+    # 6. If uid is not one of the generic default IDs, append active git branch if not present
+    if uid and uid not in ["default", "anonymous", "all", "postgres", "admin", "collaborator"]:
+        if ":" not in uid:
+            try:
+                import shutil
+                import subprocess
+                cwd = Path.cwd()
+                has_git = False
+                for parent in [cwd] + list(cwd.parents):
+                    if (parent / ".git").exists():
+                        has_git = True
+                        break
+                git_bin = shutil.which("git")
+                if git_bin and has_git:
+                    # Run git command from CWD to get active branch
+                    res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=2)
+                    if res_git.returncode == 0:
+                        branch = res_git.stdout.strip()
+                        if branch and branch != "HEAD":
+                            uid = f"{uid}:{branch}"
+            except Exception:
+                pass
+                
+    return uid or "default"
+
 @mcp_server.tool(name="projectbrain_query", description="Query ProjectBrain for contextual memories (HSG) and/or temporal facts")
 async def projectbrain_query(
     query: str,
@@ -57,7 +109,7 @@ async def projectbrain_query(
             qtype = "contextual"
 
         limit = k
-        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
+        uid = resolve_mcp_user_id(user_id)
         
         at_date = datetime.datetime.fromisoformat(at) if at else datetime.datetime.now()
         at_ts = int(at_date.timestamp() * 1000)
@@ -156,7 +208,7 @@ async def projectbrain_store(
         if stype not in ["contextual", "factual", "both"]:
             stype = "contextual"
 
-        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID") or "anonymous"
+        uid = resolve_mcp_user_id(user_id)
         
         # Read tags from args, apply configured tags if present
         actual_tags = tags or []
@@ -259,7 +311,7 @@ async def projectbrain_get(id: str) -> str:
 async def projectbrain_delete(id: str, user_id: str = None) -> str:
     """Delete a memory by ID."""
     try:
-        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
+        uid = resolve_mcp_user_id(user_id)
         m = await mem.get(id)
         if not m:
             return f"Memory {id} not found"
@@ -275,7 +327,7 @@ async def projectbrain_delete(id: str, user_id: str = None) -> str:
 async def projectbrain_list(limit: int = 20, user_id: str = None) -> str:
     """List recent memories."""
     try:
-        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
+        uid = resolve_mcp_user_id(user_id)
         res = mem.history(user_id=uid, limit=limit)
         return json.dumps([dict(r) for r in res], default=str, indent=2)
     except Exception as e:
@@ -301,7 +353,7 @@ async def projectbrain_reinforce(id: str) -> str:
 async def projectbrain_delete_all(user_id: str = None) -> str:
     """Delete all memories for a user."""
     try:
-        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
+        uid = resolve_mcp_user_id(user_id)
         await mem.delete_all(user_id=uid)
         return f"All memories deleted for user {uid or 'default'}"
     except Exception as e:
@@ -312,7 +364,7 @@ async def projectbrain_delete_all(user_id: str = None) -> str:
 async def projectbrain_stats(user_id: str = None) -> str:
     """Retrieve cognitive memory engine statistics (total count, sectors, tags)."""
     try:
-        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
+        uid = resolve_mcp_user_id(user_id)
         if uid:
             total_res = db.fetchone("SELECT count(*) as c FROM memories WHERE user_id=?", (uid,))
             sector_res = db.fetchall("SELECT primary_sector, count(*) as c FROM memories WHERE user_id=? GROUP BY primary_sector", (uid,))
@@ -343,7 +395,7 @@ async def projectbrain_ingest(source: str, creds: dict = None, filters: dict = N
     try:
         actual_creds = creds or {}
         actual_filters = filters or {}
-        uid = user_id or os.getenv("PB_DEFAULT_USER_ID") or os.getenv("OM_DEFAULT_USER_ID") or os.getenv("PB_USER_ID") or os.getenv("OM_USER_ID")
+        uid = resolve_mcp_user_id(user_id)
         
         src = mem.source(source)
         if uid:

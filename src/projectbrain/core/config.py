@@ -175,6 +175,7 @@ class EnvConfig:
         self.ollama_embedding_model = pb_getenv("OM_OLLAMA_EMBEDDING_MODEL")
         self.gemini_embedding_model = pb_getenv("OM_GEMINI_EMBEDDING_MODEL")
         self.aws_embedding_model = pb_getenv("OM_AWS_EMBEDDING_MODEL")
+        self.active_project = None
         
     @property
     def database_url(self) -> str:
