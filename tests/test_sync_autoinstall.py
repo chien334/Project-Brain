@@ -72,7 +72,7 @@ async def test_sync_db_missing_cli_exists(mock_sync, mock_connect, mock_run, moc
     # Assertions
     assert mock_exists.call_count == 2
     mock_which.assert_called_once_with("codegraph")
-    mock_run.assert_called_once_with(["/mock/bin/codegraph", "init"], capture_output=True, text=True)
+    mock_run.assert_called_once_with(["/mock/bin/codegraph", "init"], cwd=os.getcwd(), capture_output=True, text=True)
     mock_connect.assert_called_once()
     assert "success" in res
 
@@ -113,7 +113,7 @@ async def test_sync_db_missing_cli_missing_install_success(mock_sync, mock_conne
     assert mock_which.call_count == 2
     assert mock_run.call_count == 2
     mock_run.assert_any_call(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
-    mock_run.assert_any_call(["/mock/bin/codegraph", "init"], capture_output=True, text=True)
+    mock_run.assert_any_call(["/mock/bin/codegraph", "init"], cwd=os.getcwd(), capture_output=True, text=True)
     assert "success" in res
 
 

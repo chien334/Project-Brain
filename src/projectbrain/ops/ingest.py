@@ -78,7 +78,7 @@ async def mk_child(txt: str, idx: int, tot: int, rid: str, meta: Dict = None, us
 
 async def link(rid: str, cid: str, idx: int, user_id: str = None):
     ts = int(time.time()*1000)
-    db.execute("INSERT INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+    db.execute("INSERT OR REPLACE INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?)",
                (rid, cid, user_id or "anonymous", 1.0, ts, ts))
     db.commit()
 

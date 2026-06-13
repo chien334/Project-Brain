@@ -224,9 +224,10 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
                 print(f"Error attempting to install 'codegraph' CLI: {str(inst_err)}")
                 sys.exit(1)
         
-        print(f"Initializing codegraph database in current directory using '{codegraph_bin} init'...")
+        target_dir = project_path if (project_path and os.path.isdir(project_path)) else os.getcwd()
+        print(f"Initializing codegraph database in directory '{target_dir}' using '{codegraph_bin} init'...")
         try:
-            res_init = subprocess.run([codegraph_bin, "init"], capture_output=True, text=True)
+            res_init = subprocess.run([codegraph_bin, "init"], cwd=target_dir, capture_output=True, text=True)
             if res_init.returncode != 0:
                 print(f"Error running 'codegraph init' (exit code {res_init.returncode}):")
                 print(f"Stdout: {res_init.stdout}")
@@ -283,6 +284,76 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
         print(f"Error during sync: {e}")
         sys.exit(1)
 
+async def async_ingest_files(project_id: str, dir_path: str):
+    import os
+    from .main import Memory
+    
+    mem = Memory()
+    exclude_dirs = {
+        ".git", "node_modules", "dist", "build", "__pycache__", 
+        ".pytest_cache", ".codegraph", "cloned_repos", "bin", "obj", 
+        ".vs", "uploads", "venv", ".venv", ".next", ".nuxt", ".out", 
+        "target", "vendor", "staticwebassets"
+    }
+    exclude_exts = {
+        ".db", ".sqlite", ".sqlite3",
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg",
+        ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
+        ".exe", ".bin", ".dll", ".pdb", ".so", ".dylib",
+        ".woff", ".woff2", ".ttf", ".eot",
+        ".cache", ".up2date", ".log",
+        ".suo", ".user", ".map", ".lock",
+        ".mp3", ".mp4", ".wav", ".avi", ".mov", ".flac", ".ogg",
+        ".dll.config", ".exe.config"
+    }
+    
+    count = 0
+    print(f"Ingesting text files from '{dir_path}' as memories for project '{project_id}'...", flush=True)
+    
+    for root, dirs, files in os.walk(dir_path):
+        dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")]
+        for file in files:
+            ext = os.path.splitext(file)[1].lower()
+            if ext in exclude_exts:
+                continue
+            file_path = os.path.join(root, file)
+            # Extra safeguard: check if path contains any excluded directory names
+            parts = file_path.split(os.sep)
+            if any(p in exclude_dirs for p in parts):
+                continue
+            
+            rel_path = os.path.relpath(file_path, dir_path)
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                if not content.strip():
+                    continue
+                meta = {
+                    "source": "cli_ingest",
+                    "filename": file,
+                    "file_path": rel_path,
+                    "project_id": project_id
+                }
+                res = await mem.add(
+                    content=f"File: {rel_path}\n\n{content}",
+                    user_id=project_id,
+                    meta=meta,
+                    tags=["codebase", "file"]
+                )
+                count += 1
+                print(f"Ingested {rel_path}", flush=True)
+            except Exception as e:
+                print(f"Failed to ingest {rel_path}: {e}", flush=True)
+    print(f"Successfully ingested {count} codebase files as memories!", flush=True)
+
+def run_ingest_files(project_id: str, dir_path: str):
+    import os
+    import asyncio
+    if not os.path.exists(dir_path):
+        print(f"Error: Directory '{dir_path}' does not exist.")
+        sys.exit(1)
+    asyncio.run(async_ingest_files(project_id, dir_path))
+
 if __name__ == "__main__":
     import sys
     import os
@@ -298,9 +369,17 @@ if __name__ == "__main__":
         server_url = sys.argv[3] if len(sys.argv) > 3 else None
         project_path = sys.argv[4] if len(sys.argv) > 4 else None
         run_codegraph_sync(project_id, server_url, project_path)
+    elif len(sys.argv) > 1 and sys.argv[1] == "ingest-files":
+        if len(sys.argv) < 4:
+            print("Usage: python -m projectbrain.main ingest-files <project_id> <dir_path>")
+            sys.exit(1)
+        project_id = sys.argv[2]
+        dir_path = sys.argv[3]
+        run_ingest_files(project_id, dir_path)
     else:
         print("ProjectBrain Python SDK / Server")
         print("Usage:")
         print("  python -m projectbrain.main serve                                 # Start REST API & Dashboard")
         print("  python -m projectbrain.main mcp                                   # Start stdio MCP server")
         print("  python -m projectbrain.main codegraph-sync <project_id> [url] [project_path] # Sync local codegraph to server")
+        print("  python -m projectbrain.main ingest-files <project_id> <dir_path>   # Ingest codebase files into memories")

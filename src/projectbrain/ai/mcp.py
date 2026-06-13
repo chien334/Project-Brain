@@ -357,13 +357,14 @@ async def projectbrain_ingest(source: str, creds: dict = None, filters: dict = N
         return f"Error: {str(e)}"
 
 @mcp_server.tool(name="projectbrain_sync_codegraph", description="Synchronize local codegraph database structure (nodes/edges) to ProjectBrain by project ID.")
-async def projectbrain_sync_codegraph(project_id: str, author: str = None) -> str:
+async def projectbrain_sync_codegraph(project_id: str, project_path: str = None, author: str = None) -> str:
     """
-    Synchronize the local codegraph database (.codegraph/codegraph.db in current working directory)
+    Synchronize the local codegraph database (.codegraph/codegraph.db in current working directory or specified project path)
     to the ProjectBrain server under the specified project ID.
     
     Args:
         project_id: Unique identifier for the project (e.g. 'projectbrain-py').
+        project_path: Optional local path to the project directory containing .codegraph/
         author: Optional name of the user performing the sync.
     """
     import sqlite3
@@ -372,7 +373,14 @@ async def projectbrain_sync_codegraph(project_id: str, author: str = None) -> st
     import shutil
     import subprocess
     
-    db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
+    if project_path:
+        if os.path.isdir(project_path):
+            db_path = os.path.join(project_path, ".codegraph", "codegraph.db")
+        else:
+            db_path = project_path
+    else:
+        db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
+        
     if not os.path.exists(db_path):
         # Check if codegraph command is available
         codegraph_bin = shutil.which("codegraph")
@@ -407,17 +415,18 @@ async def projectbrain_sync_codegraph(project_id: str, author: str = None) -> st
                     f"Please manually install it: npm install -g @colbymchenry/codegraph"
                 )
         
-        # Now we have codegraph_bin, let's run 'codegraph init'
+        # Now we have codegraph_bin, let's run 'codegraph init' in the project directory
+        target_dir = project_path if (project_path and os.path.isdir(project_path)) else os.getcwd()
         try:
-            res_init = subprocess.run([codegraph_bin, "init"], capture_output=True, text=True)
+            res_init = subprocess.run([codegraph_bin, "init"], cwd=target_dir, capture_output=True, text=True)
             if res_init.returncode != 0:
                 return (
-                    f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}).\n"
+                    f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}) in directory {target_dir}.\n"
                     f"Stdout: {res_init.stdout}\n"
                     f"Stderr: {res_init.stderr}"
                 )
         except Exception as init_err:
-            return f"Error executing 'codegraph init': {str(init_err)}"
+            return f"Error executing 'codegraph init' in directory {target_dir}: {str(init_err)}"
             
         # Re-check db path existence
         if not os.path.exists(db_path):
