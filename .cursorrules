@@ -49,3 +49,15 @@ CodeGraph is a tree-sitter-parsed knowledge graph of every symbol, edge, and fil
 
 To minimize token usage, prefix terminal commands with `rtk` (or `/Users/macbbook/.local/bin/rtk`).
 - Example: `rtk git status`, `rtk cargo test`, `rtk pip list`.
+
+---
+
+## 🧩 Custom MCP Extensions (`extensions_mcp/`)
+
+ProjectBrain supports custom MCP extensions dynamically loaded from the `extensions_mcp/` directory.
+
+### Guidelines & Commands
+- **Standard**: Every extension must include `extension.json` (metadata manifest), `__init__.py`, `server.py` (entrypoint exposing `mcp` FastMCP instance), and `client.py` (JSON-RPC HTTP client wrapper).
+- **Runbook**: Follow the detailed workflows in [RUNBOOK.md](file:///Users/macbbook/SourceCodes/OpenMemory/RUNBOOK.md) to add, test, and invoke extensions.
+- **Rules**: Refer to [.agent/rules/extensions_mcp.md](file:///Users/macbbook/SourceCodes/OpenMemory/.agent/rules/extensions_mcp.md) for full developer rules and environment variable/dependency specifications.
+

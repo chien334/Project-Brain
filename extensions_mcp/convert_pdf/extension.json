@@ -1,0 +1,8 @@
+{
+  "name": "convert-pdf",
+  "version": "1.0.0",
+  "description": "Extract text, tables, and images from PDF files and convert them to Markdown.",
+  "entrypoint": "server_stdio.py",
+  "env_vars": [],
+  "dependencies": ["pdfplumber"]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "convert-docx",
+  "version": "1.0.0",
+  "description": "Extract text and tables from Word DOCX files and create new documents.",
+  "entrypoint": "server_stdio.py",
+  "env_vars": [],
+  "dependencies": ["python-docx"]
+}

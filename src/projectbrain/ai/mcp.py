@@ -734,5 +734,18 @@ async def projectbrain_diff_project_versions(base_project_id: str, target_projec
         traceback.print_exc(file=sys.stderr)
         return f"Error performing project comparison: {str(e)}"
 
+# Dynamically register custom extensions
+try:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from extensions_mcp.loader import load_extensions
+    load_extensions(mcp_server)
+except Exception as e:
+    logger.error(f"Failed to load custom MCP extensions: {e}")
+    logger.error(traceback.format_exc())
+
 async def run_mcp_server():
     await mcp_server.run_stdio_async()
+
+

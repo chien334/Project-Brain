@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docx-mcp"
+version = "1.0.0"
+description = "MCP server for interacting with DOCX files"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "CodeVista", email = "dev@codevista.com"}
+]
+
+dependencies = [
+    "mcp>=1.1.0",
+    "pydantic>=2.0.0",
+    "python-docx>=1.1.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
