@@ -44,6 +44,7 @@ def test_mcp_tools_registration():
     assert "migration_translate_code_comments" in tool_names
     assert "migration_recommend_refactor" in tool_names
     assert "migration_batch_scan_logic" in tool_names
+    assert "migration_plan_execution_phases" in tool_names
 
     # Check annotations and description properties of one of the registered tools
     img_folder_tool = next(t for t in tools if t.name == "img2md_extract_folder")

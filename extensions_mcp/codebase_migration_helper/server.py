@@ -177,3 +177,85 @@ async def batch_scan_logic(
         return res
     except Exception as e:
         return {"error": f"Failed to run batch scan logic: {str(e)}"}
+
+@mcp.tool(name="migration_plan_execution_phases")
+async def plan_execution_phases(
+    project_path: Annotated[str, Field(description="Root path to the legacy project workspace")],
+    max_phases: Annotated[int, Field(description="Maximum number of phases to split into")] = 5
+) -> dict:
+    """Analyzes drafts and plans sequential refactoring/migration phases.
+    
+    Perfect to partition the codebase into small execution waves.
+    """
+    try:
+        from .batch_scan_helper import run_phase_planning
+        res = await run_phase_planning(project_path, max_phases)
+        return res
+    except Exception as e:
+        # If the API fails completely, support the fallback mechanism
+        # Find drafts path to construct fallback prompts if possible
+        import json
+        drafts_data = []
+        try:
+            path = os.path.abspath(os.path.expanduser(project_path))
+            drafts_path = os.path.join(path, ".planning", "business_logic_drafts.json")
+            if os.path.exists(drafts_path):
+                with open(drafts_path, "r", encoding="utf-8") as f:
+                    drafts_data = json.load(f)
+        except Exception:
+            pass
+            
+        functions_summary = []
+        for item in drafts_data:
+            functions_summary.append({
+                "node_id": item.get("node_id"),
+                "function_name": item.get("function_name"),
+                "file_path": item.get("file_path"),
+                "signature": item.get("signature"),
+                "business_logic_summary": (item.get("business_logic_draft") or "")[:200]
+            })
+            
+        system_prompt = (
+            "You are a principal software migration architect. "
+            "Your task is to partition a list of legacy codebase functions into logical, "
+            "sequential refactoring phases based on complexity and dependency ordering."
+        )
+        
+        prompt = (
+            f"Below is a list of functions from the legacy project with their business logic drafts. "
+            f"Please group these functions into sequential migration/refactoring phases (maximum {max_phases} phases). "
+            f"Ensure that dependencies are respected: utility and helper functions should be in earlier phases, "
+            f"core business logic in middle phases, and API entrypoints or user interfaces in the final phases.\n\n"
+            f"Functions List:\n{json.dumps(functions_summary, indent=2, ensure_ascii=False)}\n\n"
+            f"Please output a structured JSON response matching this schema exactly:\n"
+            f"{{\n"
+            f"  \"phases\": [\n"
+            f"    {{\n"
+            f"      \"phase_number\": 1,\n"
+            f"      \"name\": \"Phase Name\",\n"
+            f"      \"description\": \"Description of this phase\",\n"
+            f"      \"complexity\": \"low|medium|high\",\n"
+            f"      \"functions\": [\n"
+            f"        {{\n"
+            f"          \"node_id\": 1,\n"
+            f"          \"name\": \"function_name\",\n"
+            f"          \"file_path\": \"file_path\"\n"
+            f"        }}\n"
+            f"      ]\n"
+            f"    }}\n"
+            f"  ]\n"
+            f"}}\n\n"
+            f"Return ONLY valid JSON. Do not include markdown code block wraps."
+        )
+        
+        return {
+            "error": f"Failed to plan phases: {e}",
+            "fallback_to_client": True,
+            "system_prompt": system_prompt,
+            "prompt": prompt,
+            "message": (
+                "The server-side LLM call failed. Please partition these functions into logical refactoring phases yourself "
+                "using your own model capabilities ('model hiện tại'). Create both `.planning/migration_phases.json` "
+                "and `.planning/migration_phases.md` in the project directory based on the output schema."
+            )
+        }

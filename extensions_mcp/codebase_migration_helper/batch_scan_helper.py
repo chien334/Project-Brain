@@ -190,6 +190,157 @@ async def run_batch_scan_logic(project_root, project_id):
         "output_file": output_path
     }
 
+async def run_phase_planning(project_root: str, max_phases: int = 5) -> dict:
+    project_root = os.path.abspath(project_root)
+    drafts_path = os.path.join(project_root, ".planning", "business_logic_drafts.json")
+    if not os.path.exists(drafts_path):
+        raise FileNotFoundError(f"Business logic drafts not found at {drafts_path}. Please run batch scan first.")
+        
+    with open(drafts_path, "r", encoding="utf-8") as f:
+        drafts = json.load(f)
+        
+    if not drafts:
+        return {"status": "success", "phases_count": 0, "message": "No drafts found to plan."}
+        
+    functions_summary = []
+    for item in drafts:
+        functions_summary.append({
+            "node_id": item.get("node_id"),
+            "function_name": item.get("function_name"),
+            "file_path": item.get("file_path"),
+            "signature": item.get("signature"),
+            "business_logic_summary": (item.get("business_logic_draft") or "")[:200]
+        })
+        
+    prompt = (
+        f"Below is a list of functions from the legacy project with their business logic drafts. "
+        f"Please group these functions into sequential migration/refactoring phases (maximum {max_phases} phases). "
+        f"Ensure that dependencies are respected: utility and helper functions should be in earlier phases, "
+        f"core business logic in middle phases, and API entrypoints or user interfaces in the final phases.\n\n"
+        f"Functions List:\n{json.dumps(functions_summary, indent=2, ensure_ascii=False)}\n\n"
+        f"Please output a structured JSON response matching this schema exactly:\n"
+        f"{{\n"
+        f"  \"phases\": [\n"
+        f"    {{\n"
+        f"      \"phase_number\": 1,\n"
+        f"      \"name\": \"Phase Name\",\n"
+        f"      \"description\": \"Description of this phase\",\n"
+        f"      \"complexity\": \"low|medium|high\",\n"
+        f"      \"functions\": [\n"
+        f"        {{\n"
+        f"          \"node_id\": 1,\n"
+        f"          \"name\": \"function_name\",\n"
+        f"          \"file_path\": \"file_path\"\n"
+        f"        }}\n"
+        f"      ]\n"
+        f"    }}\n"
+        f"  ]\n"
+        f"}}\n\n"
+        f"Return ONLY valid JSON. Do not include markdown code block wraps."
+    )
+    
+    system_instruction = (
+        "You are a principal software migration architect. "
+        "Your task is to partition a list of legacy codebase functions into logical, "
+        "sequential refactoring phases based on complexity and dependency ordering."
+    )
+    
+    api_key = os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("API key not set. Cannot run phase planning.")
+        
+    primary_model = os.getenv("LLM_MODEL", "gemma-4-26b-a4b-it")
+    model_chain = [primary_model, "gemini-1.5-flash", "gemini-2.5-flash", "gemma-4-26b-a4b-it"]
+    seen = set()
+    models_to_try = []
+    for m in model_chain:
+        if m not in seen:
+            seen.add(m)
+            models_to_try.append(m)
+            
+    req_body = {
+        "contents": [
+            {"role": "user", "parts": [{"text": f"System Instruction: {system_instruction}"}]},
+            {"role": "user", "parts": [{"text": prompt}]}
+        ]
+    }
+    
+    raw_result = None
+    last_err = None
+    for model_name in models_to_try:
+        if "models/" not in model_name:
+            model_path = f"models/{model_name}"
+        else:
+            model_path = model_name
+            
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={api_key}"
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                res = await client.post(url, json=req_body)
+                if res.status_code == 200:
+                    data = res.json()
+                    try:
+                        raw_result = data["candidates"][0]["content"]["parts"][0]["text"]
+                        break
+                    except (KeyError, IndexError):
+                        last_err = f"Parsing candidates failed for {model_name}: {json.dumps(data)}"
+                else:
+                    last_err = f"API Error {res.status_code} for {model_name}: {res.text}"
+        except Exception as e:
+            last_err = f"HTTP Error for {model_name}: {str(e)}"
+            
+    if not raw_result:
+        raise RuntimeError(f"All models in fallback chain failed. Last error: {last_err}")
+        
+    clean_result = raw_result.strip()
+    if clean_result.startswith("```"):
+        lines = clean_result.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines[-1].startswith("```"):
+            lines = lines[:-1]
+        clean_result = "\n".join(lines).strip()
+        
+    phases_data = json.loads(clean_result)
+    
+    # Save structured JSON
+    output_json_path = os.path.join(project_root, ".planning", "migration_phases.json")
+    os.makedirs(os.path.dirname(output_json_path), exist_ok=True)
+    with open(output_json_path, "w", encoding="utf-8") as f:
+        json.dump(phases_data, f, indent=2, ensure_ascii=False)
+        
+    # Generate and save human-readable Markdown report
+    md_lines = [
+        "# Kế hoạch các Giai đoạn Di trú (Migration Phase Plan)",
+        "Kế hoạch phân rã và chia phase thực thi cho dự án di trú mã nguồn kế thừa.",
+        ""
+    ]
+    for phase in phases_data.get("phases", []):
+        p_num = phase.get("phase_number", "?")
+        p_name = phase.get("name", "Unnamed Phase")
+        p_desc = phase.get("description", "")
+        p_complexity = phase.get("complexity", "medium")
+        
+        md_lines.append(f"## Phase {p_num}: {p_name}")
+        md_lines.append(f"- **Độ phức tạp / Rủi ro**: {p_complexity.upper()}")
+        md_lines.append(f"- **Mô tả**: {p_desc}")
+        md_lines.append("- **Danh sách các hàm di trú:**")
+        for fn in phase.get("functions", []):
+            md_lines.append(f"  - `{fn.get('name')}` trong `{fn.get('file_path')}` (Node ID: {fn.get('node_id')})")
+        md_lines.append("")
+        
+    output_md_path = os.path.join(project_root, ".planning", "migration_phases.md")
+    with open(output_md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines))
+        
+    return {
+        "status": "success",
+        "output_json": output_json_path,
+        "output_md": output_md_path,
+        "phases_count": len(phases_data.get("phases", []))
+    }
+
 async def main():
     if len(sys.argv) < 3:
         print("Usage: python3 batch_scan_helper.py <project_root_directory> <project_id>")

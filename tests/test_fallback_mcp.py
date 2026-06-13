@@ -3,8 +3,8 @@ import os
 import json
 from unittest.mock import MagicMock, patch, AsyncMock
 from projectbrain.ai.mcp import mcp_server
-from extensions_mcp.codebase_migration_helper.server import translate_code_comments, recommend_refactor
-from extensions_mcp.codebase_migration_helper.batch_scan_helper import analyze_business_logic, run_batch_scan_logic
+from extensions_mcp.codebase_migration_helper.server import translate_code_comments, recommend_refactor, plan_execution_phases
+from extensions_mcp.codebase_migration_helper.batch_scan_helper import analyze_business_logic, run_batch_scan_logic, run_phase_planning
 
 def test_mcp_tools_registration():
     """Verify registration of the new tools."""
@@ -133,3 +133,82 @@ async def test_batch_scan_partial_fallback(mock_open, mock_makedirs, mock_exists
     assert res["status"] == "partial_success_fallback_needed"
     assert len(res["failed_items"]) == 1
     assert res["failed_items"][0]["function_name"] == "foo"
+
+@pytest.mark.asyncio
+@patch("httpx.AsyncClient.post", new_callable=AsyncMock)
+@patch("os.path.exists")
+@patch("os.makedirs")
+@patch("builtins.open", create=True)
+async def test_run_phase_planning_success(mock_open, mock_makedirs, mock_exists, mock_post):
+    """Verify run_phase_planning parses JSON and generates md report."""
+    mock_exists.return_value = True
+    
+    # Mock reading business_logic_drafts.json
+    mock_open.return_value.__enter__.return_value.read.return_value = json.dumps([
+        {
+            "node_id": 1,
+            "function_name": "foo",
+            "file_path": "foo.py",
+            "signature": "def foo()",
+            "business_logic_draft": "core helper logic description"
+        }
+    ])
+    
+    # Mock LLM API response (valid JSON schema)
+    mock_res = MagicMock()
+    mock_res.status_code = 200
+    mock_res.json.return_value = {
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "text": json.dumps({
+                        "phases": [
+                            {
+                                "phase_number": 1,
+                                "name": "Utility Phase",
+                                "description": "Helpers",
+                                "complexity": "low",
+                                "functions": [{"node_id": 1, "name": "foo", "file_path": "foo.py"}]
+                            }
+                        ]
+                    })
+                }]
+            }
+        }]
+    }
+    mock_post.return_value = mock_res
+    
+    with patch.dict(os.environ, {"LLM_API_KEY": "dummy_key"}):
+        res = await run_phase_planning("/dummy/root", 3)
+        
+    assert res["status"] == "success"
+    assert res["phases_count"] == 1
+    assert "migration_phases.json" in res["output_json"]
+    assert "migration_phases.md" in res["output_md"]
+
+@pytest.mark.asyncio
+@patch("extensions_mcp.codebase_migration_helper.batch_scan_helper.run_phase_planning", new_callable=AsyncMock)
+@patch("os.path.exists")
+@patch("builtins.open", create=True)
+async def test_plan_execution_phases_fallback(mock_open, mock_exists, mock_run_planning):
+    """Verify plan_execution_phases tool falls back to client when backend API fails."""
+    mock_run_planning.side_effect = RuntimeError("API rate limit")
+    mock_exists.return_value = True
+    
+    # Mock reading drafts for prompt construction in fallback handler
+    mock_open.return_value.__enter__.return_value.read.return_value = json.dumps([
+        {
+            "node_id": 1,
+            "function_name": "foo",
+            "file_path": "foo.py",
+            "signature": "def foo()",
+            "business_logic_draft": "some logic"
+        }
+    ])
+    
+    res = await plan_execution_phases("/dummy/root", 5)
+    assert res["fallback_to_client"] is True
+    assert "Failed to plan phases" in res["error"]
+    assert "foo" in res["prompt"]
+    assert "phases" in res["message"]
+
