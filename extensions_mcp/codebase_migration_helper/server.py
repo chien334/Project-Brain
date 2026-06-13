@@ -12,28 +12,43 @@ async def call_gemini(prompt: str, system_instruction: str = None) -> str:
     if not api_key:
         raise ValueError("Missing LLM_API_KEY or GEMINI_API_KEY in environment.")
         
-    model = os.getenv("LLM_MODEL", "gemma-4-26b-a4b-it")
-    if "models/" not in model:
-        model = f"models/{model}"
+    primary_model = os.getenv("LLM_MODEL", "gemma-4-26b-a4b-it")
+    model_chain = [primary_model, "gemini-1.5-flash", "gemini-2.5-flash", "gemma-4-26b-a4b-it"]
+    seen = set()
+    models_to_try = []
+    for m in model_chain:
+        if m not in seen:
+            seen.add(m)
+            models_to_try.append(m)
+            
+    last_err = None
+    for model in models_to_try:
+        if "models/" not in model:
+            model_path = f"models/{model}"
+        else:
+            model_path = model
+            
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={api_key}"
         
-    url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent?key={api_key}"
-    
-    contents = []
-    if system_instruction:
-        contents.append({"role": "user", "parts": [{"text": f"System Instruction: {system_instruction}"}]})
-    contents.append({"role": "user", "parts": [{"text": prompt}]})
-    
-    req_body = {"contents": contents}
-    
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        res = await client.post(url, json=req_body)
-        if res.status_code != 200:
-            raise RuntimeError(f"Gemini API Error {res.status_code}: {res.text}")
-        data = res.json()
+        contents = []
+        if system_instruction:
+            contents.append({"role": "user", "parts": [{"text": f"System Instruction: {system_instruction}"}]})
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
+        
+        req_body = {"contents": contents}
+        
         try:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError):
-            raise RuntimeError(f"Unexpected response format from Gemini API: {data}")
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                res = await client.post(url, json=req_body)
+                if res.status_code == 200:
+                    data = res.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    last_err = f"API Error {res.status_code} for {model}: {res.text}"
+        except Exception as e:
+            last_err = f"HTTP Error for {model}: {str(e)}"
+            
+    raise RuntimeError(f"All models in fallback chain failed. Last error: {last_err}")
 
 @mcp.tool(name="migration_translate_code_comments")
 async def translate_code_comments(
@@ -81,7 +96,18 @@ async def translate_code_comments(
             "translated_code": translated_code
         }
     except Exception as e:
-        return {"error": f"Failed to translate: {e}"}
+        return {
+            "error": f"Failed to translate: {e}",
+            "fallback_to_client": True,
+            "system_prompt": system_prompt if 'system_prompt' in locals() else None,
+            "prompt": code_content if 'code_content' in locals() else None,
+            "message": (
+                "The server-side LLM call failed. Please perform this translation yourself "
+                "using your own model capabilities ('model hiện tại'). Translate all Japanese comments "
+                "to English (or vice versa if specified) in the provided code, maintaining logic exactly, "
+                "and output the complete translated code."
+            )
+        }
 
 @mcp.tool(name="migration_recommend_refactor")
 async def recommend_refactor(
@@ -124,7 +150,17 @@ async def recommend_refactor(
             "migration_report": report
         }
     except Exception as e:
-        return {"error": f"Failed to generate recommendations: {e}"}
+        return {
+            "error": f"Failed to generate recommendations: {e}",
+            "fallback_to_client": True,
+            "system_prompt": system_prompt if 'system_prompt' in locals() else None,
+            "prompt": prompt if 'prompt' in locals() else None,
+            "message": (
+                "The server-side LLM call failed. Please perform this refactoring analysis yourself "
+                "using your own model capabilities ('model hiện tại'). Generate a structured, technical, "
+                "and detailed markdown migration recommendation report for the provided code."
+            )
+        }
 
 @mcp.tool(name="migration_batch_scan_logic")
 async def batch_scan_logic(

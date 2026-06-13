@@ -763,6 +763,64 @@ async def projectbrain_diff_project_versions(base_project_id: str, target_projec
         traceback.print_exc(file=sys.stderr)
         return f"Error performing project comparison: {str(e)}"
 
+@mcp_server.tool(name="projectbrain_register_mcp", description="Register or update the projectbrain MCP server in Claude Desktop config.")
+async def projectbrain_register_mcp_tool(
+    transport_type: str,
+    user_id: str = "default",
+    tags: str = "source:mcp",
+    sse_url: str = "http://localhost:8080/mcp/sse"
+) -> str:
+    """
+    Register or update the projectbrain MCP server in Claude Desktop config.
+    
+    Args:
+        transport_type: 'stdio' or 'sse'
+        user_id: The default user ID/project ID.
+        tags: Tags associated with the connection.
+        sse_url: The SSE endpoint URL (if sse transport type is used).
+    """
+    try:
+        from ..server.routes.mcp_registry import register_mcp, RegisterMCPRequest
+        req = RegisterMCPRequest(
+            transport_type=transport_type,
+            user_id=user_id,
+            tags=tags,
+            sse_url=sse_url
+        )
+        res = register_mcp(req)
+        return json.dumps(res, indent=2)
+    except Exception as e:
+        return f"Error registering MCP server: {str(e)}"
+
+@mcp_server.tool(name="projectbrain_register_external_mcp", description="Register or update an external/backup MCP server in Claude Desktop config.")
+async def projectbrain_register_external_mcp_tool(
+    name: str,
+    command: str,
+    args: list = None,
+    env: dict = None
+) -> str:
+    """
+    Register or update an external/backup MCP server in Claude Desktop config.
+    
+    Args:
+        name: Name of the external MCP server.
+        command: Command to run (e.g. 'npx', 'python3').
+        args: Command arguments list.
+        env: Dictionary of environment variables.
+    """
+    try:
+        from ..server.routes.mcp_registry import save_external_mcp_server, ExternalMCPRequest
+        req = ExternalMCPRequest(
+            name=name,
+            command=command,
+            args=args or [],
+            env=env or {}
+        )
+        res = save_external_mcp_server(req)
+        return json.dumps(res, indent=2)
+    except Exception as e:
+        return f"Error registering external MCP server: {str(e)}"
+
 # Dynamically register custom extensions
 try:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))

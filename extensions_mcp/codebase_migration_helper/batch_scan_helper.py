@@ -56,8 +56,15 @@ def extract_function_code(project_root, file_path, start_line, end_line):
 
 async def analyze_business_logic(api_key, model, code_snippet, file_path, function_name, language):
     """Calls Gemini API to analyze the business logic of a single function snippet."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    
+    primary_model = model or os.getenv("LLM_MODEL", "gemma-4-26b-a4b-it")
+    model_chain = [primary_model, "gemini-1.5-flash", "gemini-2.5-flash", "gemma-4-26b-a4b-it"]
+    seen = set()
+    models_to_try = []
+    for m in model_chain:
+        if m not in seen:
+            seen.add(m)
+            models_to_try.append(m)
+
     prompt = (
         f"Analyze the legacy business logic for the following function in '{file_path}':\n\n"
         f"Language: {language}\n"
@@ -84,15 +91,30 @@ async def analyze_business_logic(api_key, model, code_snippet, file_path, functi
         ]
     }
     
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        res = await client.post(url, json=req_body)
-        if res.status_code != 200:
-            return f"Error analyzing logic: {res.text}"
-        data = res.json()
+    last_err = None
+    for model_name in models_to_try:
+        if "models/" not in model_name:
+            model_path = f"models/{model_name}"
+        else:
+            model_path = model_name
+            
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={api_key}"
+        
         try:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError):
-            return f"Error parsing API response: {json.dumps(data)}"
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                res = await client.post(url, json=req_body)
+                if res.status_code == 200:
+                    data = res.json()
+                    try:
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    except (KeyError, IndexError):
+                        last_err = f"Parsing candidates failed for {model_name}: {json.dumps(data)}"
+                else:
+                    last_err = f"API Error {res.status_code} for {model_name}: {res.text}"
+        except Exception as e:
+            last_err = f"HTTP Error for {model_name}: {str(e)}"
+            
+    raise RuntimeError(f"All models in fallback chain failed. Last error: {last_err}")
 
 async def run_batch_scan_logic(project_root, project_id):
     project_root = os.path.abspath(project_root)
@@ -142,6 +164,25 @@ async def run_batch_scan_logic(project_root, project_id):
     
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(drafts, f, indent=2, ensure_ascii=False)
+        
+    failed_items = [
+        d for d in drafts 
+        if d["business_logic_draft"].startswith("Failed to generate draft:") 
+        or d["business_logic_draft"].startswith("API key not set")
+    ]
+    
+    if failed_items:
+        return {
+            "status": "partial_success_fallback_needed",
+            "processed": len(drafts),
+            "output_file": output_path,
+            "failed_items": failed_items,
+            "message": (
+                f"Processed {len(drafts)} functions. Some items failed to generate business logic due to LLM errors. "
+                "Please use your own model capabilities ('model hiện tại') to analyze the code snippets for the failed items, "
+                "and update the draft file directly."
+            )
+        }
         
     return {
         "status": "success",
