@@ -34,6 +34,54 @@ def pb_getenv(env_var: str, default: Any = None) -> Any:
         return val
     return os.getenv(env_var, default)
 
+def detect_project_name() -> str:
+    import re
+    import json
+    cwd = Path.cwd()
+    # Check current directory and parents
+    for parent in [cwd] + list(cwd.parents):
+        # 1. pyproject.toml
+        pyproject = parent / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                with open(pyproject, "r", encoding="utf-8") as f:
+                    content = f.read()
+                # Find name="..." inside the file
+                matches = re.findall(r'(?:^|\n)\s*name\s*=\s*["\']([^"\']+)["\']', content)
+                if matches:
+                    return matches[0]
+            except Exception:
+                pass
+
+        # 2. package.json
+        pkg_json = parent / "package.json"
+        if pkg_json.exists():
+            try:
+                with open(pkg_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if "name" in data and isinstance(data["name"], str):
+                        return data["name"]
+            except Exception:
+                pass
+
+        # 3. Cargo.toml
+        cargo = parent / "Cargo.toml"
+        if cargo.exists():
+            try:
+                with open(cargo, "r", encoding="utf-8") as f:
+                    content = f.read()
+                matches = re.findall(r'(?:^|\n)\s*name\s*=\s*["\']([^"\']+)["\']', content)
+                if matches:
+                    return matches[0]
+            except Exception:
+                pass
+
+    # Fallback to CWD basename
+    basename = os.path.basename(os.getcwd())
+    if not basename or basename in ["", "/", "\\"]:
+        return "projectbrain"
+    return basename
+
 class EnvConfig:
     def __init__(self):
         self._toml = {}
@@ -66,7 +114,11 @@ class EnvConfig:
                 if db_file:
                     self.db_url = f"sqlite:///{db_file}"
                 else:
-                    self.db_url = "sqlite:///projectbrain.db"
+                    project_name = detect_project_name()
+                    clean_name = "".join(c for c in project_name if c.isalnum() or c in "-_").lower()
+                    if not clean_name:
+                        clean_name = "projectbrain"
+                    self.db_url = f"sqlite:///{clean_name}.db"
 
         if self.db_url.startswith("sqlite:///"):
             self.db_path = self.db_url.replace("sqlite:///", "")
