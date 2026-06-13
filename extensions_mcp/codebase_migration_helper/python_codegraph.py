@@ -221,82 +221,318 @@ def parse_regex(relative_path, code, lang):
     defined_symbols = {}
     
     file_node_id = f"{relative_path}::File"
-    
-    class_pattern = re.compile(r'(?:public|protected|private|static|\s|^)class\s+([a-zA-Z0-9_]+)')
-    method_pattern = re.compile(r'(?:public|protected|private|static|\s)+[a-zA-Z0-9_<>\[\]]+ +([a-zA-Z0-9_]+)\s*\([^)]*\)\s*\{')
-    
     lines = code.split("\n")
-    current_class_id = None
     
-    for idx, line in enumerate(lines):
-        line_num = idx + 1
+    if lang == "cobol":
+        div_pat = re.compile(r'^\s*(IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION\.', re.IGNORECASE)
+        sec_pat = re.compile(r'^\s*([A-Z0-9\-]+)\s+SECTION\.', re.IGNORECASE)
+        para_pat = re.compile(r'^\s*([A-Z0-9\-]+)\.\s*$', re.IGNORECASE)
         
-        m_class = class_pattern.search(line)
-        if m_class:
-            class_name = m_class.group(1)
-            class_id = f"{relative_path}::Class::{class_name}"
-            nodes.append({
-                "id": class_id,
-                "kind": "class",
-                "name": class_name,
-                "qualified_name": class_name,
-                "file_path": relative_path,
-                "language": lang,
-                "start_line": line_num,
-                "end_line": line_num,
-                "start_column": line.find(class_name),
-                "end_column": line.find(class_name) + len(class_name),
-                "docstring": "",
-                "signature": f"class {class_name}",
-                "visibility": "public"
-            })
-            edges.append({
-                "source": file_node_id,
-                "target": class_id,
-                "kind": "contains",
-                "line": line_num,
-                "col": line.find(class_name)
-            })
-            defined_symbols[class_name] = class_id
-            current_class_id = class_id
-            continue
+        current_division = None
+        current_section = None
+        
+        for idx, line in enumerate(lines):
+            line_num = idx + 1
+            cleaned = line.strip()
             
-        m_method = method_pattern.search(line)
-        if m_method:
-            method_name = m_method.group(1)
-            if method_name in ("if", "for", "while", "switch", "catch", "return"):
+            m_div = div_pat.match(cleaned)
+            if m_div:
+                div_name = f"{m_div.group(1).upper()} DIVISION"
+                div_id = f"{relative_path}::Division::{div_name.replace(' ', '_')}"
+                nodes.append({
+                    "id": div_id,
+                    "kind": "class",
+                    "name": div_name,
+                    "qualified_name": div_name,
+                    "file_path": relative_path,
+                    "language": "cobol",
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "start_column": 0,
+                    "end_column": len(div_name),
+                    "docstring": "",
+                    "signature": div_name,
+                    "visibility": "public"
+                })
+                edges.append({
+                    "source": file_node_id,
+                    "target": div_id,
+                    "kind": "contains",
+                    "line": line_num,
+                    "col": 0
+                })
+                current_division = div_id
+                current_section = None
                 continue
-            class_name = current_class_id.split("::")[-1] if current_class_id else None
-            qual_name = f"{class_name}.{method_name}" if class_name else method_name
-            method_id = f"{relative_path}::Function::{qual_name}"
+                
+            m_sec = sec_pat.match(cleaned)
+            if m_sec:
+                sec_name = m_sec.group(1).upper()
+                sec_id = f"{relative_path}::Section::{sec_name}"
+                parent = current_division if current_division else file_node_id
+                nodes.append({
+                    "id": sec_id,
+                    "kind": "class",
+                    "name": f"{sec_name} SECTION",
+                    "qualified_name": f"{sec_name} SECTION",
+                    "file_path": relative_path,
+                    "language": "cobol",
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "start_column": 0,
+                    "end_column": len(sec_name) + 8,
+                    "docstring": "",
+                    "signature": f"{sec_name} SECTION",
+                    "visibility": "public"
+                })
+                edges.append({
+                    "source": parent,
+                    "target": sec_id,
+                    "kind": "contains",
+                    "line": line_num,
+                    "col": 0
+                })
+                current_section = sec_id
+                continue
+                
+            m_para = para_pat.match(cleaned)
+            if m_para:
+                para_name = m_para.group(1).upper()
+                if para_name in ("IDENTIFICATION", "ENVIRONMENT", "DATA", "PROCEDURE", "SECTION", "DIVISION"):
+                    continue
+                para_id = f"{relative_path}::Function::{para_name}"
+                parent = current_section if current_section else (current_division if current_division else file_node_id)
+                nodes.append({
+                    "id": para_id,
+                    "kind": "function",
+                    "name": para_name,
+                    "qualified_name": para_name,
+                    "file_path": relative_path,
+                    "language": "cobol",
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "start_column": 0,
+                    "end_column": len(para_name),
+                    "docstring": "",
+                    "signature": f"{para_name}.",
+                    "visibility": "public"
+                })
+                edges.append({
+                    "source": parent,
+                    "target": para_id,
+                    "kind": "contains",
+                    "line": line_num,
+                    "col": 0
+                })
+                defined_symbols[para_name] = para_id
+                
+    elif lang == "vb6":
+        sub_pat = re.compile(r'^\s*(?:Public|Private|Friend)?\s*(?:Static\s+)?(?:Sub|Function|Property\s+(?:Get|Let|Set))\s+([a-zA-Z0-9_]+)', re.IGNORECASE)
+        for idx, line in enumerate(lines):
+            line_num = idx + 1
+            cleaned = line.strip()
+            m_sub = sub_pat.match(cleaned)
+            if m_sub:
+                sub_name = m_sub.group(1)
+                sub_id = f"{relative_path}::Function::{sub_name}"
+                nodes.append({
+                    "id": sub_id,
+                    "kind": "function",
+                    "name": sub_name,
+                    "qualified_name": sub_name,
+                    "file_path": relative_path,
+                    "language": "vb6",
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "start_column": line.find(sub_name),
+                    "end_column": line.find(sub_name) + len(sub_name),
+                    "docstring": "",
+                    "signature": cleaned,
+                    "visibility": "public"
+                })
+                edges.append({
+                    "source": file_node_id,
+                    "target": sub_id,
+                    "kind": "contains",
+                    "line": line_num,
+                    "col": line.find(sub_name)
+                })
+                defined_symbols[sub_name] = sub_id
+                
+    elif lang == "pascal":
+        unit_pat = re.compile(r'^\s*(?:unit|program|library)\s+([a-zA-Z0-9_]+)\s*;', re.IGNORECASE)
+        proc_pat = re.compile(r'^\s*(?:procedure|function)\s+([a-zA-Z0-9_]+)', re.IGNORECASE)
+        current_unit_id = None
+        
+        for idx, line in enumerate(lines):
+            line_num = idx + 1
+            cleaned = line.strip()
             
-            nodes.append({
-                "id": method_id,
-                "kind": "method" if current_class_id else "function",
-                "name": method_name,
-                "qualified_name": qual_name,
-                "file_path": relative_path,
-                "language": lang,
-                "start_line": line_num,
-                "end_line": line_num,
-                "start_column": line.find(method_name),
-                "end_column": line.find(method_name) + len(method_name),
-                "docstring": "",
-                "signature": line.strip().rstrip("{").strip(),
-                "visibility": "public"
-            })
+            m_unit = unit_pat.match(cleaned)
+            if m_unit:
+                unit_name = m_unit.group(1)
+                unit_id = f"{relative_path}::Class::{unit_name}"
+                nodes.append({
+                    "id": unit_id,
+                    "kind": "class",
+                    "name": unit_name,
+                    "qualified_name": unit_name,
+                    "file_path": relative_path,
+                    "language": "pascal",
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "start_column": line.find(unit_name),
+                    "end_column": line.find(unit_name) + len(unit_name),
+                    "docstring": "",
+                    "signature": cleaned,
+                    "visibility": "public"
+                })
+                edges.append({
+                    "source": file_node_id,
+                    "target": unit_id,
+                    "kind": "contains",
+                    "line": line_num,
+                    "col": line.find(unit_name)
+                })
+                current_unit_id = unit_id
+                continue
+                
+            m_proc = proc_pat.match(cleaned)
+            if m_proc:
+                proc_name = m_proc.group(1)
+                proc_id = f"{relative_path}::Function::{proc_name}"
+                parent = current_unit_id if current_unit_id else file_node_id
+                nodes.append({
+                    "id": proc_id,
+                    "kind": "function",
+                    "name": proc_name,
+                    "qualified_name": proc_name,
+                    "file_path": relative_path,
+                    "language": "pascal",
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "start_column": line.find(proc_name),
+                    "end_column": line.find(proc_name) + len(proc_name),
+                    "docstring": "",
+                    "signature": cleaned,
+                    "visibility": "public"
+                })
+                edges.append({
+                    "source": parent,
+                    "target": proc_id,
+                    "kind": "contains",
+                    "line": line_num,
+                    "col": line.find(proc_name)
+                })
+                defined_symbols[proc_name] = proc_id
+                
+    elif lang == "fortran":
+        fort_pat = re.compile(r'^\s*(?:PROGRAM|SUBROUTINE|FUNCTION)\s+([a-zA-Z0-9_]+)', re.IGNORECASE)
+        for idx, line in enumerate(lines):
+            line_num = idx + 1
+            cleaned = line.strip()
+            m_fort = fort_pat.match(cleaned)
+            if m_fort:
+                name = m_fort.group(1)
+                node_id = f"{relative_path}::Function::{name}"
+                nodes.append({
+                    "id": node_id,
+                    "kind": "function",
+                    "name": name,
+                    "qualified_name": name,
+                    "file_path": relative_path,
+                    "language": "fortran",
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "start_column": line.find(name),
+                    "end_column": line.find(name) + len(name),
+                    "docstring": "",
+                    "signature": cleaned,
+                    "visibility": "public"
+                })
+                edges.append({
+                    "source": file_node_id,
+                    "target": node_id,
+                    "kind": "contains",
+                    "line": line_num,
+                    "col": line.find(name)
+                })
+                defined_symbols[name] = node_id
+                
+    else:
+        class_pattern = re.compile(r'(?:public|protected|private|static|\s|^)class\s+([a-zA-Z0-9_]+)')
+        method_pattern = re.compile(r'(?:public|protected|private|static|\s)+[a-zA-Z0-9_<>\[\]]+ +([a-zA-Z0-9_]+)\s*\([^)]*\)\s*\{')
+        
+        current_class_id = None
+        for idx, line in enumerate(lines):
+            line_num = idx + 1
             
-            parent_id = current_class_id if current_class_id else file_node_id
-            edges.append({
-                "source": parent_id,
-                "target": method_id,
-                "kind": "contains",
-                "line": line_num,
-                "col": line.find(method_name)
-            })
-            defined_symbols[qual_name] = method_id
-            defined_symbols[method_name] = method_id
-            
+            m_class = class_pattern.search(line)
+            if m_class:
+                class_name = m_class.group(1)
+                class_id = f"{relative_path}::Class::{class_name}"
+                nodes.append({
+                    "id": class_id,
+                    "kind": "class",
+                    "name": class_name,
+                    "qualified_name": class_name,
+                    "file_path": relative_path,
+                    "language": lang,
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "start_column": line.find(class_name),
+                    "end_column": line.find(class_name) + len(class_name),
+                    "docstring": "",
+                    "signature": f"class {class_name}",
+                    "visibility": "public"
+                })
+                edges.append({
+                    "source": file_node_id,
+                    "target": class_id,
+                    "kind": "contains",
+                    "line": line_num,
+                    "col": line.find(class_name)
+                })
+                defined_symbols[class_name] = class_id
+                current_class_id = class_id
+                continue
+                
+            m_method = method_pattern.search(line)
+            if m_method:
+                method_name = m_method.group(1)
+                if method_name in ("if", "for", "while", "switch", "catch", "return"):
+                    continue
+                class_name = current_class_id.split("::")[-1] if current_class_id else None
+                qual_name = f"{class_name}.{method_name}" if class_name else method_name
+                method_id = f"{relative_path}::Function::{qual_name}"
+                
+                nodes.append({
+                    "id": method_id,
+                    "kind": "method" if current_class_id else "function",
+                    "name": method_name,
+                    "qualified_name": qual_name,
+                    "file_path": relative_path,
+                    "language": lang,
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "start_column": line.find(method_name),
+                    "end_column": line.find(method_name) + len(method_name),
+                    "docstring": "",
+                    "signature": line.strip().rstrip("{").strip(),
+                    "visibility": "public"
+                })
+                
+                parent_id = current_class_id if current_class_id else file_node_id
+                edges.append({
+                    "source": parent_id,
+                    "target": method_id,
+                    "kind": "contains",
+                    "line": line_num,
+                    "col": line.find(method_name)
+                })
+                defined_symbols[qual_name] = method_id
+                defined_symbols[method_name] = method_id
+                
     return nodes, edges, defined_symbols
 
 def detect_lang(file_path):
@@ -312,7 +548,18 @@ def detect_lang(file_path):
         ".h": "cpp",
         ".c": "c",
         ".rb": "ruby",
-        ".php": "php"
+        ".php": "php",
+        ".cbl": "cobol",
+        ".cob": "cobol",
+        ".bas": "vb6",
+        ".cls": "vb6",
+        ".frm": "vb6",
+        ".vbs": "vb6",
+        ".pas": "pascal",
+        ".dpr": "pascal",
+        ".f": "fortran",
+        ".for": "fortran",
+        ".f90": "fortran"
     }
     return mapping.get(ext, "text")
 
