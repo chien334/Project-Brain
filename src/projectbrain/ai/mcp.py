@@ -520,62 +520,79 @@ async def projectbrain_sync_codegraph(
         db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
         
     if not os.path.exists(db_path):
+        python_parser_run = False
         # Check if codegraph command is available
         codegraph_bin = shutil.which("codegraph")
         if not codegraph_bin:
             # Check if automatic installation is allowed
             allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
             if not allow_auto:
-                return (
-                    f"Error: Codegraph database not found at {db_path} and 'codegraph' CLI is not installed.\n"
-                    f"Automatic installation of dependencies is disabled for security and compliance.\n"
-                    f"Please install the dependency manually using:\n"
-                    f"  npm install -g @colbymchenry/codegraph\n"
-                    f"or, if permissions are required:\n"
-                    f"  sudo npm install -g @colbymchenry/codegraph"
-                )
-            
-            # Force install it via npm globally
-            try:
-                res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
-                if res.returncode != 0:
+                # Fallback: Run pure-Python codebase parser
+                try:
+                    from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                    run_python_parser(resolved_project_path)
+                    python_parser_run = True
+                except Exception as py_err:
                     return (
-                        f"Error: Codegraph database not found at {db_path}.\n"
-                        f"Automatic installation of 'codegraph' CLI failed with exit code {res.returncode}.\n"
-                        f"Command: npm install -g @colbymchenry/codegraph\n"
-                        f"Stdout: {res.stdout}\n"
-                        f"Stderr: {res.stderr}\n"
-                        f"Please install it manually using:\n"
-                        f"  npm install -g @colbymchenry/codegraph\n"
-                        f"or, if permissions are required:\n"
-                        f"  sudo npm install -g @colbymchenry/codegraph"
+                        f"Error: Codegraph database not found at {db_path} and 'codegraph' CLI is not installed.\n"
+                        f"Attempted to fallback to the pure-Python codebase parser but failed: {str(py_err)}.\n"
+                        f"Please install the dependency manually using:\n"
+                        f"  npm install -g @colbymchenry/codegraph"
                     )
-                # Re-check PATH
-                codegraph_bin = shutil.which("codegraph")
-                if not codegraph_bin:
-                    return (
-                        f"Error: Codegraph database not found at {db_path}.\n"
-                        f"Successfully ran 'npm install -g @colbymchenry/codegraph' but the 'codegraph' executable is still not found in your PATH.\n"
-                        f"Please ensure your npm global bin directory is included in your system's PATH."
-                    )
-            except Exception as inst_err:
-                return (
-                    f"Error: Codegraph database not found at {db_path}.\n"
-                    f"Attempted to install 'codegraph' CLI but encountered an error: {str(inst_err)}.\n"
-                    f"Please manually install it: npm install -g @colbymchenry/codegraph"
-                )
+            else:
+                # Force install it via npm globally
+                try:
+                    res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
+                    if res.returncode != 0:
+                        # Fallback to pure-Python parser if npm install fails
+                        try:
+                            from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                            run_python_parser(resolved_project_path)
+                            python_parser_run = True
+                        except Exception as py_err:
+                            return (
+                                f"Error: Codegraph database not found at {db_path}.\n"
+                                f"Automatic installation of 'codegraph' CLI failed, and Python fallback failed: {str(py_err)}.\n"
+                                f"Please install manually: npm install -g @colbymchenry/codegraph"
+                            )
+                    else:
+                        # Re-check PATH
+                        codegraph_bin = shutil.which("codegraph")
+                        if not codegraph_bin:
+                            # Fallback
+                            try:
+                                from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                                run_python_parser(resolved_project_path)
+                                python_parser_run = True
+                            except Exception as py_err:
+                                return (
+                                    f"Error: 'codegraph' executable is still not found in PATH.\n"
+                                    f"Fallback to Python codebase parser failed: {str(py_err)}."
+                                )
+                except Exception as inst_err:
+                    # Fallback
+                    try:
+                        from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                        run_python_parser(resolved_project_path)
+                        python_parser_run = True
+                    except Exception as py_err:
+                        return (
+                            f"Error: Codegraph database not found at {db_path}.\n"
+                            f"Attempted to install 'codegraph' CLI but failed: {str(inst_err)}, and Python fallback failed: {str(py_err)}."
+                        )
         
-        # Now we have codegraph_bin, let's run 'codegraph init' in the project directory
-        try:
-            res_init = subprocess.run([codegraph_bin, "init"], cwd=resolved_project_path, capture_output=True, text=True)
-            if res_init.returncode != 0:
-                return (
-                    f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}) in directory {resolved_project_path}.\n"
-                    f"Stdout: {res_init.stdout}\n"
-                    f"Stderr: {res_init.stderr}"
-                )
-        except Exception as init_err:
-            return f"Error executing 'codegraph init' in directory {resolved_project_path}: {str(init_err)}"
+        # Now run 'codegraph init' in the project directory if we have codegraph_bin and did not run the python parser
+        if codegraph_bin and not python_parser_run:
+            try:
+                res_init = subprocess.run([codegraph_bin, "init"], cwd=resolved_project_path, capture_output=True, text=True)
+                if res_init.returncode != 0:
+                    return (
+                        f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}) in directory {resolved_project_path}.\n"
+                        f"Stdout: {res_init.stdout}\n"
+                        f"Stderr: {res_init.stderr}"
+                    )
+            except Exception as init_err:
+                return f"Error executing 'codegraph init' in directory {resolved_project_path}: {str(init_err)}"
             
         # Re-check db path existence
         if not os.path.exists(db_path):
