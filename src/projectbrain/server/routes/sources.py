@@ -17,7 +17,8 @@ router = APIRouter(prefix="/sources", tags=["sources"])
 async def upload_document(
     file: UploadFile = File(...),
     project_id: str = Form("default"),
-    tags: Optional[str] = Form("")
+    tags: Optional[str] = Form(""),
+    author: Optional[str] = Form(None)
 ):
     try:
         file_bytes = await file.read()
@@ -44,7 +45,9 @@ async def upload_document(
             "size": len(file_bytes),
             "project_id": project_id
         }
-        
+        if author:
+            meta["author"] = author
+            
         res = await mem.add(
             content=f"Document: {filename}\n\n{markdown_content}",
             user_id=project_id,

@@ -2,6 +2,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // DOM Elements
     const currentProjectSelect = document.getElementById('currentProject');
     const btnAddProject = document.getElementById('btnAddProject');
+    const currentUser = document.getElementById('currentUser');
     
     // Version Comparison Elements
     const diffBaseProject = document.getElementById('diffBaseProject');
@@ -97,6 +98,11 @@ document.addEventListener('DOMContentLoaded', () => {
         loadProjects();
         
         // Listeners
+        currentUser.value = localStorage.getItem('currentUser') || '';
+        currentUser.addEventListener('input', () => {
+            localStorage.setItem('currentUser', currentUser.value.trim());
+        });
+
         currentProjectSelect.addEventListener('change', (e) => {
             activeUser = e.target.value.trim() || 'default';
             loadStats();
@@ -324,7 +330,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     content: content,
                     user_id: activeUser,
                     tags: tags,
-                    metadata: { source: 'dashboard' }
+                    metadata: { source: 'dashboard' },
+                    author: currentUser.value.trim()
                 })
             });
             
@@ -397,7 +404,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         query: query,
-                        user_id: activeUser
+                        user_id: activeUser,
+                        author: currentUser.value.trim()
                     })
                 });
                 if (!res.ok) throw new Error("Failed to query Gemini PM search");
@@ -432,7 +440,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     body: JSON.stringify({
                         query: query,
                         user_id: activeUser,
-                        limit: 10
+                        limit: 10,
+                        author: currentUser.value.trim()
                     })
                 });
                 if (!res.ok) throw new Error("Failed to perform raw search");
@@ -468,7 +477,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({
                     prompt: prompt,
                     doc_type: docType.value,
-                    user_id: activeUser
+                    user_id: activeUser,
+                    author: currentUser.value.trim()
                 })
             });
             if (!res.ok) throw new Error("Failed to generate document.");
@@ -1004,7 +1014,8 @@ document.addEventListener('DOMContentLoaded', () => {
             diffTargetProject.innerHTML = '<option value="">Select Target Project...</option>';
             
             projects.forEach(p => {
-                const ipSuffix = p.sync_ip ? ` (${p.sync_ip})` : '';
+                const authorStr = p.sync_author ? ` by ${p.sync_author}` : '';
+                const ipSuffix = (p.sync_ip || p.sync_author) ? ` (${p.sync_ip || ''}${authorStr})` : '';
                 
                 // Code Graph dropdown
                 const opt = document.createElement('option');
@@ -1227,6 +1238,7 @@ document.addEventListener('DOMContentLoaded', () => {
         formData.append('file', file);
         formData.append('project_id', activeProj);
         formData.append('tags', tags);
+        formData.append('author', currentUser.value.trim());
         
         try {
             const res = await fetch('/sources/upload', {

@@ -24,7 +24,8 @@ async def projectbrain_query(
     at: str = None,
     k: int = 10,
     user_id: str = None,
-    sector: str = None
+    sector: str = None,
+    author: str = None
 ) -> str:
     """
     Query ProjectBrain for contextual memories (HSG) and/or temporal facts.
@@ -37,8 +38,13 @@ async def projectbrain_query(
         k: Max results for HSG queries.
         user_id: Isolate results to specific user.
         sector: Restrict to sector (lexical, semantic, etc).
+        author: Optional name of the user performing the search.
     """
     try:
+        import getpass
+        resolved_author = author or os.getenv("PB_USER_NAME") or os.getenv("OM_USER_NAME") or os.getenv("USER") or getpass.getuser() or "anonymous-mcp"
+        logger.info(f"MCP User '{resolved_author}' queried: '{query}' on project '{user_id or 'default'}'")
+
         # Normalize and validate qtype
         qtype = type
         if not qtype or not isinstance(qtype, str):
@@ -122,7 +128,8 @@ async def projectbrain_store(
     facts: list = None,
     user_id: str = None,
     tags: list = None,
-    metadata: dict = None
+    metadata: dict = None,
+    author: str = None
 ) -> str:
     """
     Persist new content into ProjectBrain (HSG contextual memory and/or temporal facts).
@@ -134,8 +141,10 @@ async def projectbrain_store(
         user_id: User ID associated with the changes.
         tags: Custom tags for organizing memories.
         metadata: Custom metadata dictionary.
+        author: Optional name of the user storing the memory.
     """
     try:
+        import getpass
         # Normalize and validate stype
         stype = type
         if not stype or not isinstance(stype, str):
@@ -159,6 +168,8 @@ async def projectbrain_store(
         meta = metadata or {}
         meta["editor"] = "mcp-client"
         meta["editor_user"] = uid
+        resolved_author = author or os.getenv("PB_USER_NAME") or os.getenv("OM_USER_NAME") or os.getenv("USER") or getpass.getuser() or "anonymous-mcp"
+        meta["author"] = resolved_author
         if "tags" not in meta:
             meta["tags"] = actual_tags
 
@@ -343,16 +354,18 @@ async def projectbrain_ingest(source: str, creds: dict = None, filters: dict = N
         return f"Error: {str(e)}"
 
 @mcp_server.tool(name="projectbrain_sync_codegraph", description="Synchronize local codegraph database structure (nodes/edges) to ProjectBrain by project ID.")
-async def projectbrain_sync_codegraph(project_id: str) -> str:
+async def projectbrain_sync_codegraph(project_id: str, author: str = None) -> str:
     """
     Synchronize the local codegraph database (.codegraph/codegraph.db in current working directory)
     to the ProjectBrain server under the specified project ID.
     
     Args:
         project_id: Unique identifier for the project (e.g. 'projectbrain-py').
+        author: Optional name of the user performing the sync.
     """
     import sqlite3
     import os
+    import getpass
     
     db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
     if not os.path.exists(db_path):
@@ -373,11 +386,14 @@ async def projectbrain_sync_codegraph(project_id: str) -> str:
         
         from ..server.routes.codegraph import sync_codegraph_data, SyncRequest
         
+        resolved_author = author or os.getenv("PB_USER_NAME") or os.getenv("OM_USER_NAME") or os.getenv("USER") or getpass.getuser() or "anonymous-mcp"
+        
         req = SyncRequest(
             project_id=project_id,
             project_name=project_id,
             nodes=nodes,
-            edges=edges
+            edges=edges,
+            author=resolved_author
         )
         
         res = await sync_codegraph_data(req)

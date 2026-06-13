@@ -11,15 +11,21 @@ class PMSearchRequest(BaseModel):
     query: str
     user_id: Optional[str] = None
     limit: Optional[int] = 10
+    author: Optional[str] = None
 
 class PMDocRequest(BaseModel):
     prompt: str
     doc_type: str = "status_report" # status_report, prd, user_story, roadmap
     user_id: Optional[str] = None
+    author: Optional[str] = None
 
 @router.post("/search")
 async def pm_search(req: PMSearchRequest):
     try:
+        import logging
+        logger = logging.getLogger("server")
+        logger.info(f"User '{req.author or 'anonymous'}' triggered PM RAG search: '{req.query}' on project '{req.user_id or 'all'}'")
+
         # 1. Search ProjectBrain
         mems = await mem.search(req.query, user_id=req.user_id, limit=req.limit)
         
@@ -57,6 +63,10 @@ Thông tin ký ức tìm thấy:
 @router.post("/generate-doc")
 async def pm_generate_doc(req: PMDocRequest):
     try:
+        import logging
+        logger = logging.getLogger("server")
+        logger.info(f"User '{req.author or 'anonymous'}' triggered PM document generation (Type: {req.doc_type}) for prompt: '{req.prompt}' on project '{req.user_id or 'all'}'")
+
         # 1. Search memories related to the prompt
         mems = await mem.search(req.prompt, user_id=req.user_id, limit=20)
         

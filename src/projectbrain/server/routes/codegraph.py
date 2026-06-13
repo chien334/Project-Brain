@@ -14,6 +14,7 @@ class SyncRequest(BaseModel):
     project_name: str
     nodes: List[Dict[str, Any]]
     edges: List[Dict[str, Any]]
+    author: Optional[str] = None
 
 class CreateProjectRequest(BaseModel):
     id: str
@@ -28,7 +29,7 @@ async def get_projects():
     db.connect()
     try:
         cursor = db.conn.cursor()
-        cursor.execute("SELECT id, name, description, created_at, updated_at, sync_ip FROM projects ORDER BY name ASC;")
+        cursor.execute("SELECT id, name, description, created_at, updated_at, sync_ip, sync_author FROM projects ORDER BY name ASC;")
         rows = cursor.fetchall()
         
         projects = []
@@ -40,7 +41,8 @@ async def get_projects():
                     "description": r[2],
                     "created_at": r[3],
                     "updated_at": r[4],
-                    "sync_ip": r[5]
+                    "sync_ip": r[5],
+                    "sync_author": r[6]
                 })
             else:
                 projects.append(dict(r))
@@ -442,8 +444,8 @@ async def sync_codegraph_data(req: SyncRequest, request: Request = None):
             
             # Insert project
             cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip) VALUES (%s, %s, %s, %s, %s, %s)",
-                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts, client_ip)
+                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip, sync_author) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts, client_ip, req.author or "anonymous")
             )
             
             # Batch insert nodes
@@ -494,8 +496,8 @@ async def sync_codegraph_data(req: SyncRequest, request: Request = None):
             cursor.execute("DELETE FROM projects WHERE id = ?", (req.project_id,))
             
             cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip) VALUES (?, ?, ?, ?, ?, ?)",
-                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts, client_ip)
+                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip, sync_author) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts, client_ip, req.author or "anonymous")
             )
             
             if req.nodes:

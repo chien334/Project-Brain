@@ -223,13 +223,17 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
         
         print(f"Found {len(nodes)} nodes and {len(edges)} edges. Synchronizing to {server_url}/codegraph/sync...")
         
+        import getpass
+        author = os.getenv("PB_USER_NAME") or os.getenv("OM_USER_NAME") or os.getenv("USER") or getpass.getuser() or "anonymous"
+        
         resp = httpx.post(
             f"{server_url}/codegraph/sync",
             json={
                 "project_id": project_id,
                 "project_name": project_id,
                 "nodes": nodes,
-                "edges": edges
+                "edges": edges,
+                "author": author
             },
             timeout=120.0
         )

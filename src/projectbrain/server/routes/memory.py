@@ -12,12 +12,14 @@ class AddMemoryRequest(BaseModel):
     user_id: Optional[str] = None
     tags: Optional[List[str]] = []
     metadata: Optional[Dict[str, Any]] = {}
+    author: Optional[str] = None
 
 class SearchMemoryRequest(BaseModel):
     query: str
     user_id: Optional[str] = None
     limit: Optional[int] = 10
     filters: Optional[Dict[str, Any]] = {}
+    author: Optional[str] = None
 
 class DeleteAllRequest(BaseModel):
     user_id: Optional[str] = None
@@ -27,6 +29,7 @@ async def add_memory(req: AddMemoryRequest):
     try:
         meta = req.metadata or {}
         if req.tags: meta["tags"] = req.tags
+        if req.author: meta["author"] = req.author
 
         result = await mem.add(req.content, user_id=req.user_id, meta=meta, tags=req.tags)
         return {"success": True, "data": result}
@@ -36,6 +39,10 @@ async def add_memory(req: AddMemoryRequest):
 @router.post("/search")
 async def search_memory(req: SearchMemoryRequest):
     try:
+        import logging
+        logger = logging.getLogger("server")
+        logger.info(f"User '{req.author or 'anonymous'}' searched: '{req.query}' on project '{req.user_id or 'all'}'")
+        
         filters = req.filters or {}
         results = await mem.search(req.query, user_id=req.user_id, limit=req.limit, **filters)
         return {"results": results}
