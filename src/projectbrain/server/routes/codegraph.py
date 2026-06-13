@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import sqlite3
@@ -28,7 +28,7 @@ async def get_projects():
     db.connect()
     try:
         cursor = db.conn.cursor()
-        cursor.execute("SELECT id, name, description, created_at, updated_at FROM projects ORDER BY name ASC;")
+        cursor.execute("SELECT id, name, description, created_at, updated_at, sync_ip FROM projects ORDER BY name ASC;")
         rows = cursor.fetchall()
         
         projects = []
@@ -39,7 +39,8 @@ async def get_projects():
                     "name": r[1],
                     "description": r[2],
                     "created_at": r[3],
-                    "updated_at": r[4]
+                    "updated_at": r[4],
+                    "sync_ip": r[5]
                 })
             else:
                 projects.append(dict(r))
@@ -415,9 +416,19 @@ async def get_codegraph_data(
         )
 
 @router.post("/sync")
-async def sync_codegraph_data(req: SyncRequest):
+async def sync_codegraph_data(req: SyncRequest, request: Request = None):
+    if not req.nodes:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot sync empty codegraph data. Ensure that you have run 'codegraph init' and indexed files locally before syncing."
+        )
+
     db.connect()
     ts = int(time.time())
+    client_ip = "127.0.0.1"
+    if request and request.client:
+        client_ip = request.client.host
+
     
     try:
         cursor = db.conn.cursor()
@@ -431,8 +442,8 @@ async def sync_codegraph_data(req: SyncRequest):
             
             # Insert project
             cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (%s, %s, %s, %s, %s)",
-                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts)
+                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip) VALUES (%s, %s, %s, %s, %s, %s)",
+                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts, client_ip)
             )
             
             # Batch insert nodes
@@ -483,8 +494,8 @@ async def sync_codegraph_data(req: SyncRequest):
             cursor.execute("DELETE FROM projects WHERE id = ?", (req.project_id,))
             
             cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts)
+                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip) VALUES (?, ?, ?, ?, ?, ?)",
+                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts, client_ip)
             )
             
             if req.nodes:

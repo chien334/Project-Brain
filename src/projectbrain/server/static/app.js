@@ -1004,27 +1004,29 @@ document.addEventListener('DOMContentLoaded', () => {
             diffTargetProject.innerHTML = '<option value="">Select Target Project...</option>';
             
             projects.forEach(p => {
+                const ipSuffix = p.sync_ip ? ` (${p.sync_ip})` : '';
+                
                 // Code Graph dropdown
                 const opt = document.createElement('option');
                 opt.value = p.id;
-                opt.textContent = `${p.name} (Server)`;
+                opt.textContent = `${p.name}${ipSuffix} (Server)`;
                 cgProjectSelect.appendChild(opt);
                 
                 // Global active dropdown
                 const optGlobal = document.createElement('option');
                 optGlobal.value = p.id;
-                optGlobal.textContent = p.name;
+                optGlobal.textContent = `${p.name}${ipSuffix}`;
                 currentProjectSelect.appendChild(optGlobal);
                 
                 // Diff dropdowns
                 const optBase = document.createElement('option');
                 optBase.value = p.id;
-                optBase.textContent = p.name;
+                optBase.textContent = `${p.name}${ipSuffix}`;
                 diffBaseProject.appendChild(optBase);
                 
                 const optTarget = document.createElement('option');
                 optTarget.value = p.id;
-                optTarget.textContent = p.name;
+                optTarget.textContent = `${p.name}${ipSuffix}`;
                 diffTargetProject.appendChild(optTarget);
             });
             
