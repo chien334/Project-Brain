@@ -408,16 +408,82 @@ async def projectbrain_ingest(source: str, creds: dict = None, filters: dict = N
         traceback.print_exc(file=sys.stderr)
         return f"Error: {str(e)}"
 
-@mcp_server.tool(name="projectbrain_sync_codegraph", description="Synchronize local codegraph database structure (nodes/edges) to ProjectBrain by project ID and branch.")
-async def projectbrain_sync_codegraph(project_id: str, project_path: str = None, branch: str = None, author: str = None) -> str:
+async def sync_codebase_memories(project_id: str, dir_path: str) -> dict:
+    import os
+    exclude_dirs = {
+        ".git", "node_modules", "dist", "build", "__pycache__", 
+        ".pytest_cache", ".codegraph", "cloned_repos", "bin", "obj", 
+        ".vs", "uploads", "venv", ".venv", ".next", ".nuxt", ".out", 
+        "target", "vendor", "staticwebassets"
+    }
+    exclude_exts = {
+        ".db", ".sqlite", ".sqlite3",
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg",
+        ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
+        ".exe", ".bin", ".dll", ".pdb", ".so", ".dylib",
+        ".woff", ".woff2", ".ttf", ".eot",
+        ".cache", ".up2date", ".log",
+        ".suo", ".user", ".map", ".lock",
+        ".mp3", ".mp4", ".wav", ".avi", ".mov", ".flac", ".ogg",
+        ".dll.config", ".exe.config"
+    }
+    
+    count = 0
+    errors = 0
+    
+    for root, dirs, files in os.walk(dir_path):
+        dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")]
+        for file in files:
+            ext = os.path.splitext(file)[1].lower()
+            if ext in exclude_exts:
+                continue
+            file_path = os.path.join(root, file)
+            parts = file_path.split(os.sep)
+            if any(p in exclude_dirs for p in parts):
+                continue
+            
+            rel_path = os.path.relpath(file_path, dir_path)
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                if not content.strip():
+                    continue
+                meta = {
+                    "source": "mcp_sync_all",
+                    "filename": file,
+                    "file_path": rel_path,
+                    "project_id": project_id
+                }
+                await mem.add(
+                    content=f"File: {rel_path}\n\n{content}",
+                    user_id=project_id,
+                    meta=meta,
+                    tags=["codebase", "file"]
+                )
+                count += 1
+            except Exception as e:
+                logger.error(f"Failed to ingest {rel_path} in MCP sync: {e}")
+                errors += 1
+                
+    return {"total_ingested": count, "total_errors": errors}
+
+@mcp_server.tool(name="projectbrain_sync_codegraph", description="Synchronize local codegraph database structure (nodes/edges) and codebase files (as memories) to ProjectBrain.")
+async def projectbrain_sync_codegraph(
+    project_id: str, 
+    project_path: str = None, 
+    branch: str = None, 
+    sync_memories: bool = True,
+    author: str = None
+) -> str:
     """
     Synchronize the local codegraph database (.codegraph/codegraph.db in current working directory or specified project path)
-    to the ProjectBrain server under the specified project ID and branch.
+    to the ProjectBrain server under the specified project ID and branch, and optionally ingest files into memories.
     
     Args:
         project_id: Unique identifier for the project (e.g. 'projectbrain-py').
         project_path: Optional local path to the project directory containing .codegraph/
         branch: Optional branch name to associate with the synchronization. If not specified, tries to auto-detect the active git branch.
+        sync_memories: If True (default), scans and ingests all text source files as memories.
         author: Optional name of the user performing the sync.
     """
     import sqlite3
@@ -441,6 +507,9 @@ async def projectbrain_sync_codegraph(project_id: str, project_path: str = None,
             cursor.close()
         except Exception:
             pass
+
+    target_dir = resolved_project_path if (resolved_project_path and os.path.isdir(resolved_project_path)) else os.getcwd()
+    resolved_project_path = os.path.abspath(target_dir)
 
     if resolved_project_path:
         if os.path.isdir(resolved_project_path):
@@ -485,17 +554,16 @@ async def projectbrain_sync_codegraph(project_id: str, project_path: str = None,
                 )
         
         # Now we have codegraph_bin, let's run 'codegraph init' in the project directory
-        target_dir = resolved_project_path if (resolved_project_path and os.path.isdir(resolved_project_path)) else os.getcwd()
         try:
-            res_init = subprocess.run([codegraph_bin, "init"], cwd=target_dir, capture_output=True, text=True)
+            res_init = subprocess.run([codegraph_bin, "init"], cwd=resolved_project_path, capture_output=True, text=True)
             if res_init.returncode != 0:
                 return (
-                    f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}) in directory {target_dir}.\n"
+                    f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}) in directory {resolved_project_path}.\n"
                     f"Stdout: {res_init.stdout}\n"
                     f"Stderr: {res_init.stderr}"
                 )
         except Exception as init_err:
-            return f"Error executing 'codegraph init' in directory {target_dir}: {str(init_err)}"
+            return f"Error executing 'codegraph init' in directory {resolved_project_path}: {str(init_err)}"
             
         # Re-check db path existence
         if not os.path.exists(db_path):
@@ -519,8 +587,8 @@ async def projectbrain_sync_codegraph(project_id: str, project_path: str = None,
         if not resolved_branch:
             try:
                 git_bin = shutil.which("git")
-                if git_bin and os.path.exists(os.path.join(target_dir, ".git")):
-                    res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], cwd=target_dir, capture_output=True, text=True)
+                if git_bin and os.path.exists(os.path.join(resolved_project_path, ".git")):
+                    res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], cwd=resolved_project_path, capture_output=True, text=True)
                     if res_git.returncode == 0:
                         resolved_branch = res_git.stdout.strip()
             except Exception:
@@ -534,7 +602,7 @@ async def projectbrain_sync_codegraph(project_id: str, project_path: str = None,
                 sync_project_id = f"{project_id}:{resolved_branch}"
         else:
             sync_project_id = project_id
-
+ 
         from ..server.routes.codegraph import sync_codegraph_data, SyncRequest
         
         resolved_author = author or os.getenv("PB_USER_NAME") or os.getenv("OM_USER_NAME") or os.getenv("USER") or getpass.getuser() or "anonymous-mcp"
@@ -549,6 +617,17 @@ async def projectbrain_sync_codegraph(project_id: str, project_path: str = None,
         )
         
         res = await sync_codegraph_data(req)
+        
+        mem_res = None
+        if sync_memories:
+            mem_res = await sync_codebase_memories(sync_project_id, resolved_project_path)
+            res["memories"] = mem_res
+            res["message"] = (
+                f"Successfully synchronized {len(nodes)} nodes, {len(edges)} edges, "
+                f"and ingested {mem_res['total_ingested']} codebase files as memories "
+                f"(with {mem_res['total_errors']} errors)!"
+            )
+            
         return json.dumps(res, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)

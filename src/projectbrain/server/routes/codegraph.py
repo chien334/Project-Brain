@@ -251,7 +251,10 @@ async def get_codegraph_data(
             cursor = db.conn.cursor()
             
             # Build node query for Server Db
-            where_clauses = ["project_id = " + ("%s" if db.is_postgres else "?")]
+            if "%" in project_id or "_" in project_id:
+                where_clauses = ["project_id LIKE " + ("%s" if db.is_postgres else "?")]
+            else:
+                where_clauses = ["project_id = " + ("%s" if db.is_postgres else "?")]
             params = [project_id]
             
             if query:
@@ -301,10 +304,11 @@ async def get_codegraph_data(
                 
             # Query edges connecting these nodes
             placeholders = ",".join(["%s" if db.is_postgres else "?"] * len(node_ids))
+            edge_op = "LIKE" if ("%" in project_id or "_" in project_id) else "="
             edges_query = f"""
                 SELECT id, source, target, kind, metadata, line, col
                 FROM project_edges
-                WHERE project_id = {("%s" if db.is_postgres else "?")} 
+                WHERE project_id {edge_op} {("%s" if db.is_postgres else "?")} 
                   AND source IN ({placeholders}) 
                   AND target IN ({placeholders})
             """

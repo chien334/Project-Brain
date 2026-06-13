@@ -21,8 +21,10 @@ exports
 *.vsix
 __pycache__
 test
-*.db
 hits.json
 debug_*.log
 .codegraph/
 cloned_repos/
+*.db
+*.db-shm
+*.db-wal

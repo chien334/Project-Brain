@@ -90,8 +90,12 @@ class PostgresVectorStore(VectorStore):
         arg_idx = 3
 
         if filter and filter.get("user_id"):
-            filter_sql += f" AND user_id=${arg_idx}"
-            args.append(filter["user_id"])
+            uid = filter["user_id"]
+            if "%" in uid or "_" in uid:
+                filter_sql += f" AND user_id LIKE ${arg_idx}"
+            else:
+                filter_sql += f" AND user_id=${arg_idx}"
+            args.append(uid)
             arg_idx += 1
         sql = f"""
             SELECT id, 1 - (v <=> $1::vector) as similarity

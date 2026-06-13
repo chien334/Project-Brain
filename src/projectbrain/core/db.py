@@ -228,6 +228,8 @@ class Queries:
         db.commit()
 
     def all_mem_by_user(self, user_id: str, limit=10, offset=0):
+        if user_id and ("%" in user_id or "_" in user_id):
+            return db.fetchall("SELECT * FROM memories WHERE user_id LIKE ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (user_id, limit, offset))
         return db.fetchall("SELECT * FROM memories WHERE user_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?", (user_id, limit, offset))
 
     def get_waypoints_by_src(self, src_id: str):
@@ -240,9 +242,14 @@ class Queries:
         db.commit()
 
     def del_mem_by_user(self, uid: str):
-        db.execute("DELETE FROM vectors WHERE id IN (SELECT id FROM memories WHERE user_id=?)", (uid,))
-        db.execute("DELETE FROM waypoints WHERE src_id IN (SELECT id FROM memories WHERE user_id=?) OR dst_id IN (SELECT id FROM memories WHERE user_id=?)", (uid, uid))
-        db.execute("DELETE FROM memories WHERE user_id=?", (uid,))
+        if uid and ("%" in uid or "_" in uid):
+            db.execute("DELETE FROM vectors WHERE id IN (SELECT id FROM memories WHERE user_id LIKE ?)", (uid,))
+            db.execute("DELETE FROM waypoints WHERE src_id IN (SELECT id FROM memories WHERE user_id LIKE ?) OR dst_id IN (SELECT id FROM memories WHERE user_id LIKE ?)", (uid, uid))
+            db.execute("DELETE FROM memories WHERE user_id LIKE ?", (uid,))
+        else:
+            db.execute("DELETE FROM vectors WHERE id IN (SELECT id FROM memories WHERE user_id=?)", (uid,))
+            db.execute("DELETE FROM waypoints WHERE src_id IN (SELECT id FROM memories WHERE user_id=?) OR dst_id IN (SELECT id FROM memories WHERE user_id=?)", (uid, uid))
+            db.execute("DELETE FROM memories WHERE user_id=?", (uid,))
         db.commit()
 
 q = Queries()

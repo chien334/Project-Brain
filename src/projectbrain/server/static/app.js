@@ -1,6 +1,8 @@
 document.addEventListener('DOMContentLoaded', () => {
     // DOM Elements
     const currentProjectSelect = document.getElementById('currentProject');
+    const currentBranchSelect = document.getElementById('currentBranch');
+    const branchSelectorContainer = document.getElementById('branchSelectorContainer');
     const btnAddProject = document.getElementById('btnAddProject');
     const currentUser = document.getElementById('currentUser');
     
@@ -85,7 +87,62 @@ document.addEventListener('DOMContentLoaded', () => {
     let cgNodesList = [];
 
     // State
-    let activeUser = currentProjectSelect.value || 'default';
+    let activeUser = 'default';
+    let projectGroups = {};
+    
+    function updateBranchDropdown(baseId) {
+        currentBranchSelect.innerHTML = '';
+        const group = projectGroups[baseId];
+        
+        if (!group || !group.branches || group.branches.size === 0) {
+            branchSelectorContainer.style.display = 'none';
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = 'Default Branch';
+            currentBranchSelect.appendChild(opt);
+            return;
+        }
+        
+        branchSelectorContainer.style.display = 'flex';
+        
+        const optAll = document.createElement('option');
+        optAll.value = '%';
+        optAll.textContent = 'All Branches';
+        currentBranchSelect.appendChild(optAll);
+        
+        // Convert branches set to sorted array
+        const branchList = Array.from(group.branches).sort();
+        branchList.forEach(branch => {
+            const opt = document.createElement('option');
+            opt.value = branch;
+            opt.textContent = branch;
+            currentBranchSelect.appendChild(opt);
+        });
+        
+        // Restore cached branch
+        const cached = localStorage.getItem(`branch_${baseId}`) || '%';
+        if (Array.from(currentBranchSelect.options).some(o => o.value === cached)) {
+            currentBranchSelect.value = cached;
+        } else {
+            currentBranchSelect.value = '%';
+        }
+    }
+    
+    function recalculateActiveUser() {
+        const selectedProj = currentProjectSelect.value.trim() || 'default';
+        const selectedBranch = currentBranchSelect.value;
+        
+        if (selectedProj === 'default') {
+            activeUser = 'default';
+        } else if (selectedBranch === '%') {
+            activeUser = `${selectedProj}:%`;
+        } else if (selectedBranch) {
+            activeUser = `${selectedProj}:${selectedBranch}`;
+        } else {
+            activeUser = selectedProj;
+        }
+        console.log("Recalculated activeUser:", activeUser);
+    }
     
     // Initialize Dashboard
     init();
@@ -111,7 +168,38 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         currentProjectSelect.addEventListener('change', (e) => {
-            activeUser = e.target.value.trim() || 'default';
+            const selectedProj = e.target.value.trim() || 'default';
+            localStorage.setItem('activeProject', selectedProj);
+            updateBranchDropdown(selectedProj);
+            recalculateActiveUser();
+            
+            loadStats();
+            loadMemories();
+            
+            // Sync active project to the server
+            fetch('/memory/active-project', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ project_id: activeUser })
+            }).catch(err => console.error('Failed to sync active project to server:', err));
+            
+            // Sync with Code Graph selector
+            if (cgProjectSelect) {
+                cgProjectSelect.value = activeUser === 'default' ? '' : activeUser;
+            }
+            
+            // Trigger graph reload if Code Graph tab is active
+            const cgTab = document.getElementById('codeGraphTab');
+            if (cgTab && cgTab.classList.contains('active')) {
+                loadCodeGraph();
+            }
+        });
+        
+        currentBranchSelect.addEventListener('change', () => {
+            const selectedProj = currentProjectSelect.value.trim() || 'default';
+            localStorage.setItem(`branch_${selectedProj}`, currentBranchSelect.value);
+            recalculateActiveUser();
+            
             loadStats();
             loadMemories();
             
@@ -220,6 +308,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (targetTab === 'codeGraphTab') {
                     loadProjects();
                     setTimeout(loadCodeGraph, 100);
+                } else if (targetTab === 'compareTab') {
+                    loadProjects();
                 }
             });
         });
@@ -228,7 +318,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // API calls
     async function loadStats() {
         try {
-            const res = await fetch(`/memory/stats?user_id=${activeUser}`);
+            const res = await fetch(`/memory/stats?user_id=${encodeURIComponent(activeUser)}`);
             if (!res.ok) throw new Error("Failed to load stats");
             const data = await res.json();
             
@@ -278,7 +368,7 @@ document.addEventListener('DOMContentLoaded', () => {
     async function loadMemories() {
         memoriesFeed.innerHTML = `<div class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading...</div>`;
         try {
-            const res = await fetch(`/memory/history?user_id=${activeUser}&limit=30`);
+            const res = await fetch(`/memory/history?user_id=${encodeURIComponent(activeUser)}&limit=30`);
             if (!res.ok) throw new Error("Failed to load history");
             const data = await res.json();
             
@@ -346,6 +436,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function saveMemory() {
+        if (activeUser.includes('%')) {
+            alert("Cannot store memories when 'All Branches' is selected. Please select a specific branch.");
+            return;
+        }
         const content = newMemoryContent.value.trim();
         if (!content) return alert("Memory content cannot be empty.");
         
@@ -1031,54 +1125,119 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await res.json();
             const projects = data.projects || [];
             
+            // 1. Group projects by base ID
+            projectGroups = {};
+            projects.forEach(p => {
+                let baseId = p.id;
+                let branchName = "";
+                if (p.id.includes(':')) {
+                    const parts = p.id.split(':');
+                    baseId = parts[0];
+                    branchName = parts.slice(1).join(':');
+                }
+                
+                if (!projectGroups[baseId]) {
+                    projectGroups[baseId] = {
+                        id: baseId,
+                        name: p.name || baseId,
+                        branches: new Set(),
+                        sync_ip: p.sync_ip,
+                        sync_author: p.sync_author,
+                        project_path: p.project_path
+                    };
+                }
+                if (branchName) {
+                    projectGroups[baseId].branches.add(branchName);
+                }
+            });
+
             // Populate cgProjectSelect
             const currentVal = cgProjectSelect.value;
             cgProjectSelect.innerHTML = '<option value="">Local Codegraph (Default)</option>';
+            Object.values(projectGroups).forEach(group => {
+                const authorStr = group.sync_author ? ` by ${group.sync_author}` : '';
+                const ipSuffix = (group.sync_ip || group.sync_author) ? ` (${group.sync_ip || ''}${authorStr})` : '';
+                
+                if (group.branches.size > 0) {
+                    // Add wildcard option
+                    const optAll = document.createElement('option');
+                    optAll.value = `${group.id}:%`;
+                    optAll.textContent = `${group.name} (All Branches)${ipSuffix} (Server)`;
+                    cgProjectSelect.appendChild(optAll);
+                    
+                    // Add branch-specific options
+                    group.branches.forEach(branch => {
+                        const opt = document.createElement('option');
+                        opt.value = `${group.id}:${branch}`;
+                        opt.textContent = `${group.name}:${branch}${ipSuffix} (Server)`;
+                        cgProjectSelect.appendChild(opt);
+                    });
+                } else {
+                    const opt = document.createElement('option');
+                    opt.value = group.id;
+                    opt.textContent = `${group.name}${ipSuffix} (Server)`;
+                    cgProjectSelect.appendChild(opt);
+                }
+            });
             
-            // Populate currentProjectSelect
+            // Populate currentProjectSelect (Global Active project selector)
             const currentGlobalVal = currentProjectSelect.value;
             currentProjectSelect.innerHTML = '<option value="default">default</option>';
+            Object.values(projectGroups).forEach(group => {
+                const optGlobal = document.createElement('option');
+                optGlobal.value = group.id;
+                const authorStr = group.sync_author ? ` by ${group.sync_author}` : '';
+                const ipSuffix = (group.sync_ip || group.sync_author) ? ` (${group.sync_ip || ''}${authorStr})` : '';
+                optGlobal.textContent = `${group.id}${ipSuffix}`;
+                currentProjectSelect.appendChild(optGlobal);
+            });
             
-            // Populate base and target selects
+            // Populate base and target selects for Diff comparison
             const currentBaseVal = diffBaseProject.value;
             const currentTargetVal = diffTargetProject.value;
             diffBaseProject.innerHTML = '<option value="">Select Base Project...</option>';
             diffTargetProject.innerHTML = '<option value="">Select Target Project...</option>';
-            
             projects.forEach(p => {
                 const authorStr = p.sync_author ? ` by ${p.sync_author}` : '';
                 const ipSuffix = (p.sync_ip || p.sync_author) ? ` (${p.sync_ip || ''}${authorStr})` : '';
                 
-                // Code Graph dropdown
-                const opt = document.createElement('option');
-                opt.value = p.id;
-                opt.textContent = `${p.name}${ipSuffix} (Server)`;
-                cgProjectSelect.appendChild(opt);
-                
-                // Global active dropdown
-                const optGlobal = document.createElement('option');
-                optGlobal.value = p.id;
-                optGlobal.textContent = `${p.name}${ipSuffix}`;
-                currentProjectSelect.appendChild(optGlobal);
-                
-                // Diff dropdowns
                 const optBase = document.createElement('option');
                 optBase.value = p.id;
-                optBase.textContent = `${p.name}${ipSuffix}`;
+                optBase.textContent = `${p.id}${ipSuffix}`;
                 diffBaseProject.appendChild(optBase);
                 
                 const optTarget = document.createElement('option');
                 optTarget.value = p.id;
-                optTarget.textContent = `${p.name}${ipSuffix}`;
+                optTarget.textContent = `${p.id}${ipSuffix}`;
                 diffTargetProject.appendChild(optTarget);
             });
             
+            // Restore previous values
             if (currentVal && Array.from(cgProjectSelect.options).some(o => o.value === currentVal)) {
                 cgProjectSelect.value = currentVal;
             }
-            if (currentGlobalVal && Array.from(currentProjectSelect.options).some(o => o.value === currentGlobalVal)) {
-                currentProjectSelect.value = currentGlobalVal;
+            const savedProject = localStorage.getItem('activeProject');
+            const projectToRestore = savedProject || currentGlobalVal || 'default';
+            if (projectToRestore && Array.from(currentProjectSelect.options).some(o => o.value === projectToRestore)) {
+                currentProjectSelect.value = projectToRestore;
+            } else {
+                currentProjectSelect.value = 'default';
             }
+            
+            // Update branch dropdown and activeUser based on restored currentProjectSelect
+            updateBranchDropdown(currentProjectSelect.value);
+            recalculateActiveUser();
+            
+            // Sync with server and load initial data
+            fetch('/memory/active-project', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ project_id: activeUser })
+            }).catch(err => console.error('Failed to sync active project to server:', err));
+            
+            loadStats();
+            loadMemories();
+
             if (currentBaseVal && Array.from(diffBaseProject.options).some(o => o.value === currentBaseVal)) {
                 diffBaseProject.value = currentBaseVal;
             }
@@ -1189,48 +1348,76 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             }
             
-            // Diff memories by fetching history
-            const baseMemsRes = await fetch(`/memory/history?user_id=${encodeURIComponent(base)}&limit=200`);
-            const targetMemsRes = await fetch(`/memory/history?user_id=${encodeURIComponent(target)}&limit=200`);
+            // Diff memories by fetching from the new `/memory/diff` endpoint
+            const memsDiffRes = await fetch(`/memory/diff?base_project_id=${encodeURIComponent(base)}&target_project_id=${encodeURIComponent(target)}`);
+            if (!memsDiffRes.ok) throw new Error("Failed to fetch memory diff data");
+            const memsDiffData = await memsDiffRes.json();
             
-            const baseMemsData = baseMemsRes.ok ? await baseMemsRes.json() : { history: [] };
-            const targetMemsData = targetMemsRes.ok ? await targetMemsRes.json() : { history: [] };
+            const addedMems = memsDiffData.added || [];
+            const deletedMems = memsDiffData.deleted || [];
+            const modifiedMems = memsDiffData.modified || [];
             
-            const baseHistory = baseMemsData.history || [];
-            const targetHistory = targetMemsData.history || [];
-            
-            const baseContents = baseHistory.map(m => m.content.trim());
-            const targetContents = targetHistory.map(m => m.content.trim());
-            
-            const addedMems = targetHistory.filter(m => !baseContents.includes(m.content.trim()));
-            const deletedMems = baseHistory.filter(m => !targetContents.includes(m.content.trim()));
+            // Render memory diff counts
+            document.getElementById('memCountAdded').textContent = addedMems.length;
+            document.getElementById('memCountDeleted').textContent = deletedMems.length;
+            document.getElementById('memCountModified').textContent = modifiedMems.length;
             
             diffOmList.innerHTML = '';
-            if (addedMems.length === 0 && deletedMems.length === 0) {
+            if (addedMems.length === 0 && deletedMems.length === 0 && modifiedMems.length === 0) {
                 diffOmList.innerHTML = '<div class="empty-placeholder">No memory changes.</div>';
             } else {
+                // Render added memories
                 addedMems.forEach(m => {
                     const el = document.createElement('div');
                     el.className = 'diff-item';
+                    const meta = m.meta ? (typeof m.meta === 'string' ? JSON.parse(m.meta) : m.meta) : {};
+                    const title = meta.file_path ? `${meta.file_path} (sec ${meta.section_index || 0})` : m.primary_sector;
                     el.innerHTML = `
                         <div class="diff-item-header">
-                            <span class="diff-item-title">[${escapeHTML(m.primary_sector)}]</span>
+                            <span class="diff-item-title">${escapeHTML(title)}</span>
                             <span class="diff-change-badge added">Added</span>
                         </div>
-                        <div class="diff-item-sub">${escapeHTML(m.content)}</div>
+                        <div class="diff-item-sub"><pre style="margin: 0; font-family: monospace; white-space: pre-wrap; font-size: 11px; max-height: 150px; overflow-y: auto;">${escapeHTML(m.content)}</pre></div>
                     `;
                     diffOmList.appendChild(el);
                 });
                 
+                // Render deleted memories
                 deletedMems.forEach(m => {
                     const el = document.createElement('div');
                     el.className = 'diff-item';
+                    const meta = m.meta ? (typeof m.meta === 'string' ? JSON.parse(m.meta) : m.meta) : {};
+                    const title = meta.file_path ? `${meta.file_path} (sec ${meta.section_index || 0})` : m.primary_sector;
                     el.innerHTML = `
                         <div class="diff-item-header">
-                            <span class="diff-item-title">[${escapeHTML(m.primary_sector)}]</span>
+                            <span class="diff-item-title">${escapeHTML(title)}</span>
                             <span class="diff-change-badge deleted">Deleted</span>
                         </div>
-                        <div class="diff-item-sub">${escapeHTML(m.content)}</div>
+                        <div class="diff-item-sub"><pre style="margin: 0; font-family: monospace; white-space: pre-wrap; font-size: 11px; max-height: 150px; overflow-y: auto;">${escapeHTML(m.content)}</pre></div>
+                    `;
+                    diffOmList.appendChild(el);
+                });
+                
+                // Render modified memories
+                modifiedMems.forEach(mod => {
+                    const el = document.createElement('div');
+                    el.className = 'diff-item';
+                    const m = mod.target;
+                    const meta = m.meta ? (typeof m.meta === 'string' ? JSON.parse(m.meta) : m.meta) : {};
+                    const title = meta.file_path ? `${meta.file_path} (sec ${meta.section_index || 0})` : m.primary_sector;
+                    el.innerHTML = `
+                        <div class="diff-item-header">
+                            <span class="diff-item-title">${escapeHTML(title)}</span>
+                            <span class="diff-change-badge modified">Modified</span>
+                        </div>
+                        <div class="diff-item-sub">
+                            <div style="font-size: 11px; color: #f87171; text-decoration: line-through; margin-bottom: 4px; max-height: 100px; overflow-y: auto; border-bottom: 1px dashed rgba(255,255,255,0.05); padding-bottom: 4px;">
+                                <pre style="margin: 0; font-family: monospace; white-space: pre-wrap;">${escapeHTML(mod.base.content)}</pre>
+                            </div>
+                            <div style="font-size: 11px; color: #34d399; max-height: 100px; overflow-y: auto;">
+                                <pre style="margin: 0; font-family: monospace; white-space: pre-wrap;">${escapeHTML(mod.target.content)}</pre>
+                            </div>
+                        </div>
                     `;
                     diffOmList.appendChild(el);
                 });
@@ -1259,16 +1446,20 @@ document.addEventListener('DOMContentLoaded', () => {
             return alert("Please select a file to upload first.");
         }
         
+        if (activeUser.includes('%')) {
+            alert("Cannot upload documents when 'All Branches' is selected. Please select a specific branch.");
+            return;
+        }
+
         const file = docUploadFile.files[0];
         const tags = docUploadTags.value.trim();
-        const activeProj = currentProjectSelect.value || 'default';
         
         btnUploadDoc.disabled = true;
         btnUploadDoc.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Uploading...`;
         
         const formData = new FormData();
         formData.append('file', file);
-        formData.append('project_id', activeProj);
+        formData.append('project_id', activeUser);
         formData.append('tags', tags);
         formData.append('author', currentUser.value.trim());
         

@@ -68,8 +68,12 @@ class SQLiteVectorStore(VectorStore):
         filter_sql = ""
         params = [sector]
         if filter and filter.get("user_id"):
-            filter_sql += " AND user_id=?"
-            params.append(filter["user_id"])
+            uid = filter["user_id"]
+            if "%" in uid or "_" in uid:
+                filter_sql += " AND user_id LIKE ?"
+            else:
+                filter_sql += " AND user_id=?"
+            params.append(uid)
 
         sql = f"SELECT id, v FROM {self.table} WHERE sector=? {filter_sql}"
         rows = db.fetchall(sql, tuple(params))

@@ -91,7 +91,19 @@ class ValkeyVectorStore(VectorStore):
 
                     if filter and filter.get("user_id"):
                         i_uid = dec(item.get(b'user_id') or item.get('user_id'))
-                        if i_uid != filter["user_id"]: continue
+                        target_uid = filter["user_id"]
+                        if "%" in target_uid or "_" in target_uid:
+                            import re
+                            regex_pat = "^" + "".join(
+                                ".*" if c == "%" else
+                                "." if c == "_" else
+                                re.escape(c)
+                                for c in target_uid
+                            ) + "$"
+                            if not re.match(regex_pat, i_uid):
+                                continue
+                        elif i_uid != target_uid:
+                            continue
 
                     v_bytes = item.get(b'v') or item.get('v')
                     v = np.frombuffer(v_bytes, dtype=np.float32)

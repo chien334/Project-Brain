@@ -10,7 +10,10 @@ async def query_facts_at_time(subject: Optional[str] = None, predicate: Optional
     params = [ts, ts]
 
     if user_id:
-        conds.append("user_id = ?")
+        if "%" in user_id or "_" in user_id:
+            conds.append("user_id LIKE ?")
+        else:
+            conds.append("user_id = ?")
         params.append(user_id)
     if subject:
         conds.append("subject = ?")

@@ -24,15 +24,23 @@
             </div>
         </div>
         
-        <div class="project-selector-wrapper" style="display: flex; gap: 20px; align-items: center;">
-            <div style="display: flex; align-items: center; gap: 8px;">
-                <label for="currentProject" style="margin: 0;"><i class="fa-solid fa-folder-tree"></i> Active Project:</label>
+        <div class="project-selector-wrapper" style="display: flex; gap: 16px; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 6px;">
+                <label for="currentProject" style="margin: 0;"><i class="fa-solid fa-folder-tree"></i> Project:</label>
                 <select id="currentProject" class="project-select">
                     <option value="default">default</option>
                 </select>
+            </div>
+            <div id="branchSelectorContainer" style="display: flex; align-items: center; gap: 6px; border-left: 1px solid rgba(255, 255, 255, 0.1); padding-left: 16px;">
+                <label for="currentBranch" style="margin: 0;"><i class="fa-solid fa-code-branch"></i> Branch:</label>
+                <select id="currentBranch" class="project-select" style="min-width: 100px;">
+                    <option value="%">All Branches</option>
+                </select>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px; border-left: 1px solid rgba(255, 255, 255, 0.1); padding-left: 16px;">
                 <button id="btnAddProject" class="btn-icon-only" title="Add New Project"><i class="fa-solid fa-plus"></i></button>
             </div>
-            <div style="display: flex; align-items: center; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 6px; border-left: 1px solid rgba(255, 255, 255, 0.1); padding-left: 16px;">
                 <label for="currentUser" style="margin: 0;"><i class="fa-solid fa-user"></i> Your Name:</label>
                 <input type="text" id="currentUser" placeholder="Enter your name..." style="width: 150px; padding: 6px 12px; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.15); background: rgba(255, 255, 255, 0.05); color: #fff; font-size: 13px; font-family: 'Outfit', sans-serif; outline: none; transition: border 0.2s;" onfocus="this.style.borderColor='#818cf8'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'">
             </div>
@@ -89,6 +97,7 @@
                 <button class="tab-link" data-tab="copilotTab"><i class="fa-solid fa-file-invoice"></i> PM Copilot</button>
                 <button class="tab-link" data-tab="mcpTab"><i class="fa-solid fa-network-wired"></i> MCP Integration</button>
                 <button class="tab-link" data-tab="codeGraphTab" id="btnTabCodeGraph"><i class="fa-solid fa-diagram-project"></i> Code Graph</button>
+                <button class="tab-link" data-tab="compareTab" id="btnTabCompare"><i class="fa-solid fa-code-compare"></i> Version Compare</button>
             </nav>
 
             <!-- Tab 1: Memories Feed -->
@@ -356,53 +365,7 @@
                     </div>
                 </div>
 
-                <!-- Version Comparison Panel -->
-                <div class="version-comparison-section card" style="margin-top: 20px;">
-                    <h3 style="margin-bottom: 5px;"><i class="fa-solid fa-code-compare"></i> Compare Codebase Versions & Branches</h3>
-                    <p class="description-text" style="margin-bottom: 15px;">Select two versions of the project (e.g., main and a development/feature branch) to see structural code modifications (classes, methods, functions, files) alongside cognitive memory differences.</p>
-                    <div class="form-row">
-                        <div class="form-group flex-1">
-                            <label for="diffBaseProject">Base Version (e.g. main):</label>
-                            <select id="diffBaseProject">
-                                <option value="">Select Base Project...</option>
-                            </select>
-                        </div>
-                        <div class="form-group flex-1">
-                            <label for="diffTargetProject">Target Version (e.g. branch):</label>
-                            <select id="diffTargetProject">
-                                <option value="">Select Target Project...</option>
-                            </select>
-                        </div>
-                        <div class="form-group align-end">
-                            <button id="btnCompareVersions" class="btn btn-primary"><i class="fa-solid fa-arrow-right-arrow-left"></i> Run Comparison</button>
-                        </div>
-                    </div>
-                    
-                    <div id="diffResultsArea" class="diff-results-area" style="display: none; margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 20px;">
-                        <div class="diff-summary-banner" style="display: flex; gap: 15px; margin-bottom: 20px;">
-                            <span class="diff-badge added" style="background: rgba(16, 185, 129, 0.15); color: #34d399; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(16, 185, 129, 0.3);"><i class="fa-solid fa-circle-plus"></i> <span id="diffCountAdded">0</span> Added</span>
-                            <span class="diff-badge deleted" style="background: rgba(239, 68, 68, 0.15); color: #f87171; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(239, 68, 68, 0.3);"><i class="fa-solid fa-circle-minus"></i> <span id="diffCountDeleted">0</span> Deleted</span>
-                            <span class="diff-badge modified" style="background: rgba(245, 158, 11, 0.15); color: #fbbf24; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(245, 158, 11, 0.3);"><i class="fa-solid fa-circle-exclamation"></i> <span id="diffCountModified">0</span> Modified</span>
-                        </div>
-                        
-                        <div class="diff-columns" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                            <!-- Column 1: Codegraph Changes -->
-                            <div class="diff-column">
-                                <h4 style="margin-bottom: 12px; font-size: 15px; color: var(--text-primary); border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-diagram-project" style="color: #6366f1;"></i> Codebase changes</h4>
-                                <div id="diffCgList" class="diff-item-list" style="max-height: 250px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
-                                    <div class="empty-placeholder" style="color: var(--text-secondary); font-size: 13px; font-style: italic;">No codebase changes.</div>
-                                </div>
-                            </div>
-                            <!-- Column 2: ProjectBrain Changes -->
-                            <div class="diff-column">
-                                <h4 style="margin-bottom: 12px; font-size: 15px; color: var(--text-primary); border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-brain" style="color: #ec4899;"></i> Memories & rules changes</h4>
-                                <div id="diffOmList" class="diff-item-list" style="max-height: 250px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
-                                    <div class="empty-placeholder" style="color: var(--text-secondary); font-size: 13px; font-style: italic;">No memory changes.</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+
 
                 <div class="graph-layout" style="margin-top: 25px;">
                     <div class="graph-container card" style="position: relative; height: 550px; overflow: hidden; padding: 0; flex: 1;">
@@ -443,6 +406,67 @@
                             <div class="detail-item" id="ndDocstringRow">
                                 <span class="detail-label">Docstring:</span>
                                 <div id="ndDocstring" class="docstring-text"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab 6: Version Compare -->
+            <div class="tab-content" id="compareTab">
+                <h2>Compare Codebase Versions & Branches</h2>
+                <p class="description-text">Select two versions of the project (e.g., main and a development/feature branch) to see structural code modifications (classes, methods, functions, files) alongside cognitive memory differences.</p>
+                
+                <!-- Version Comparison Panel -->
+                <div class="version-comparison-section card" style="margin-top: 20px;">
+                    <div class="form-row">
+                        <div class="form-group flex-1">
+                            <label for="diffBaseProject">Base Version (e.g. main):</label>
+                            <select id="diffBaseProject">
+                                <option value="">Select Base Project...</option>
+                            </select>
+                        </div>
+                        <div class="form-group flex-1">
+                            <label for="diffTargetProject">Target Version (e.g. branch):</label>
+                            <select id="diffTargetProject">
+                                <option value="">Select Target Project...</option>
+                            </select>
+                        </div>
+                        <div class="form-group align-end">
+                            <button id="btnCompareVersions" class="btn btn-primary"><i class="fa-solid fa-arrow-right-arrow-left"></i> Run Comparison</button>
+                        </div>
+                    </div>
+                    
+                    <div id="diffResultsArea" class="diff-results-area" style="display: none; margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 20px;">
+                        <div class="diff-summary-banner" style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px;">
+                            <div style="display: flex; gap: 15px; align-items: center;">
+                                <span style="font-weight: 600; font-size: 13px; min-width: 140px; color: var(--text-secondary);"><i class="fa-solid fa-diagram-project" style="color: #6366f1;"></i> Codebase Symbols:</span>
+                                <span class="diff-badge added" style="background: rgba(16, 185, 129, 0.15); color: #34d399; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(16, 185, 129, 0.3);"><i class="fa-solid fa-circle-plus"></i> <span id="diffCountAdded">0</span> Added</span>
+                                <span class="diff-badge deleted" style="background: rgba(239, 68, 68, 0.15); color: #f87171; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(239, 68, 68, 0.3);"><i class="fa-solid fa-circle-minus"></i> <span id="diffCountDeleted">0</span> Deleted</span>
+                                <span class="diff-badge modified" style="background: rgba(245, 158, 11, 0.15); color: #fbbf24; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(245, 158, 11, 0.3);"><i class="fa-solid fa-circle-exclamation"></i> <span id="diffCountModified">0</span> Modified</span>
+                            </div>
+                            <div style="display: flex; gap: 15px; align-items: center;">
+                                <span style="font-weight: 600; font-size: 13px; min-width: 140px; color: var(--text-secondary);"><i class="fa-solid fa-brain" style="color: #ec4899;"></i> Memories & Rules:</span>
+                                <span class="diff-badge added" style="background: rgba(16, 185, 129, 0.15); color: #34d399; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(16, 185, 129, 0.3);"><i class="fa-solid fa-circle-plus"></i> <span id="memCountAdded">0</span> Added</span>
+                                <span class="diff-badge deleted" style="background: rgba(239, 68, 68, 0.15); color: #f87171; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(239, 68, 68, 0.3);"><i class="fa-solid fa-circle-minus"></i> <span id="memCountDeleted">0</span> Deleted</span>
+                                <span class="diff-badge modified" style="background: rgba(245, 158, 11, 0.15); color: #fbbf24; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(245, 158, 11, 0.3);"><i class="fa-solid fa-circle-exclamation"></i> <span id="memCountModified">0</span> Modified</span>
+                            </div>
+                        </div>
+                        
+                        <div class="diff-columns" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                            <!-- Column 1: Codegraph Changes -->
+                            <div class="diff-column">
+                                <h4 style="margin-bottom: 12px; font-size: 15px; color: var(--text-primary); border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-diagram-project" style="color: #6366f1;"></i> Codebase changes</h4>
+                                <div id="diffCgList" class="diff-item-list" style="max-height: 500px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
+                                    <div class="empty-placeholder" style="color: var(--text-secondary); font-size: 13px; font-style: italic;">No codebase changes.</div>
+                                </div>
+                            </div>
+                            <!-- Column 2: ProjectBrain Changes -->
+                            <div class="diff-column">
+                                <h4 style="margin-bottom: 12px; font-size: 15px; color: var(--text-primary); border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-brain" style="color: #ec4899;"></i> Memories & rules changes</h4>
+                                <div id="diffOmList" class="diff-item-list" style="max-height: 500px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
+                                    <div class="empty-placeholder" style="color: var(--text-secondary); font-size: 13px; font-style: italic;">No memory changes.</div>
+                                </div>
                             </div>
                         </div>
                     </div>

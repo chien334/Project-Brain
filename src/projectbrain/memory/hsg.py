@@ -538,6 +538,19 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
 
         res_list = []
         kw_scores = {}
+        user_id_regex = None
+        if f and f.get("user_id"):
+            uid_pattern = f["user_id"]
+            if "%" in uid_pattern or "_" in uid_pattern:
+                import re
+                regex_pat = "^" + "".join(
+                    ".*" if c == "%" else
+                    "." if c == "_" else
+                    re.escape(c)
+                    for c in uid_pattern
+                ) + "$"
+                user_id_regex = re.compile(regex_pat)
+
         for mid in ids:
             mem = q.get_mem(mid)
             if mem:
@@ -548,7 +561,12 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
             m = q.get_mem(mid)
             if not m: continue
             if f and f.get("minSalience") and m["salience"] < f["minSalience"]: continue
-            if f and f.get("user_id") and m["user_id"] != f["user_id"]: continue
+            if f and f.get("user_id"):
+                if user_id_regex:
+                    if not user_id_regex.match(m["user_id"] or ""):
+                        continue
+                elif m["user_id"] != f["user_id"]:
+                    continue
 
             mvf = await calc_multi_vec_fusion_score(mid, qe, w)
             csr = await calculateCrossSectorResonanceScore(m["primary_sector"], qc["primary"], mvf)
@@ -579,11 +597,11 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
 
             item = {
                 "id": mid,
+                "user_id": m["user_id"],
                 "content": m["content"],
                 "score": fs,
                 "primary_sector": m["primary_sector"],
                 "path": em["path"] if em else [mid],
-                "salience": sal,
                 "salience": sal,
                 "last_seen_at": m["last_seen_at"],
                 "tags": json.loads(m["tags"] or "[]"),

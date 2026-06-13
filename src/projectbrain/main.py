@@ -187,7 +187,7 @@ def run_server():
     print(f"Starting ProjectBrain Server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
 
-def run_codegraph_sync(project_id: str, server_url: str = None, project_path: str = None, branch: str = None):
+def run_codegraph_sync(project_id: str, server_url: str = None, project_path: str = None, branch: str = None, sync_memories: bool = False):
     import sqlite3
     import httpx
     import os
@@ -304,6 +304,11 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
         if resp.status_code == 200:
             print("Successfully synchronized codegraph data!")
             print(resp.json().get("message", ""))
+            
+            if sync_memories:
+                print("Proceeding to ingest codebase files as memories...")
+                import asyncio
+                asyncio.run(async_ingest_files(sync_project_id, target_dir))
         else:
             print(f"Sync failed (Status {resp.status_code}): {resp.text}")
             sys.exit(1)
@@ -396,7 +401,13 @@ if __name__ == "__main__":
         server_url = sys.argv[3] if len(sys.argv) > 3 else None
         project_path = sys.argv[4] if len(sys.argv) > 4 else None
         branch = sys.argv[5] if len(sys.argv) > 5 else None
-        run_codegraph_sync(project_id, server_url, project_path, branch)
+        
+        sync_memories = any(arg in sys.argv for arg in ["--sync-memories", "-m"])
+        if server_url in ["--sync-memories", "-m"]: server_url = None
+        if project_path in ["--sync-memories", "-m"]: project_path = None
+        if branch in ["--sync-memories", "-m"]: branch = None
+        
+        run_codegraph_sync(project_id, server_url, project_path, branch, sync_memories)
     elif len(sys.argv) > 1 and sys.argv[1] == "ingest-files":
         if len(sys.argv) < 4:
             print("Usage: python -m projectbrain.main ingest-files <project_id> <dir_path>")
@@ -409,5 +420,5 @@ if __name__ == "__main__":
         print("Usage:")
         print("  python -m projectbrain.main serve                                         # Start REST API & Dashboard")
         print("  python -m projectbrain.main mcp                                           # Start stdio MCP server")
-        print("  python -m projectbrain.main codegraph-sync <project_id> [url] [path] [branch] # Sync local codegraph to server")
+        print("  python -m projectbrain.main codegraph-sync <project_id> [url] [path] [branch] [-m] # Sync local codegraph and memories to server")
         print("  python -m projectbrain.main ingest-files <project_id> <dir_path>           # Ingest codebase files into memories")
