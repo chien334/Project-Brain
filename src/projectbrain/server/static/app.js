@@ -107,6 +107,17 @@ document.addEventListener('DOMContentLoaded', () => {
             activeUser = e.target.value.trim() || 'default';
             loadStats();
             loadMemories();
+            
+            // Sync with Code Graph selector
+            if (cgProjectSelect) {
+                cgProjectSelect.value = activeUser === 'default' ? '' : activeUser;
+            }
+            
+            // Trigger graph reload if Code Graph tab is active
+            const cgTab = document.getElementById('codeGraphTab');
+            if (cgTab && cgTab.classList.contains('active')) {
+                loadCodeGraph();
+            }
         });
         btnAddProject.addEventListener('click', addProject);
         btnCompareVersions.addEventListener('click', compareVersions);
@@ -167,7 +178,16 @@ document.addEventListener('DOMContentLoaded', () => {
         cgSearchInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') loadCodeGraph();
         });
-        cgProjectSelect.addEventListener('change', loadCodeGraph);
+        cgProjectSelect.addEventListener('change', (e) => {
+            const val = e.target.value.trim();
+            activeUser = val || 'default';
+            if (currentProjectSelect) {
+                currentProjectSelect.value = activeUser;
+            }
+            loadStats();
+            loadMemories();
+            loadCodeGraph();
+        });
         document.getElementById('btnSaveExtMcp').addEventListener('click', saveExternalMcp);
     }
 
@@ -185,9 +205,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 if (targetTab === 'codeGraphTab') {
                     loadProjects();
-                    if (!cgNetwork) {
-                        setTimeout(loadCodeGraph, 100);
-                    }
+                    setTimeout(loadCodeGraph, 100);
                 }
             });
         });

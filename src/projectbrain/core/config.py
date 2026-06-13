@@ -62,7 +62,11 @@ class EnvConfig:
             if self.db_backend == "postgres":
                 self.db_url = f"postgresql://{self.pg_user}:{self.pg_pass}@{self.pg_host}:{self.pg_port}/{self.pg_db}"
             else:
-                self.db_url = "sqlite:///projectbrain.db"
+                db_file = pb_getenv("OM_DB_PATH")
+                if db_file:
+                    self.db_url = f"sqlite:///{db_file}"
+                else:
+                    self.db_url = "sqlite:///projectbrain.db"
 
         if self.db_url.startswith("sqlite:///"):
             self.db_path = self.db_url.replace("sqlite:///", "")
