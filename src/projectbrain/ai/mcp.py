@@ -366,10 +366,59 @@ async def projectbrain_sync_codegraph(project_id: str, author: str = None) -> st
     import sqlite3
     import os
     import getpass
+    import shutil
+    import subprocess
     
     db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
     if not os.path.exists(db_path):
-        return f"Error: Codegraph database not found at {db_path}. Please initialize codegraph with 'codegraph init' or ensure you run this in your project root."
+        # Check if codegraph command is available
+        codegraph_bin = shutil.which("codegraph")
+        if not codegraph_bin:
+            # Force install it via npm globally
+            try:
+                res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
+                if res.returncode != 0:
+                    return (
+                        f"Error: Codegraph database not found at {db_path}.\n"
+                        f"Automatic installation of 'codegraph' CLI failed with exit code {res.returncode}.\n"
+                        f"Command: npm install -g @colbymchenry/codegraph\n"
+                        f"Stdout: {res.stdout}\n"
+                        f"Stderr: {res.stderr}\n"
+                        f"Please install it manually using:\n"
+                        f"  npm install -g @colbymchenry/codegraph\n"
+                        f"or, if permissions are required:\n"
+                        f"  sudo npm install -g @colbymchenry/codegraph"
+                    )
+                # Re-check PATH
+                codegraph_bin = shutil.which("codegraph")
+                if not codegraph_bin:
+                    return (
+                        f"Error: Codegraph database not found at {db_path}.\n"
+                        f"Successfully ran 'npm install -g @colbymchenry/codegraph' but the 'codegraph' executable is still not found in your PATH.\n"
+                        f"Please ensure your npm global bin directory is included in your system's PATH."
+                    )
+            except Exception as inst_err:
+                return (
+                    f"Error: Codegraph database not found at {db_path}.\n"
+                    f"Attempted to install 'codegraph' CLI but encountered an error: {str(inst_err)}.\n"
+                    f"Please manually install it: npm install -g @colbymchenry/codegraph"
+                )
+        
+        # Now we have codegraph_bin, let's run 'codegraph init'
+        try:
+            res_init = subprocess.run([codegraph_bin, "init"], capture_output=True, text=True)
+            if res_init.returncode != 0:
+                return (
+                    f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}).\n"
+                    f"Stdout: {res_init.stdout}\n"
+                    f"Stderr: {res_init.stderr}"
+                )
+        except Exception as init_err:
+            return f"Error executing 'codegraph init': {str(init_err)}"
+            
+        # Re-check db path existence
+        if not os.path.exists(db_path):
+            return f"Error: Finished running 'codegraph init' but codegraph database file was not created at {db_path}."
         
     try:
         conn = sqlite3.connect(db_path)

@@ -201,9 +201,44 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
         db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
         
     if not os.path.exists(db_path):
-        print(f"Error: Codegraph database not found at {db_path}.")
-        print("Please run this command in your project root containing '.codegraph/' directory or specify project_path.")
-        sys.exit(1)
+        import shutil
+        import subprocess
+        print(f"Codegraph database not found at {db_path}. Checking for 'codegraph' CLI...")
+        codegraph_bin = shutil.which("codegraph")
+        if not codegraph_bin:
+            print("'codegraph' CLI not found. Attempting to install it globally via npm...")
+            try:
+                res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
+                if res.returncode != 0:
+                    print(f"Error: Automatic global installation of 'codegraph' CLI failed with exit code {res.returncode}.")
+                    print(f"Stdout: {res.stdout}")
+                    print(f"Stderr: {res.stderr}")
+                    print("Please install it manually: npm install -g @colbymchenry/codegraph (or with sudo)")
+                    sys.exit(1)
+                codegraph_bin = shutil.which("codegraph")
+                if not codegraph_bin:
+                    print("Error: Successfully installed 'codegraph' via npm, but 'codegraph' command is still not found in PATH.")
+                    print("Please verify your npm global bin folder is in your PATH.")
+                    sys.exit(1)
+            except Exception as inst_err:
+                print(f"Error attempting to install 'codegraph' CLI: {str(inst_err)}")
+                sys.exit(1)
+        
+        print(f"Initializing codegraph database in current directory using '{codegraph_bin} init'...")
+        try:
+            res_init = subprocess.run([codegraph_bin, "init"], capture_output=True, text=True)
+            if res_init.returncode != 0:
+                print(f"Error running 'codegraph init' (exit code {res_init.returncode}):")
+                print(f"Stdout: {res_init.stdout}")
+                print(f"Stderr: {res_init.stderr}")
+                sys.exit(1)
+        except Exception as init_err:
+            print(f"Error running 'codegraph init': {str(init_err)}")
+            sys.exit(1)
+            
+        if not os.path.exists(db_path):
+            print(f"Error: 'codegraph init' completed but database file was still not found at {db_path}.")
+            sys.exit(1)
         
     server_url = server_url or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
     
