@@ -1,0 +1,8 @@
+{
+  "name": "convert-excel",
+  "version": "1.0.0",
+  "description": "Convert Excel/CSV files to Markdown tables and vice versa.",
+  "entrypoint": "server_stdio.py",
+  "env_vars": [],
+  "dependencies": ["openpyxl"]
+}

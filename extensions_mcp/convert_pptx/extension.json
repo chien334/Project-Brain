@@ -1,0 +1,8 @@
+{
+  "name": "convert-pptx",
+  "version": "1.0.0",
+  "description": "Extract text, create presentations, extract images, and convert PPTX files to Markdown.",
+  "entrypoint": "server_stdio.py",
+  "env_vars": [],
+  "dependencies": ["python-pptx"]
+}

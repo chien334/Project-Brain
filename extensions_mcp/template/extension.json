@@ -1,0 +1,8 @@
+{
+  "name": "template-extension",
+  "version": "1.0.0",
+  "description": "Boilerplate template for creating custom MCP extensions.",
+  "entrypoint": "server.py",
+  "env_vars": [],
+  "dependencies": []
+}
