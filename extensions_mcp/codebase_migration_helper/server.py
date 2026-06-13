@@ -125,3 +125,19 @@ async def recommend_refactor(
         }
     except Exception as e:
         return {"error": f"Failed to generate recommendations: {e}"}
+
+@mcp.tool(name="migration_batch_scan_logic")
+async def batch_scan_logic(
+    project_path: Annotated[str, Field(description="Root path to the legacy project workspace")],
+    project_id: Annotated[str, Field(description="Project ID to scope the scan inside RAG memory")]
+) -> dict:
+    """Recursively batch-scans a codebase, analyzes each function's business logic using Gemini, and saves a JSON draft.
+    
+    This is extremely useful to extract implicit business rules from COBOL, VB6, or modern files.
+    """
+    try:
+        from .batch_scan_helper import run_batch_scan_logic
+        res = await run_batch_scan_logic(project_path, project_id)
+        return res
+    except Exception as e:
+        return {"error": f"Failed to run batch scan logic: {str(e)}"}

@@ -94,40 +94,25 @@ async def analyze_business_logic(api_key, model, code_snippet, file_path, functi
         except (KeyError, IndexError):
             return f"Error parsing API response: {json.dumps(data)}"
 
-async def main():
-    if len(sys.argv) < 3:
-        print("Usage: python3 batch_scan_helper.py <project_root_directory> <project_id>")
-        print("Example: python3 batch_scan_helper.py /path/to/legacy-project my-legacy-project")
-        sys.exit(1)
-        
-    project_root = os.path.abspath(sys.argv[1])
-    project_id = sys.argv[2]
-    
+async def run_batch_scan_logic(project_root, project_id):
+    project_root = os.path.abspath(project_root)
     db_path = os.path.join(project_root, ".codegraph", "codegraph.db")
     if not os.path.exists(db_path):
-        print(f"Error: Codegraph database not found at {db_path}.")
-        print("Please run 'python3 -m projectbrain.main codegraph-sync' or equivalent to build it first.")
-        sys.exit(1)
+        raise FileNotFoundError(f"Codegraph database not found at {db_path}.")
         
     functions = get_project_functions(db_path, project_id)
     if not functions:
-        print("No function or method nodes found in the database. Scan completed.")
-        sys.exit(0)
+        return {"status": "success", "processed": 0, "message": "No functions found to scan."}
         
-    print(f"Found {len(functions)} function/method nodes. Preparing draft templates...")
-    
     api_key = os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY")
     model = os.getenv("LLM_MODEL", "gemini-1.5-flash")
     
     drafts = []
-    
-    for idx, fn in enumerate(functions):
+    for fn in functions:
         code = extract_function_code(project_root, fn["file_path"], fn["start_line"], fn["end_line"])
         if not code:
             continue
             
-        print(f"[{idx+1}/{len(functions)}] Preparing draft for {fn['file_path']} -> {fn['name']}...")
-        
         draft_item = {
             "node_id": fn["id"],
             "function_name": fn["name"],
@@ -138,7 +123,6 @@ async def main():
             "status": "pending_review"
         }
         
-        # If API key is available, we can optionally pre-populate the draft
         if api_key:
             ext = os.path.splitext(fn["file_path"])[1]
             try:
@@ -159,8 +143,24 @@ async def main():
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(drafts, f, indent=2, ensure_ascii=False)
         
-    print(f"\nSuccessfully generated {len(drafts)} drafts at: {output_path}")
-    print("Kỹ sư có thể chỉnh sửa tệp JSON này trực tiếp hoặc qua Dashboard trước khi gửi 'projectbrain_store' để lưu vào bộ nhớ chung.")
+    return {
+        "status": "success",
+        "processed": len(drafts),
+        "output_file": output_path
+    }
+
+async def main():
+    if len(sys.argv) < 3:
+        print("Usage: python3 batch_scan_helper.py <project_root_directory> <project_id>")
+        print("Example: python3 batch_scan_helper.py /path/to/legacy-project my-legacy-project")
+        sys.exit(1)
+        
+    try:
+        res = await run_batch_scan_logic(sys.argv[1], sys.argv[2])
+        print(f"Batch scan finished. Processed {res['processed']} functions. Output: {res.get('output_file')}")
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
