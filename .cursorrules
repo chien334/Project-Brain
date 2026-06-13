@@ -61,3 +61,15 @@ ProjectBrain supports custom MCP extensions dynamically loaded from the `extensi
 - **Runbook**: Follow the detailed workflows in [RUNBOOK.md](file:///Users/macbbook/SourceCodes/OpenMemory/RUNBOOK.md) to add, test, and invoke extensions.
 - **Rules**: Refer to [.agent/rules/extensions_mcp.md](file:///Users/macbbook/SourceCodes/OpenMemory/.agent/rules/extensions_mcp.md) for full developer rules and environment variable/dependency specifications.
 
+---
+
+## 🔄 Legacy Codebase Migration & Maintenance
+
+ProjectBrain includes a dedicated framework for refactoring and migrating legacy codebases (particularly Japanese projects).
+
+### Guidelines & Commands
+- **Extension**: Use the `codebase-migration-helper` extension tools (`migration_translate_code_comments`, `migration_recommend_refactor`).
+- **Runbook**: Follow the step-by-step migration phases in [MIGRATION_RUNBOOK.md](file:///Users/macbbook/SourceCodes/OpenMemory/MIGRATION_RUNBOOK.md).
+- **Rules**: Refer to [.agent/rules/migration_combo.md](file:///Users/macbbook/SourceCodes/OpenMemory/.agent/rules/migration_combo.md) for legacy maintenance guidelines.
+
+

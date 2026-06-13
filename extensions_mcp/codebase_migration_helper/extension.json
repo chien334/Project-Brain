@@ -1,0 +1,8 @@
+{
+  "name": "codebase-migration-helper",
+  "version": "1.0.0",
+  "description": "Custom tools for migrating legacy systems and translating Japanese code/documentation.",
+  "entrypoint": "server.py",
+  "env_vars": ["LLM_API_KEY"],
+  "dependencies": ["google-genai"]
+}
