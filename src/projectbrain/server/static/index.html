@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ProjectBrain - Premium Cognitive Control Panel</title>
+    <!-- Google Fonts: Outfit -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <!-- FontAwesome for Premium Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Vis.js Standalone for network graph rendering -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+    <div class="glass-bg"></div>
+    
+    <header class="app-header">
+        <div class="header-logo">
+            <i class="fa-solid fa-brain-circuit brain-icon"></i>
+            <div>
+                <h1>ProjectBrain</h1>
+                <span class="subtitle">Cognitive Storage System</span>
+            </div>
+        </div>
+        
+        <div class="project-selector-wrapper">
+            <label for="currentProject"><i class="fa-solid fa-folder-tree"></i> Active Project:</label>
+            <select id="currentProject" class="project-select">
+                <option value="default">default</option>
+            </select>
+            <button id="btnAddProject" class="btn-icon-only" title="Add New Project"><i class="fa-solid fa-plus"></i></button>
+        </div>
+
+        <div class="connection-status">
+            <span class="status-dot online"></span>
+            <span id="backendStatus">Connected</span>
+        </div>
+    </header>
+
+    <main class="dashboard-container">
+        <!-- Sidebar stats -->
+        <aside class="sidebar-panel card">
+            <h2><i class="fa-solid fa-chart-simple"></i> System Statistics</h2>
+            
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <span class="stat-val" id="totalMemories">0</span>
+                    <span class="stat-lbl">Memories</span>
+                </div>
+                <div class="stat-box">
+                    <span class="stat-val" id="totalFacts">0</span>
+                    <span class="stat-lbl">Temporal Facts</span>
+                </div>
+            </div>
+
+            <div class="sector-chart-section">
+                <h3><i class="fa-solid fa-pie-chart"></i> Memory Sectors</h3>
+                <div class="sector-list" id="sectorCounts">
+                    <div class="sector-item placeholder-item">No data loaded</div>
+                </div>
+            </div>
+
+            <div class="tags-section">
+                <h3><i class="fa-solid fa-tags"></i> Active Tags</h3>
+                <div class="tags-cloud" id="activeTags">
+                    <span class="placeholder-item">No tags</span>
+                </div>
+            </div>
+            
+            <div class="danger-zone">
+                <h3><i class="fa-solid fa-triangle-exclamation"></i> Danger Zone</h3>
+                <button id="btnDeleteAll" class="btn btn-danger"><i class="fa-solid fa-trash-can"></i> Clear All Memories</button>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <section class="main-content">
+            <!-- Tabs Menu -->
+            <nav class="nav-tabs">
+                <button class="tab-link active" data-tab="memoriesTab"><i class="fa-solid fa-memory"></i> Memory Feed</button>
+                <button class="tab-link" data-tab="searchTab"><i class="fa-solid fa-magnifying-glass"></i> Smart Search</button>
+                <button class="tab-link" data-tab="copilotTab"><i class="fa-solid fa-file-invoice"></i> PM Copilot</button>
+                <button class="tab-link" data-tab="mcpTab"><i class="fa-solid fa-network-wired"></i> MCP Integration</button>
+                <button class="tab-link" data-tab="codeGraphTab" id="btnTabCodeGraph"><i class="fa-solid fa-diagram-project"></i> Code Graph</button>
+            </nav>
+
+            <!-- Tab 1: Memories Feed -->
+            <div class="tab-content active" id="memoriesTab">
+                <div class="card-header-action">
+                    <h2>Recent Cognitive Nodes</h2>
+                    <button id="btnRefreshHistory" class="btn btn-secondary"><i class="fa-solid fa-rotate"></i> Refresh</button>
+                </div>
+                
+                <div class="memory-input-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 2rem;">
+                    <!-- Column 1: Store New Memory -->
+                    <div class="add-memory-box card" style="margin-bottom: 0; display: flex; flex-direction: column; height: 100%;">
+                        <h3><i class="fa-solid fa-plus-circle"></i> Store New Memory</h3>
+                        <div class="form-group" style="flex: 1; display: flex; flex-direction: column;">
+                            <textarea id="newMemoryContent" placeholder="Enter content to store (e.g. 'Client prefers dark mode UI and Outfit font')" style="flex: 1; min-height: 80px;"></textarea>
+                        </div>
+                        <div class="form-row" style="margin-top: 10px; display: flex; align-items: flex-end; gap: 10px;">
+                            <div class="form-group" style="flex: 1;">
+                                <label>Tags (comma separated):</label>
+                                <input type="text" id="newMemoryTags" placeholder="e.g. preference, UI">
+                            </div>
+                            <button id="btnSaveMemory" class="btn btn-primary" style="height: 38px;"><i class="fa-solid fa-floppy-disk"></i> Store Memory</button>
+                        </div>
+                    </div>
+
+                    <!-- Column 2: Upload Document -->
+                    <div class="upload-doc-box card" style="display: flex; flex-direction: column; height: 100%;">
+                        <h3><i class="fa-solid fa-cloud-arrow-up"></i> Upload Document</h3>
+                        <div class="form-group" style="flex: 1; justify-content: center; display: flex; flex-direction: column;">
+                            <label for="docUploadFile" style="cursor: pointer; border: 2px dashed rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 20px; text-align: center; background: rgba(255, 255, 255, 0.01); transition: all 0.2s;" id="uploadDropzone">
+                                <i class="fa-solid fa-file-arrow-up fa-2x" style="color: #818cf8; margin-bottom: 8px;"></i>
+                                <div style="font-size: 13px; font-weight: 500;" id="uploadStatusText">Click to select PDF, DOCX, XLSX, TXT</div>
+                                <div style="font-size: 11px; color: var(--text-secondary); margin-top: 4px;">File will parse locally to Markdown</div>
+                            </label>
+                            <input type="file" id="docUploadFile" style="display: none;" accept=".pdf,.docx,.xlsx,.xls,.txt,.md">
+                        </div>
+                        <div class="form-row" style="margin-top: 10px; display: flex; align-items: flex-end; gap: 10px;">
+                            <div class="form-group" style="flex: 1;">
+                                <label>Tags (comma separated):</label>
+                                <input type="text" id="docUploadTags" placeholder="e.g. spec, architecture">
+                            </div>
+                            <button id="btnUploadDoc" class="btn btn-primary" style="height: 38px;"><i class="fa-solid fa-upload"></i> Upload</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="memories-feed" id="memoriesFeed">
+                    <div class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading memories...</div>
+                </div>
+            </div>
+
+            <!-- Tab 2: Smart Search -->
+            <div class="tab-content" id="searchTab">
+                <h2>AI Semantic & Fact Search</h2>
+                <div class="search-box card">
+                    <div class="search-input-group">
+                        <i class="fa-solid fa-magnifying-glass search-icon"></i>
+                        <input type="text" id="searchQuery" placeholder="Ask a question or search keywords...">
+                        <button id="btnSearch" class="btn btn-primary">Search</button>
+                    </div>
+                    <div class="search-modes">
+                        <label class="radio-label">
+                            <input type="radio" name="searchMode" value="rag" checked>
+                            <span><i class="fa-solid fa-wand-magic-sparkles"></i> Gemini RAG Search</span>
+                        </label>
+                        <label class="radio-label">
+                            <input type="radio" name="searchMode" value="raw">
+                            <span><i class="fa-solid fa-database"></i> Raw Context Retrieval</span>
+                        </label>
+                    </div>
+                </div>
+
+                <div id="searchResults" class="search-results-container">
+                    <div class="empty-state">
+                        <i class="fa-solid fa-search"></i>
+                        <p>Enter a query above to explore ProjectBrain</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab 3: PM Copilot -->
+            <div class="tab-content" id="copilotTab">
+                <h2>Product Manager Documentation Copilot</h2>
+                <p class="description-text">Leverage Google Gemini to automatically compile meeting notes, features, preferences, and details stored in memory into structured PM documentation.</p>
+
+                <div class="copilot-form card">
+                    <div class="form-group">
+                        <label for="docType">Document Type:</label>
+                        <select id="docType">
+                            <option value="status_report">Project Status Update (Báo cáo tiến độ)</option>
+                            <option value="prd">Product Requirement Document (PRD)</option>
+                            <option value="user_story">User Stories & Acceptance Criteria</option>
+                            <option value="roadmap">Product Development Roadmap (Lộ trình)</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="copilotPrompt">Prompt / Guidance:</label>
+                        <textarea id="copilotPrompt" placeholder="Provide context or instructions, e.g. 'Summarize all features completed this week and identify any blocking risks based on project memory'"></textarea>
+                    </div>
+
+                    <button id="btnGenerateDoc" class="btn btn-primary"><i class="fa-solid fa-magic"></i> Generate Document</button>
+                </div>
+
+                <div id="copilotResults" class="copilot-results-container" style="display: none;">
+                    <div class="doc-viewer card">
+                        <div class="doc-header">
+                            <h3><i class="fa-solid fa-file-lines"></i> Generated Document</h3>
+                            <button id="btnCopyDoc" class="btn btn-secondary btn-sm"><i class="fa-solid fa-copy"></i> Copy Markdown</button>
+                        </div>
+                        <div class="doc-body markdown-body" id="generatedDocContent">
+                            <!-- Generated markdown goes here -->
+                        </div>
+                    </div>
+
+                    <div class="sources-list card">
+                        <h3><i class="fa-solid fa-link"></i> Utilized Source Memories</h3>
+                        <div id="docSourcesFeed">
+                            <!-- Memories used for doc generation -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab 4: MCP Integration -->
+            <div class="tab-content" id="mcpTab">
+                <h2>Model Context Protocol (MCP) Local System Integration</h2>
+                <p class="description-text">Configure how local AI clients (like Claude Desktop) connect to ProjectBrain. You can choose to run MCP via local <strong>Stdio</strong> (spawning a process) or <strong>HTTP/SSE</strong> (server-sent events stream).</p>
+
+                <div class="mcp-config-container card">
+                    <h3><i class="fa-solid fa-gears"></i> Integration Settings</h3>
+                    
+                    <div class="form-group">
+                        <label>Connection Method (Transport Type):</label>
+                        <div class="radio-group">
+                            <label class="radio-label">
+                                <input type="radio" name="mcpTransport" value="stdio" checked>
+                                <span><i class="fa-solid fa-terminal"></i> Stdio (Local Process)</span>
+                            </label>
+                            <label class="radio-label">
+                                <input type="radio" name="mcpTransport" value="sse">
+                                <span><i class="fa-solid fa-cloud-arrow-down"></i> HTTP/SSE (Server Stream)</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Stdio specific config -->
+                    <div id="mcpStdioConfig" class="mcp-sub-config">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="mcpUserId">Default User ID:</label>
+                                <input type="text" id="mcpUserId" value="default" placeholder="default">
+                            </div>
+                            <div class="form-group">
+                                <label for="mcpTags">Default Tags:</label>
+                                <input type="text" id="mcpTags" value="source:mcp" placeholder="source:mcp">
+                            </div>
+                        </div>
+                        <p class="info-text"><i class="fa-solid fa-info-circle"></i> Stdio mode registers a command calling ProjectBrain's package on this python environment directly, setting these default tags and user ID in environment variables.</p>
+                    </div>
+
+                    <!-- SSE specific config -->
+                    <div id="mcpSseConfig" class="mcp-sub-config" style="display: none;">
+                        <div class="form-group">
+                            <label for="mcpSseUrl">SSE Endpoint URL:</label>
+                            <input type="text" id="mcpSseUrl" value="http://localhost:8080/mcp/sse">
+                        </div>
+                        <p class="info-text"><i class="fa-solid fa-info-circle"></i> SSE mode routes client queries to the running server. It registers a proxy connection using <code>mcp-remote</code> inside Claude Desktop.</p>
+                    </div>
+
+                    <div class="action-buttons">
+                        <button id="btnRegisterMcp" class="btn btn-primary"><i class="fa-solid fa-circle-check"></i> Install & Apply Configuration</button>
+                        <button id="btnUnregisterMcp" class="btn btn-secondary"><i class="fa-solid fa-circle-xmark"></i> Remove Integration</button>
+                    </div>
+                </div>
+
+                <div class="mcp-status-panel card">
+                    <h3><i class="fa-solid fa-shield-halved"></i> Active System Status</h3>
+                    <div class="status-indicator">
+                        <span class="status-label">Claude Desktop Config File:</span>
+                        <span id="mcpFileStatus" class="status-tag danger">Not Checked</span>
+                    </div>
+                    <div class="status-indicator">
+                        <span class="status-label">ProjectBrain Registered:</span>
+                        <span id="mcpRegisteredStatus" class="status-tag danger">No</span>
+                    </div>
+                    <div class="form-group mt-15">
+                        <label>Config Path:</label>
+                        <input type="text" id="mcpConfigPath" readonly class="code-font select-all">
+                    </div>
+                    <div class="form-group">
+                        <label>Active Configuration JSON in Claude Desktop:</label>
+                        <pre class="code-block" id="mcpActiveConfig">{}</pre>
+                    </div>
+                </div>
+
+                <!-- External MCP Servers Manager -->
+                <div class="card mt-20" id="externalMcpCard" style="margin-top: 2rem;">
+                    <h2><i class="fa-solid fa-plug"></i> External MCP Servers Manager</h2>
+                    <p class="description-text">Extend your AI system by registering other MCP servers directly into your Claude Desktop configuration.</p>
+                    
+                    <div class="form-row" style="margin-top: 15px; margin-bottom: 15px;">
+                        <div class="form-group flex-1">
+                            <label for="extMcpName">Server Name:</label>
+                            <input type="text" id="extMcpName" placeholder="e.g. postgres-mcp">
+                        </div>
+                        <div class="form-group flex-1">
+                            <label for="extMcpCommand">Command:</label>
+                            <input type="text" id="extMcpCommand" placeholder="e.g. npx or docker or node">
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="extMcpArgs">Arguments (JSON Array, e.g. ["-y", "@modelcontextprotocol/server-postgres"]):</label>
+                        <input type="text" id="extMcpArgs" value="[]" placeholder='e.g. ["-y", "@modelcontextprotocol/server-postgres", "postgresql://..."]'>
+                    </div>
+
+                    <div class="form-group mt-15">
+                        <label for="extMcpEnv">Environment Variables (JSON Object, optional):</label>
+                        <input type="text" id="extMcpEnv" value="{}" placeholder='e.g. {"DB_URL": "...", "API_KEY": "..."}'>
+                    </div>
+
+                    <div style="margin-top: 15px; display: flex; justify-content: flex-end;">
+                        <button id="btnSaveExtMcp" class="btn btn-primary"><i class="fa-solid fa-save"></i> Save MCP Server</button>
+                    </div>
+
+                    <h3 style="margin-top: 25px; margin-bottom: 10px;"><i class="fa-solid fa-list"></i> Registered External MCP Servers</h3>
+                    <div id="externalMcpList" class="external-mcp-list">
+                        <!-- Dynamic list of external servers -->
+                        <div class="placeholder-item">No external MCP servers registered yet.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab 5: Code Graph -->
+            <div class="tab-content" id="codeGraphTab">
+                <h2>Codebase Structure Graph (Codegraph)</h2>
+                <p class="description-text">Visualizing code relationships, function calls, class inheritances, and imports indexed by Codegraph.</p>
+                
+                <div class="codegraph-controls card">
+                    <div class="form-row">
+                        <div class="form-group flex-1">
+                            <label for="cgProjectSelect">Active Project:</label>
+                            <select id="cgProjectSelect">
+                                <option value="">Local Codegraph (Default)</option>
+                            </select>
+                        </div>
+                        <div class="form-group flex-2">
+                            <label for="cgSearchInput">Search Symbols:</label>
+                            <input type="text" id="cgSearchInput" placeholder="Search by class name, function, or file...">
+                        </div>
+                        <div class="form-group flex-1">
+                            <label for="cgKindSelect">Filter by Kind:</label>
+                            <select id="cgKindSelect">
+                                <option value="class,function,method,file" selected>Standard View (Clean)</option>
+                                <option value="all">All Kinds (with Imports)</option>
+                                <option value="class">Classes Only</option>
+                                <option value="function,method">Functions & Methods</option>
+                                <option value="file">Files Only</option>
+                            </select>
+                        </div>
+                        <div class="form-group align-end">
+                            <button id="btnLoadCodeGraph" class="btn btn-primary"><i class="fa-solid fa-sync"></i> Load Graph</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Version Comparison Panel -->
+                <div class="version-comparison-section card" style="margin-top: 20px;">
+                    <h3 style="margin-bottom: 5px;"><i class="fa-solid fa-code-compare"></i> Compare Codebase Versions & Branches</h3>
+                    <p class="description-text" style="margin-bottom: 15px;">Select two versions of the project (e.g., main and a development/feature branch) to see structural code modifications (classes, methods, functions, files) alongside cognitive memory differences.</p>
+                    <div class="form-row">
+                        <div class="form-group flex-1">
+                            <label for="diffBaseProject">Base Version (e.g. main):</label>
+                            <select id="diffBaseProject">
+                                <option value="">Select Base Project...</option>
+                            </select>
+                        </div>
+                        <div class="form-group flex-1">
+                            <label for="diffTargetProject">Target Version (e.g. branch):</label>
+                            <select id="diffTargetProject">
+                                <option value="">Select Target Project...</option>
+                            </select>
+                        </div>
+                        <div class="form-group align-end">
+                            <button id="btnCompareVersions" class="btn btn-primary"><i class="fa-solid fa-arrow-right-arrow-left"></i> Run Comparison</button>
+                        </div>
+                    </div>
+                    
+                    <div id="diffResultsArea" class="diff-results-area" style="display: none; margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 20px;">
+                        <div class="diff-summary-banner" style="display: flex; gap: 15px; margin-bottom: 20px;">
+                            <span class="diff-badge added" style="background: rgba(16, 185, 129, 0.15); color: #34d399; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(16, 185, 129, 0.3);"><i class="fa-solid fa-circle-plus"></i> <span id="diffCountAdded">0</span> Added</span>
+                            <span class="diff-badge deleted" style="background: rgba(239, 68, 68, 0.15); color: #f87171; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(239, 68, 68, 0.3);"><i class="fa-solid fa-circle-minus"></i> <span id="diffCountDeleted">0</span> Deleted</span>
+                            <span class="diff-badge modified" style="background: rgba(245, 158, 11, 0.15); color: #fbbf24; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(245, 158, 11, 0.3);"><i class="fa-solid fa-circle-exclamation"></i> <span id="diffCountModified">0</span> Modified</span>
+                        </div>
+                        
+                        <div class="diff-columns" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                            <!-- Column 1: Codegraph Changes -->
+                            <div class="diff-column">
+                                <h4 style="margin-bottom: 12px; font-size: 15px; color: var(--text-primary); border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-diagram-project" style="color: #6366f1;"></i> Codebase changes</h4>
+                                <div id="diffCgList" class="diff-item-list" style="max-height: 250px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
+                                    <div class="empty-placeholder" style="color: var(--text-secondary); font-size: 13px; font-style: italic;">No codebase changes.</div>
+                                </div>
+                            </div>
+                            <!-- Column 2: ProjectBrain Changes -->
+                            <div class="diff-column">
+                                <h4 style="margin-bottom: 12px; font-size: 15px; color: var(--text-primary); border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-brain" style="color: #ec4899;"></i> Memories & rules changes</h4>
+                                <div id="diffOmList" class="diff-item-list" style="max-height: 250px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
+                                    <div class="empty-placeholder" style="color: var(--text-secondary); font-size: 13px; font-style: italic;">No memory changes.</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="graph-layout" style="margin-top: 25px;">
+                    <div class="graph-container card" style="position: relative; height: 550px; overflow: hidden; padding: 0; flex: 1;">
+                        <div id="codegraphNetwork" style="width: 100%; height: 100%;"></div>
+                        <div id="graphLoader" class="loader" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); display: none;">
+                            <i class="fa-solid fa-spinner fa-spin fa-2x"></i>
+                            <p style="margin-top: 10px;">Rendering Code Graph...</p>
+                        </div>
+                        <div id="graphEmptyState" class="empty-state" style="display: none; height: 100%; justify-content: center; align-items: center; flex-direction: column;">
+                            <i class="fa-solid fa-circle-nodes" style="font-size: 3em; color: var(--text-secondary);"></i>
+                            <p style="margin-top: 15px;">No nodes match the filter or search. Try loading again.</p>
+                        </div>
+                    </div>
+                    
+                    <div class="node-details-panel card" id="nodeDetailsPanel" style="display: none; width: 300px;">
+                        <h3><i class="fa-solid fa-circle-info"></i> Symbol Details</h3>
+                        <div class="node-details-content">
+                            <div class="detail-item">
+                                <span class="detail-label">Name:</span>
+                                <span id="ndName" class="detail-value code-font font-bold"></span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">Kind:</span>
+                                <span id="ndKind" class="status-tag info"></span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">File Path:</span>
+                                <span id="ndFilePath" class="detail-value code-font"></span>
+                            </div>
+                            <div class="detail-item" id="ndLineRow">
+                                <span class="detail-label">Lines:</span>
+                                <span id="ndLines" class="detail-value"></span>
+                            </div>
+                            <div class="detail-item" id="ndSignatureRow">
+                                <span class="detail-label">Signature:</span>
+                                <pre id="ndSignature" class="code-block" style="font-size: 0.75rem; max-height: 120px;"></pre>
+                            </div>
+                            <div class="detail-item" id="ndDocstringRow">
+                                <span class="detail-label">Docstring:</span>
+                                <div id="ndDocstring" class="docstring-text"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="app-footer">
+        <p>ProjectBrain Server running locally on PostgreSQL / SQLite</p>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+</html>

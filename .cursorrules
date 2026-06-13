@@ -1,0 +1,51 @@
+# ProjectBrain & CodeGraph AI Agent Rules
+
+Welcome! This workspace is optimized for AI pair programming using ProjectBrain (cognitive memory and version diffing) and CodeGraph (tree-sitter symbol graph). Please adhere to the following guidelines and utilize the available MCP tools.
+
+---
+
+## 🧠 ProjectBrain MCP Tools (`projectbrain_*`)
+
+ProjectBrain provides a project-centric long-term memory engine and codebase version diffing control panel.
+
+### Tool Directory & Usage
+
+- **`projectbrain_query`**: Search contextual memories or temporal facts.
+  - *Parameters*: `query` (str), `type` (`"contextual"`, `"factual"`, or `"unified"`), `user_id` (always pass active project ID, e.g. `Project-Brain:1.0.0`), `k` (limit).
+- **`projectbrain_store`**: Persist new memories or facts.
+  - *Parameters*: `content` (str), `type` (`"contextual"`, `"factual"`, or `"both"`), `user_id` (active project ID), `tags` (list of strings).
+- **`projectbrain_sync_codegraph`**: Sync local codebase structure to the server.
+- **`projectbrain_diff_project_versions`**: Compare codebase structures and context memories between two versions of a project (e.g. `main` vs branch).
+  - *Parameters*: `base_project_id` (str), `target_project_id` (str).
+
+### Rules of Thumb
+1. **Always Scope by Project ID**: Pass the active project name and version (e.g., `Project-Brain:1.0.0` or `ecommerce-app:main`) to the `user_id` or `project_id` arguments.
+2. **Save Decisions**: After resolving bugs or finishing features, use `projectbrain_store` to persist key learnings.
+3. **Use Version Comparison**: Compare feature branches to main using `projectbrain_diff_project_versions` to review added/deleted/modified symbols and memory changes.
+
+---
+
+## 📊 CodeGraph MCP Tools (`codegraph_*`)
+
+CodeGraph is a tree-sitter-parsed knowledge graph of every symbol, edge, and file.
+
+### Tool Directory & Usage
+
+- **`codegraph_search`**: Locate where a symbol is defined.
+- **`codegraph_callers`**: Find all functions/methods calling a symbol.
+- **`codegraph_callees`**: Find all symbols called by a function.
+- **`codegraph_trace`**: Trace the path/flow from symbol X to Y.
+- **`codegraph_impact`**: Analyze what code is affected by changing a symbol.
+- **`codegraph_context`**: Get focused context for a task or area.
+- **`codegraph_explore`**: View multiple symbols' source code in a single call.
+
+### Rules of Thumb
+1. **Prefer CodeGraph for Structural Queries**: Use `codegraph_search` or `codegraph_context` instead of raw greps when looking up signatures, definitions, or references.
+2. **Avoid Chaining**: Use `codegraph_context` or `codegraph_explore` directly rather than running multiple nested `codegraph_search` and `codegraph_node` calls.
+
+---
+
+## ⚡ RTK Token Optimizer
+
+To minimize token usage, prefix terminal commands with `rtk` (or `/Users/macbbook/.local/bin/rtk`).
+- Example: `rtk git status`, `rtk cargo test`, `rtk pip list`.
