@@ -374,11 +374,27 @@ async def projectbrain_sync_codegraph(project_id: str, project_path: str = None,
     import shutil
     import subprocess
     
-    if project_path:
-        if os.path.isdir(project_path):
-            db_path = os.path.join(project_path, ".codegraph", "codegraph.db")
+    resolved_project_path = project_path
+    if not resolved_project_path:
+        # Check database for previously synced local project_path
+        try:
+            from ..core.db import db
+            db.connect()
+            cursor = db.conn.cursor()
+            base_id = project_id.split(":", 1)[0] if ":" in project_id else project_id
+            cursor.execute("SELECT project_path FROM projects WHERE id = ? OR id LIKE ? ORDER BY updated_at DESC LIMIT 1;", (project_id, f"{base_id}%"))
+            row = cursor.fetchone()
+            if row and row[0]:
+                resolved_project_path = row[0]
+            cursor.close()
+        except Exception:
+            pass
+
+    if resolved_project_path:
+        if os.path.isdir(resolved_project_path):
+            db_path = os.path.join(resolved_project_path, ".codegraph", "codegraph.db")
         else:
-            db_path = project_path
+            db_path = resolved_project_path
     else:
         db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
         
@@ -417,7 +433,7 @@ async def projectbrain_sync_codegraph(project_id: str, project_path: str = None,
                 )
         
         # Now we have codegraph_bin, let's run 'codegraph init' in the project directory
-        target_dir = project_path if (project_path and os.path.isdir(project_path)) else os.getcwd()
+        target_dir = resolved_project_path if (resolved_project_path and os.path.isdir(resolved_project_path)) else os.getcwd()
         try:
             res_init = subprocess.run([codegraph_bin, "init"], cwd=target_dir, capture_output=True, text=True)
             if res_init.returncode != 0:
@@ -476,7 +492,8 @@ async def projectbrain_sync_codegraph(project_id: str, project_path: str = None,
             project_name=sync_project_id,
             nodes=nodes,
             edges=edges,
-            author=resolved_author
+            author=resolved_author,
+            project_path=resolved_project_path
         )
         
         res = await sync_codegraph_data(req)

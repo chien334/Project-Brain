@@ -295,7 +295,8 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
                 "project_name": sync_project_id,
                 "nodes": nodes,
                 "edges": edges,
-                "author": author
+                "author": author,
+                "project_path": os.path.abspath(target_dir)
             },
             timeout=120.0
         )
