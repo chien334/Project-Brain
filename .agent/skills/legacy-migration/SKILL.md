@@ -40,8 +40,9 @@ Always follow these stages sequentially:
    ```
 2. **Analyze Call Sites**: Use `codegraph_callers` to find all entry points calling the legacy class.
 3. **Create Migration ADR**: Write an Architecture Decision Record (ADR) detailing the refactoring plan and list it under ProjectBrain.
+4. **Mandatory STOP and Approve**: Stop execution, present the Migration ADR to the user, and wait for their explicit approval. Do not proceed to Stage 3 until the user approves.
 
-### Stage 3: Building & Refactoring
+### Stage 3: Building & Refactoring (Only after User Approval)
 1. **Generate Recommendations**: Use `migration_recommend_refactor` to get structural mappings and snippets for the target stack:
    ```bash
    python3 extensions_mcp/codebase_migration_helper/client.py migration_recommend_refactor '{"file_path": "<legacy_file>", "tech_stack": "<target_stack>"}'

@@ -63,8 +63,13 @@ Before changing legacy code, you must understand its dependencies and side effec
 
 ---
 
-### Phase 3: Incremental Refactoring & Migration
-Now we generate the migrated codebase in the target stack (e.g. converting Struts JSP to React, or inline SQL to SQLAlchemy).
+### ⚠️ Mandatory Planning & User Approval Gate (CRITICAL)
+Before starting Phase 3, the AI Agent or developer **MUST STOP** and present the migration architecture/plan. **DO NOT** execute any refactoring or make code changes in the target workspace until the user reviews, edits, and grants explicit approval.
+
+---
+
+### Phase 3: Incremental Refactoring & Migration (Only After Approval)
+Now we generate the migrated codebase in the target stack (e.g. converting Struts JSP to React, or inline SQL to SQLAlchemy) based on the approved plan.
 
 1. **Generate Refactoring Blueprint**: Run `migration_recommend_refactor` to get detailed mappings and snippets:
    ```bash

@@ -15,8 +15,9 @@ Use these rules when maintaining legacy systems (particularly Japanese codebases
    - Before editing or deprecating a legacy method/class, you MUST analyze its dependencies.
    - Use CodeGraph tools (`codegraph_callers`, `codegraph_impact`) to trace all call sites and identify what components will be affected by the migration.
 
-3. **Incremental Migration Plan**:
-   - Write a migration plan detailing how you will transition code module-by-module.
+3. **Mandatory Planning & Approval Gate (CRITICAL)**:
+   - Always write a detailed migration plan (or ADR) first.
+   - You **MUST STOP** after the planning phase. **DO NOT** modify any codebase files or write refactored modules until the user has reviewed, edited, and explicitly approved the migration plan.
    - Refer to the detailed phase checklists in [MIGRATION_RUNBOOK.md](file:///Users/macbbook/SourceCodes/OpenMemory/MIGRATION_RUNBOOK.md).
 
 4. **Preserve Legacy Logic (Zero Regressions)**:
