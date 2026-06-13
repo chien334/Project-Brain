@@ -212,3 +212,53 @@ async def test_plan_execution_phases_fallback(mock_open, mock_exists, mock_run_p
     assert "foo" in res["prompt"]
     assert "phases" in res["message"]
 
+from projectbrain.utils.doc_parser import parse_document
+
+@patch("pdfplumber.open")
+def test_parse_pdf_via_doc_parser(mock_pdfplumber_open):
+    # Mock pdfplumber structures
+    mock_pdf = MagicMock()
+    mock_page = MagicMock()
+    mock_page.extract_text.return_value = "hello pdf"
+    mock_page.extract_tables.return_value = [[["header", "val"], ["v1", "v2"]]]
+    mock_pdf.pages = [mock_page]
+    mock_pdfplumber_open.return_value.__enter__.return_value = mock_pdf
+    
+    res = parse_document("test.pdf", b"pdfbytes")
+    assert "Page 1" in res or "Page 2" not in res
+    assert "hello pdf" in res
+    assert "header | val" in res
+
+@patch("openpyxl.load_workbook")
+def test_parse_excel_via_doc_parser(mock_load_workbook):
+    mock_wb = MagicMock()
+    mock_wb.sheetnames = ["Sheet1"]
+    mock_ws = MagicMock()
+    mock_ws.iter_rows.return_value = [("col1", "col2"), ("v1", "v2")]
+    mock_wb.__getitem__.return_value = mock_ws
+    mock_load_workbook.return_value = mock_wb
+    
+    res = parse_document("test.xlsx", b"excelbytes")
+    assert "Sheet: Sheet1" in res
+    assert "col1 | col2" in res
+    assert "v1 | v2" in res
+
+@patch("pptx.Presentation")
+def test_parse_pptx_via_doc_parser(mock_presentation):
+    mock_prs = MagicMock()
+    mock_slide = MagicMock()
+    mock_shape = MagicMock()
+    mock_shape.has_text_frame = True
+    mock_shape.is_placeholder = True
+    mock_shape.placeholder_format.type = 1 # Title
+    mock_shape.text = "Slide Title"
+    mock_shape.top = 10
+    mock_slide.shapes = [mock_shape]
+    mock_prs.slides = [mock_slide]
+    mock_presentation.return_value = mock_prs
+    
+    res = parse_document("test.pptx", b"pptxbytes")
+    assert "Slide 1" in res
+    assert "Slide Title" in res
+
+
