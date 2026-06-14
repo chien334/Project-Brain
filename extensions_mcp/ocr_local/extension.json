@@ -1,0 +1,8 @@
+{
+  "name": "ocr-local",
+  "version": "1.0.0",
+  "description": "Offline CPU OCR with PaddleOCR: extract text from images and scanned PDFs (render each page then OCR). No API key required.",
+  "entrypoint": "server.py",
+  "env_vars": [],
+  "dependencies": ["paddleocr", "paddlepaddle", "pymupdf", "pillow", "numpy"]
+}

@@ -35,5 +35,16 @@ dependencies = [
     "python-pptx>=1.0.0",
 ]
 
+[project.optional-dependencies]
+# Local, offline OCR (CPU). Install with:  pip install -e ".[ocr]"
+# Heavy: paddlepaddle pulls in large CPU inference libs. First run also downloads
+# the OCR models (a few MB per language) to ~/.paddleocr.
+ocr = [
+    "paddleocr>=2.7",
+    "paddlepaddle>=2.6",
+    "pymupdf>=1.23",
+    "numpy",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/projectbrain"]

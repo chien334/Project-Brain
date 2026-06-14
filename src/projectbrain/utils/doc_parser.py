@@ -4,27 +4,82 @@ import pypdf
 import mammoth
 import markdownify
 
+async def _ocr_raw(image_bytes: bytes, mime_type: str) -> str:
+    """Run OCR on raw image bytes, returning plain transcribed text ("" on failure).
+
+    Engine is chosen by the OCR_ENGINE env var (auto|paddle|vision|off):
+      - auto  : try local PaddleOCR first, fall back to cloud vision (default)
+      - paddle: local PaddleOCR only (offline, no API key)
+      - vision: cloud vision only (needs LLM_API_KEY)
+      - off   : skip OCR entirely
+    """
+    engine = (os.getenv("OCR_ENGINE", "auto").strip().lower() or "auto")
+    if engine == "off":
+        return ""
+
+    # 1) Local PaddleOCR (CPU, offline, free)
+    if engine in ("auto", "paddle"):
+        try:
+            from extensions_mcp.image_to_markdown.paddle_client import (
+                extract_text_local,
+                is_available,
+            )
+            if is_available():
+                text = await extract_text_local(image_bytes, mime_type)
+                if text and text.strip():
+                    return text
+        except Exception:
+            pass
+        if engine == "paddle":
+            return ""
+
+    # 2) Cloud vision fallback (Gemini / OpenAI-compatible)
+    if engine in ("auto", "vision"):
+        try:
+            from extensions_mcp.image_to_markdown.vision_client import (
+                extract_text_from_image,
+                DEFAULT_PROMPT,
+            )
+            from extensions_mcp.image_to_markdown.config import CONFIG
+            if getattr(CONFIG, "api_key", None):
+                text = await extract_text_from_image(
+                    image_bytes, mime_type, DEFAULT_PROMPT, CONFIG.model
+                )
+                if text and text.strip():
+                    return text
+        except Exception:
+            pass
+    return ""
+
+
 async def call_ocr_if_available(image_bytes: bytes, mime_type: str) -> str:
-    """Helper to call vision MCP tool to transcribe image content if credentials are set."""
-    try:
-        from extensions_mcp.image_to_markdown.vision_client import extract_text_from_image, DEFAULT_PROMPT
-        from extensions_mcp.image_to_markdown.config import CONFIG
-        
-        # If API key is not present, skip OCR call and fallback to standard placeholder
-        if not getattr(CONFIG, "api_key", None):
-            return "![Image]"
-            
-        ocr_text = await extract_text_from_image(
-            image_bytes=image_bytes,
-            mime_type=mime_type,
-            prompt=DEFAULT_PROMPT,
-            model=CONFIG.model
-        )
-        if ocr_text:
-            return f"\n\n<!-- Start Embedded Image OCR -->\n{ocr_text.strip()}\n<!-- End Embedded Image OCR -->\n\n"
-    except Exception:
-        pass
+    """Transcribe an embedded image to a Markdown snippet, or a placeholder.
+
+    Tries local PaddleOCR first and cloud vision second (see _ocr_raw). The result
+    is wrapped in OCR markers so downstream parsing can identify image-derived text.
+    """
+    text = await _ocr_raw(image_bytes, mime_type)
+    if text and text.strip():
+        return f"\n\n<!-- Start Embedded Image OCR -->\n{text.strip()}\n<!-- End Embedded Image OCR -->\n\n"
     return "![Image]"
+
+
+async def _ocr_full_pdf_page(file_bytes: bytes, page_index: int) -> str:
+    """Render a full PDF page to an image and OCR it (for scanned/image-only pages)."""
+    try:
+        from .pdf_render import render_page_png, is_available as render_ok
+        if not render_ok():
+            return ""
+        try:
+            dpi = int(os.getenv("OCR_PADDLE_DPI", "200") or "200")
+        except ValueError:
+            dpi = 200
+        png = render_page_png(file_bytes, page_index, dpi)
+        if not png:
+            return ""
+        return await _ocr_raw(png, "image/png")
+    except Exception:
+        return ""
 
 async def pdf_to_markdown(file_bytes: bytes) -> str:
     try:
@@ -33,12 +88,14 @@ async def pdf_to_markdown(file_bytes: bytes) -> str:
             text_parts = []
             for page_num, page in enumerate(pdf.pages, 1):
                 text_parts.append(f"## Page {page_num}\n")
-                
-                # Extract text
+                full_page_ocred = False
+
+                # Extract text (digital text layer, if any)
                 text = page.extract_text(x_tolerance=2)
+                page_has_text = bool(text and len(text.strip()) >= 15)
                 if text:
                     text_parts.append(text + "\n")
-                    
+
                 # Extract and format tables
                 tables = page.extract_tables()
                 if tables:
@@ -56,8 +113,19 @@ async def pdf_to_markdown(file_bytes: bytes) -> str:
                                 body = "\n".join(body_rows) if body_rows else ""
                                 text_parts.append(f"\n{header}\n{separator}\n{body}\n")
                 
-                # Extract images and perform OCR if possible
-                if hasattr(page, "images") and page.images:
+                # Scanned / image-only page: render the whole page and OCR it.
+                if not page_has_text:
+                    page_ocr = await _ocr_full_pdf_page(file_bytes, page_num - 1)
+                    if page_ocr and page_ocr.strip():
+                        text_parts.append(
+                            "\n<!-- Start Page OCR -->\n"
+                            + page_ocr.strip()
+                            + "\n<!-- End Page OCR -->\n"
+                        )
+                        full_page_ocred = True
+
+                # Extract embedded images and OCR them (skip if the whole page was OCR'd)
+                if not full_page_ocred and hasattr(page, "images") and page.images:
                     for img in page.images:
                         if img.get("width", 0) > 0 and img.get("height", 0) > 0:
                             try:
