@@ -47,4 +47,4 @@ ocr = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/projectbrain"]
+packages = ["src/projectbrain", "extensions_mcp"]
