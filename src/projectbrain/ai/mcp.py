@@ -77,7 +77,8 @@ def resolve_mcp_user_id(user_id: str = None) -> str:
                 pass
                 
     return uid or "default"
-
+def check_read_only() -> bool:
+    return os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes")
 @mcp_server.tool(name="projectbrain_query", description="Query ProjectBrain for contextual memories (HSG) and/or temporal facts")
 async def projectbrain_query(
     query: str,
@@ -206,6 +207,8 @@ async def projectbrain_store(
         author: Optional name of the user storing the memory.
     """
     try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
         import getpass
         # Normalize and validate stype
         stype = type
@@ -316,8 +319,10 @@ async def projectbrain_get(id: str) -> str:
 
 @mcp_server.tool(name="projectbrain_delete", description="Delete a memory by ID")
 async def projectbrain_delete(id: str, user_id: str = None) -> str:
-    """Delete a memory by ID."""
+    """Fetch a single memory by ID."""
     try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
         uid = resolve_mcp_user_id(user_id)
         m = await mem.get(id)
         if not m:
@@ -345,6 +350,8 @@ async def projectbrain_list(limit: int = 20, user_id: str = None) -> str:
 async def projectbrain_reinforce(id: str) -> str:
     """Reinforce a memory's salience/importance by its ID."""
     try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
         m = await mem.get(id)
         if not m:
             return f"Memory {id} not found"
@@ -360,6 +367,8 @@ async def projectbrain_reinforce(id: str) -> str:
 async def projectbrain_delete_all(user_id: str = None) -> str:
     """Delete all memories for a user."""
     try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
         uid = resolve_mcp_user_id(user_id)
         await mem.delete_all(user_id=uid)
         return f"All memories deleted for user {uid or 'default'}"
@@ -400,6 +409,8 @@ async def projectbrain_stats(user_id: str = None) -> str:
 async def projectbrain_ingest(source: str, creds: dict = None, filters: dict = None, user_id: str = None) -> str:
     """Ingest data from an external connector."""
     try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
         actual_creds = creds or {}
         actual_filters = filters or {}
         uid = resolve_mcp_user_id(user_id)
@@ -493,36 +504,56 @@ async def projectbrain_sync_codegraph(
         sync_memories: If True (default), scans and ingests all text source files as memories.
         author: Optional name of the user performing the sync.
     """
-    import sqlite3
-    import os
-    import getpass
     import shutil
     import subprocess
     
-    resolved_project_path = project_path
-    path_source = "specified" if project_path else "database"
+    if check_read_only():
+        return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+        
+    projects_root = os.getenv("PB_PROJECTS_ROOT_DIR") or os.getenv("OM_PROJECTS_ROOT_DIR")
     
-    if not resolved_project_path:
-        # Check database for previously synced local project_path
-        try:
-            from ..core.db import db
-            db.connect()
-            cursor = db.conn.cursor()
-            base_id = project_id.split(":", 1)[0] if ":" in project_id else project_id
-            cursor.execute("SELECT project_path FROM projects WHERE id = ? OR id LIKE ? ORDER BY updated_at DESC LIMIT 1;", (project_id, f"{base_id}%"))
-            row = cursor.fetchone()
-            if row and row[0]:
-                resolved_project_path = row[0]
-            cursor.close()
-        except Exception:
-            pass
-
-    if resolved_project_path:
+    if projects_root:
+        projects_root = os.path.abspath(projects_root)
+        project_dir_name = project_id.split(":")[0]
+        if project_path:
+            if os.path.isabs(project_path):
+                resolved_project_path = os.path.abspath(project_path)
+            else:
+                resolved_project_path = os.path.abspath(os.path.join(projects_root, project_path))
+        else:
+            resolved_project_path = os.path.abspath(os.path.join(projects_root, project_dir_name))
+            
+        if not resolved_project_path.startswith(projects_root):
+            return f"Error: Security violation. Path '{resolved_project_path}' is outside of the configured root directory '{projects_root}'."
+            
         if not os.path.isdir(resolved_project_path):
-            return f"Error: The {path_source} project path '{resolved_project_path}' does not exist or is not a directory on this machine."
+            return f"Error: The resolved project directory '{resolved_project_path}' does not exist or is not a directory on the server."
+            
         target_dir = resolved_project_path
     else:
-        target_dir = os.getcwd()
+        resolved_project_path = project_path
+        path_source = "specified" if project_path else "database"
+        
+        if not resolved_project_path:
+            try:
+                from ..core.db import db
+                db.connect()
+                cursor = db.conn.cursor()
+                base_id = project_id.split(":", 1)[0] if ":" in project_id else project_id
+                cursor.execute("SELECT project_path FROM projects WHERE id = ? OR id LIKE ? ORDER BY updated_at DESC LIMIT 1;", (project_id, f"{base_id}%"))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    resolved_project_path = row[0]
+                cursor.close()
+            except Exception:
+                pass
+
+        if resolved_project_path:
+            if not os.path.isdir(resolved_project_path):
+                return f"Error: The {path_source} project path '{resolved_project_path}' does not exist or is not a directory on this machine."
+            target_dir = resolved_project_path
+        else:
+            target_dir = os.getcwd()
         
     resolved_project_path = os.path.abspath(target_dir)
 
@@ -818,6 +849,8 @@ async def projectbrain_register_mcp_tool(
         sse_url: The SSE endpoint URL (if sse transport type is used).
     """
     try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
         from ..server.routes.mcp_registry import register_mcp, RegisterMCPRequest
         req = RegisterMCPRequest(
             transport_type=transport_type,
@@ -847,6 +880,8 @@ async def projectbrain_register_external_mcp_tool(
         env: Dictionary of environment variables.
     """
     try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
         from ..server.routes.mcp_registry import save_external_mcp_server, ExternalMCPRequest
         req = ExternalMCPRequest(
             name=name,

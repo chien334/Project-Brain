@@ -56,6 +56,9 @@ async def get_projects():
 
 @router.post("/projects")
 async def create_project(req: CreateProjectRequest):
+    import os
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
     db.connect()
     ts = int(time.time())
     try:
@@ -425,6 +428,9 @@ async def get_codegraph_data(
 
 @router.post("/sync")
 async def sync_codegraph_data(req: SyncRequest, request: Request = None):
+    import os
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
     if not req.nodes:
         raise HTTPException(
             status_code=400,
@@ -571,6 +577,9 @@ async def upload_codegraph_db(
     project_path: Optional[str] = Form(None),
     request: Request = None
 ):
+    import os
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
     import tempfile
     import os
     import shutil

@@ -20,6 +20,9 @@ async def upload_document(
     tags: Optional[str] = Form(""),
     author: Optional[str] = Form(None)
 ):
+    import os
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
     try:
         file_bytes = await file.read()
         filename = file.filename
