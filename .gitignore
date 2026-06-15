@@ -28,3 +28,4 @@ cloned_repos/
 *.db
 *.db-shm
 *.db-wal
+projectbrain.db-shm

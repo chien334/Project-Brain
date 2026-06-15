@@ -1,4 +1,34 @@
 document.addEventListener('DOMContentLoaded', () => {
+    // Safe storage wrapper shadowing global localStorage to prevent SecurityError crash on LAN HTTP
+    const safeStorage = {
+        getItem(key) {
+            try {
+                return window.localStorage.getItem(key);
+            } catch (e) {
+                console.warn("localStorage.getItem blocked:", e);
+                return this._fallback[key] || null;
+            }
+        },
+        setItem(key, value) {
+            try {
+                window.localStorage.setItem(key, value);
+            } catch (e) {
+                console.warn("localStorage.setItem blocked:", e);
+                this._fallback[key] = value;
+            }
+        },
+        removeItem(key) {
+            try {
+                window.localStorage.removeItem(key);
+            } catch (e) {
+                console.warn("localStorage.removeItem blocked:", e);
+                delete this._fallback[key];
+            }
+        },
+        _fallback: {}
+    };
+    const localStorage = safeStorage;
+
     // Intercept fetch to automatically include Authorization header
     const originalFetch = window.fetch;
     window.fetch = async function (url, options = {}) {
@@ -486,7 +516,33 @@ document.addEventListener('DOMContentLoaded', () => {
                         const originalBg = claudeConfigPre.style.background;
                         claudeConfigPre.style.background = 'rgba(129, 140, 248, 0.2)';
                         setTimeout(() => claudeConfigPre.style.background = originalBg, 200);
-                        alert("Claude / Cursor Configuration copied to clipboard!");
+                        alert("Claude / Cursor SSE Configuration copied to clipboard!");
+                    })
+                    .catch(err => console.error("Failed to copy:", err));
+            });
+        }
+        const stdioLocalConfigPre = document.getElementById('mcpStdioLocalConfig');
+        if (stdioLocalConfigPre) {
+            stdioLocalConfigPre.addEventListener('click', () => {
+                navigator.clipboard.writeText(stdioLocalConfigPre.textContent)
+                    .then(() => {
+                        const originalBg = stdioLocalConfigPre.style.background;
+                        stdioLocalConfigPre.style.background = 'rgba(129, 140, 248, 0.2)';
+                        setTimeout(() => stdioLocalConfigPre.style.background = originalBg, 200);
+                        alert("Stdio Local Configuration copied to clipboard!");
+                    })
+                    .catch(err => console.error("Failed to copy:", err));
+            });
+        }
+        const stdioRemoteConfigPre = document.getElementById('mcpStdioRemoteConfig');
+        if (stdioRemoteConfigPre) {
+            stdioRemoteConfigPre.addEventListener('click', () => {
+                navigator.clipboard.writeText(stdioRemoteConfigPre.textContent)
+                    .then(() => {
+                        const originalBg = stdioRemoteConfigPre.style.background;
+                        stdioRemoteConfigPre.style.background = 'rgba(129, 140, 248, 0.2)';
+                        setTimeout(() => stdioRemoteConfigPre.style.background = originalBg, 200);
+                        alert("Stdio Remote DB Configuration copied to clipboard!");
                     })
                     .catch(err => console.error("Failed to copy:", err));
             });
@@ -496,8 +552,10 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateLocalProjectConfig() {
         const copilotConfigPre = document.getElementById('mcpCopilotConfig');
         const claudeConfigPre = document.getElementById('mcpClaudeConfig');
+        const stdioLocalConfigPre = document.getElementById('mcpStdioLocalConfig');
+        const stdioRemoteConfigPre = document.getElementById('mcpStdioRemoteConfig');
         const projectDisplay = document.getElementById('activeProjectDisplay');
-        if (!copilotConfigPre && !claudeConfigPre) return;
+        if (!copilotConfigPre && !claudeConfigPre && !stdioLocalConfigPre && !stdioRemoteConfigPre) return;
 
         const token = localStorage.getItem('pb_auth_token') || 'YOUR_AUTH_TOKEN';
         const project = activeUser || 'default';
@@ -505,9 +563,8 @@ document.addEventListener('DOMContentLoaded', () => {
             projectDisplay.textContent = project;
         }
 
-        // Determine server Origin. If localhost, use dynamic location
+        // Determine server Origin
         let serverOrigin = window.location.origin;
-        // If it's localhost or loopback, let's keep it, but support remote access if accessed via IP
         const sseUrl = `${serverOrigin}/mcp/sse?token=${token}&project_id=${project}`;
 
         // 1. GitHub Copilot Format (.vscode/mcp.json)
@@ -538,6 +595,49 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             };
             claudeConfigPre.textContent = JSON.stringify(claudeJson, null, 2);
+        }
+
+        // 3. Stdio Local Format (.mcp.json)
+        if (stdioLocalConfigPre) {
+            const stdioLocalJson = {
+                "mcpServers": {
+                    "projectbrain": {
+                        "command": "python3",
+                        "args": [
+                            "-m",
+                            "projectbrain.main",
+                            "mcp"
+                        ],
+                        "env": {
+                            "PB_DEFAULT_USER_ID": project,
+                            "PB_AUTH_TOKEN": token
+                        }
+                    }
+                }
+            };
+            stdioLocalConfigPre.textContent = JSON.stringify(stdioLocalJson, null, 2);
+        }
+
+        // 4. Stdio Remote DB Format (.mcp.json)
+        if (stdioRemoteConfigPre) {
+            const stdioRemoteJson = {
+                "mcpServers": {
+                    "projectbrain": {
+                        "command": "python3",
+                        "args": [
+                            "-m",
+                            "projectbrain.main",
+                            "mcp"
+                        ],
+                        "env": {
+                            "PB_DEFAULT_USER_ID": project,
+                            "PB_AUTH_TOKEN": token,
+                            "PB_DB_PATH": "postgresql://username:password@remote_ip:5432/projectbrain"
+                        }
+                    }
+                }
+            };
+            stdioRemoteConfigPre.textContent = JSON.stringify(stdioRemoteJson, null, 2);
         }
     }
 
