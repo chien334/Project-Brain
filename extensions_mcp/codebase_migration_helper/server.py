@@ -103,7 +103,7 @@ async def translate_code_comments(
             "prompt": code_content if 'code_content' in locals() else None,
             "message": (
                 "The server-side LLM call failed. Please perform this translation yourself "
-                "using your own model capabilities ('model hiện tại'). Translate all Japanese comments "
+                "using your own model capabilities ('current model'). Translate all Japanese comments "
                 "to English (or vice versa if specified) in the provided code, maintaining logic exactly, "
                 "and output the complete translated code."
             )
@@ -157,7 +157,7 @@ async def recommend_refactor(
             "prompt": prompt if 'prompt' in locals() else None,
             "message": (
                 "The server-side LLM call failed. Please perform this refactoring analysis yourself "
-                "using your own model capabilities ('model hiện tại'). Generate a structured, technical, "
+                "using your own model capabilities ('current model'). Generate a structured, technical, "
                 "and detailed markdown migration recommendation report for the provided code."
             )
         }
@@ -255,7 +255,7 @@ async def plan_execution_phases(
             "prompt": prompt,
             "message": (
                 "The server-side LLM call failed. Please partition these functions into logical refactoring phases yourself "
-                "using your own model capabilities ('model hiện tại'). Create both `.planning/migration_phases.json` "
+                "using your own model capabilities ('current model'). Create both `.planning/migration_phases.json` "
                 "and `.planning/migration_phases.md` in the project directory based on the output schema."
             )
         }

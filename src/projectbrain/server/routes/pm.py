@@ -31,20 +31,20 @@ async def pm_search(req: PMSearchRequest):
         
         if not mems:
             return {
-                "results": "Không tìm thấy ký ức nào liên quan để trả lời câu hỏi.",
+                "results": "No relevant memories found to answer the question.",
                 "source_memories": []
             }
             
         # 2. Build RAG prompt for Gemini
         context = "\n".join([f"- [{m.get('primary_sector')} | Tag: {m.get('tags')}] {m.get('content')}" for m in mems])
         
-        prompt = f"""Bạn là một trợ lý AI thông minh hỗ trợ PM (Quản trị dự án). 
-Hãy trả lời câu hỏi của PM dựa trên các thông tin ký ức (context) được tìm thấy dưới đây.
-Nếu thông tin trong context không đủ, hãy trả lời dựa trên những gì có sẵn và nêu rõ thiếu sót.
+        prompt = f"""You are a smart AI assistant supporting a PM (Project Manager). 
+Please answer the PM's question based on the project memories (context) found below.
+If the information in the context is insufficient, answer based on what is available and clearly state the gaps.
 
-Câu hỏi: {req.query}
+Question: {req.query}
 
-Thông tin ký ức tìm thấy:
+Project memories found:
 {context}
 """
         # Call Gemini
@@ -59,14 +59,14 @@ Thông tin ký ức tìm thấy:
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+ 
 @router.post("/generate-doc")
 async def pm_generate_doc(req: PMDocRequest):
     try:
         import logging
         logger = logging.getLogger("server")
         logger.info(f"User '{req.author or 'anonymous'}' triggered PM document generation (Type: {req.doc_type}) for prompt: '{req.prompt}' on project '{req.user_id or 'all'}'")
-
+ 
         # 1. Search memories related to the prompt
         mems = await mem.search(req.prompt, user_id=req.user_id, limit=20)
         
@@ -74,21 +74,21 @@ async def pm_generate_doc(req: PMDocRequest):
         context = "\n".join([f"- [{m.get('primary_sector')}] {m.get('content')}" for m in mems])
         
         doc_instructions = {
-            "status_report": "Báo cáo tiến độ dự án (Status Report) bao gồm các công việc hoàn thành, đang làm, và các rủi ro phát sinh.",
-            "prd": "Tài liệu Yêu cầu Sản phẩm (PRD) bao gồm tổng quan, mục tiêu, user stories, yêu cầu chức năng và kỹ thuật.",
-            "user_story": "Danh sách các User Stories chi tiết kèm theo tiêu chí nghiệm thu (Acceptance Criteria).",
-            "roadmap": "Lộ trình phát triển sản phẩm (Roadmap) chia theo các mốc thời gian và tính năng chính."
+            "status_report": "Project Status Report including completed tasks, in-progress work, and identified risks.",
+            "prd": "Product Requirement Document (PRD) including overview, objectives, user stories, functional and technical requirements.",
+            "user_story": "Detailed list of User Stories accompanied by acceptance criteria (Acceptance Criteria).",
+            "roadmap": "Product Roadmap broken down by milestones and major features."
         }
         
         instruction = doc_instructions.get(req.doc_type, doc_instructions["status_report"])
         
-        prompt = f"""Bạn là một chuyên gia Product Manager xuất sắc. 
-Nhiệm vụ của bạn là soạn thảo một tài liệu: {instruction}
-Hãy dựa trên thông tin thực tế thu thập từ ký ức của dự án dưới đây để viết tài liệu này một cách chuyên nghiệp, cấu trúc rõ ràng bằng Markdown.
+        prompt = f"""You are an outstanding Product Manager expert. 
+Your task is to draft a document: {instruction}
+Please base your writing on the actual facts collected from the project memories below, and write the document professionally with a clear Markdown structure.
 
-Yêu cầu PM: {req.prompt}
+PM Request: {req.prompt}
 
-Thông tin ký ức thực tế thu thập được:
+Actual project memories collected:
 {context}
 """
         # Call Gemini
