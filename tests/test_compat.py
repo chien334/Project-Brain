@@ -154,3 +154,24 @@ def test_registry_compat_external_filters_openmemory(tmp_path):
         assert "openmemory" not in servers
         assert "projectbrain" not in servers
         assert "my-external-server" in servers
+
+def test_sse_headers_and_cors():
+    from fastapi.testclient import TestClient
+    from projectbrain.server.api import create_app
+    
+    app = create_app()
+    client = TestClient(app, base_url="http://localhost")
+    
+    # 1. Verify CORS exposes Mcp-Session-Id header on actual request
+    response = client.get("/memory/stats", headers={
+        "Origin": "http://localhost:3000"
+    })
+    assert "access-control-expose-headers" in response.headers
+    assert "mcp-session-id" in response.headers["access-control-expose-headers"].lower()
+
+    # 2. Verify SSE middleware injects X-Accel-Buffering and Cache-Control headers
+    # We request an endpoint containing "/mcp" in its path (returns 404 but applies middleware)
+    response_sse = client.get("/mcp/nonexistent-test-route")
+    assert response_sse.headers.get("x-accel-buffering") == "no"
+    assert response_sse.headers.get("cache-control") == "no-cache"
+

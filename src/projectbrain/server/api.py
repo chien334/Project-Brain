@@ -16,7 +16,16 @@ def create_app() -> FastAPI:
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["Mcp-Session-Id"],
     )
+
+    @app.middleware("http")
+    async def add_sse_headers(request: Request, call_next):
+        response = await call_next(request)
+        if "/mcp" in request.url.path or response.headers.get("content-type") == "text/event-stream":
+            response.headers["X-Accel-Buffering"] = "no"
+            response.headers["Cache-Control"] = "no-cache"
+        return response
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
         start = time.time()
