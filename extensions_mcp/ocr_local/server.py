@@ -27,16 +27,16 @@ mcp = FastMCP("ocr_local_mcp")
     )
 )
 async def ocr_engine_status() -> dict:
-    """Bao cao tinh trang OCR local: PaddleOCR/PyMuPDF da cai chua, ngon ngu, engine.
+    """Report local OCR engine status: PaddleOCR/PyMuPDF installation, language, and engine settings.
 
     Returns:
         dict: {
-            "ocr_engine": str,              # gia tri OCR_ENGINE (auto|paddle|vision|off)
-            "paddle_langs": str,            # OCR_PADDLE_LANG
-            "paddle_dpi": str,              # OCR_PADDLE_DPI
-            "paddleocr_available": bool,    # da cai paddleocr?
-            "pdf_renderer_available": bool, # render PDF duoc? (PyMuPDF/pdfplumber)
-            "cloud_vision_key_set": bool    # co LLM_API_KEY de fallback cloud?
+            "ocr_engine": str,              # OCR_ENGINE value (auto|paddle|vision|off)
+            "paddle_langs": str,            # OCR_PADDLE_LANG value
+            "paddle_dpi": str,              # OCR_PADDLE_DPI value
+            "paddleocr_available": bool,    # is paddleocr installed?
+            "pdf_renderer_available": bool, # can we render PDFs? (PyMuPDF/pdfplumber)
+            "cloud_vision_key_set": bool    # is LLM_API_KEY set for cloud fallback?
         }
     """
     import os
@@ -79,27 +79,27 @@ async def ocr_engine_status() -> dict:
     )
 )
 async def ocr_image_to_markdown(
-    image_path: Annotated[str, Field(description="Duong dan toi file anh")],
+    image_path: Annotated[str, Field(description="Path to the image file")],
     output_path: Annotated[
-        Optional[str], Field(description="Neu co, ghi Markdown ra file nay")
+        Optional[str], Field(description="If provided, writes the Markdown output to this file path")
     ] = None,
 ) -> dict:
-    """OCR 1 file anh bang PaddleOCR local (khong can API key).
+    """OCR a single image file using local PaddleOCR (no API key required).
 
     Args:
-        image_path: Duong dan toi anh (png/jpg/webp/bmp/tiff...).
-        output_path: Neu co, ghi ket qua Markdown ra duong dan nay.
+        image_path: Path to the image (png/jpg/webp/bmp/tiff...).
+        output_path: If provided, writes the recognized Markdown result to this path.
 
     Returns:
         dict: {"file": str, "markdown": str, "chars": int}
 
     Error Handling:
-        Raise ValueError neu khong tim thay anh;
-        RuntimeError neu PaddleOCR chua duoc cai.
+        Raises ValueError if the image is not found.
+        Raises RuntimeError if PaddleOCR is not installed.
     """
     p = Path(image_path).expanduser()
     if not p.is_file():
-        raise ValueError(f"Khong tim thay anh: {p}")
+        raise ValueError(f"Image not found: {p}")
     from extensions_mcp.image_to_markdown.paddle_client import (
         extract_text_local,
         is_available,
@@ -107,7 +107,7 @@ async def ocr_image_to_markdown(
 
     if not is_available():
         raise RuntimeError(
-            "PaddleOCR chua duoc cai. Chay: pip install paddleocr paddlepaddle"
+            "PaddleOCR is not installed. Please run: pip install paddleocr paddlepaddle"
         )
     text = await extract_text_local(p.read_bytes(), "image/png")
     if output_path:
@@ -127,28 +127,27 @@ async def ocr_image_to_markdown(
     )
 )
 async def ocr_pdf_to_markdown(
-    pdf_path: Annotated[str, Field(description="Duong dan toi file PDF")],
+    pdf_path: Annotated[str, Field(description="Path to the PDF file")],
     dpi: Annotated[
-        int, Field(ge=72, le=400, description="Do phan giai render trang (mac dinh 200)")
+        int, Field(ge=72, le=400, description="DPI resolution for rendering pages (default: 200)")
     ] = 200,
     force_ocr: Annotated[
-        bool, Field(description="True: OCR moi trang ke ca khi co text layer")
+        bool, Field(description="True: OCR all pages even if a text layer exists")
     ] = False,
     output_path: Annotated[
-        Optional[str], Field(description="Neu co, ghi Markdown ra file nay")
+        Optional[str], Field(description="If provided, writes the Markdown output to this file path")
     ] = None,
 ) -> dict:
-    """Convert PDF -> Markdown bang cach render tung trang roi OCR local (PaddleOCR).
+    """Convert PDF to Markdown by rendering each page and running local PaddleOCR on the images.
 
-    Luong nay phu hop cho PDF scan / PDF anh (khong co text layer). Voi PDF born-digital
-    (co san text), de force_ocr=False de lay text layer truc tiep (chinh xac & nhanh hon),
-    chi OCR nhung trang khong co text.
+    This workflow is suitable for scanned PDFs or image-based PDFs (which don't have a digital text layer).
+    For digital PDFs with a built-in text layer, set force_ocr=False to extract the digital text directly (much faster & more accurate), only running OCR on pages that lack digital text.
 
     Args:
-        pdf_path: Duong dan toi PDF.
-        dpi: Do phan giai render (72-400, mac dinh 200). Cao hon = net hon nhung cham hon.
-        force_ocr: True de OCR TOAN BO trang (bo qua text layer); huu ich khi text layer loi.
-        output_path: Neu co, ghi Markdown ra duong dan nay.
+        pdf_path: Path to the PDF file.
+        dpi: Rendering resolution (72-400, default: 200). Higher values yield higher accuracy but run slower.
+        force_ocr: True to force OCR on all pages, bypassing the digital text layer. Useful when the digital text layer is corrupted.
+        output_path: Optional path to save the generated Markdown.
 
     Returns:
         dict: {
@@ -157,12 +156,12 @@ async def ocr_pdf_to_markdown(
         }
 
     Error Handling:
-        Raise ValueError neu khong tim thay PDF;
-        RuntimeError neu thieu PyMuPDF (render) hoac PaddleOCR.
+        Raises ValueError if the PDF is not found.
+        Raises RuntimeError if PyMuPDF (rendering) or PaddleOCR is missing.
     """
     p = Path(pdf_path).expanduser()
     if not p.is_file():
-        raise ValueError(f"Khong tim thay PDF: {p}")
+        raise ValueError(f"PDF not found: {p}")
     data = p.read_bytes()
 
     from projectbrain.utils.pdf_render import (
@@ -172,7 +171,7 @@ async def ocr_pdf_to_markdown(
     )
 
     if not render_ok():
-        raise RuntimeError("Thieu trinh render PDF. Chay: pip install pymupdf")
+        raise RuntimeError("PDF renderer missing. Please run: pip install pymupdf")
     from extensions_mcp.image_to_markdown.paddle_client import (
         extract_text_local,
         is_available as paddle_ok,
@@ -180,7 +179,7 @@ async def ocr_pdf_to_markdown(
 
     if not paddle_ok():
         raise RuntimeError(
-            "PaddleOCR chua duoc cai. Chay: pip install paddleocr paddlepaddle"
+            "PaddleOCR is not installed. Please run: pip install paddleocr paddlepaddle"
         )
 
     # Pre-extract the digital text layer (when not forcing OCR).
@@ -207,7 +206,7 @@ async def ocr_pdf_to_markdown(
         else:
             png = render_page_png(data, i, dpi)
             ocr_txt = await extract_text_local(png, "image/png") if png else ""
-            parts.append((ocr_txt.strip() if ocr_txt else "_(khong nhan dang duoc text)_") + "\n")
+            parts.append((ocr_txt.strip() if ocr_txt else "_(no text detected)_") + "\n")
             ocr_pages += 1
 
     markdown = "\n".join(parts).strip()
