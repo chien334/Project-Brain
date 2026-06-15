@@ -445,10 +445,62 @@ async def async_ingest_files(project_id: str, dir_path: str):
 def run_ingest_files(project_id: str, dir_path: str):
     import os
     import asyncio
-    if not os.path.exists(dir_path):
-        print(f"Error: Directory '{dir_path}' does not exist.")
-        sys.exit(1)
     asyncio.run(async_ingest_files(project_id, dir_path))
+
+def run_upload_file(project_id: str, file_path: str, server_url: str = None, tags: str = "", author: str = None):
+    import os
+    import sys
+    import httpx
+    import mimetypes
+
+    if not os.path.exists(file_path):
+        print(f"Error: File '{file_path}' does not exist.")
+        sys.exit(1)
+
+    if not os.path.isfile(file_path):
+        print(f"Error: '{file_path}' is not a file.")
+        sys.exit(1)
+
+    server_url = server_url or os.getenv("PB_URL") or os.getenv("PB_API_URL") or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
+    
+    filename = os.path.basename(file_path)
+    mime_type, _ = mimetypes.guess_type(file_path)
+    mime_type = mime_type or "application/octet-stream"
+
+    print(f"Uploading file '{filename}' to {server_url}/sources/upload...")
+
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (filename, f, mime_type)}
+            data = {
+                "project_id": project_id,
+                "tags": tags,
+                "author": author or "cli"
+            }
+            
+            headers = {}
+            api_key = os.getenv("PB_API_KEY") or os.getenv("OM_API_KEY")
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            resp = httpx.post(
+                f"{server_url}/sources/upload",
+                files=files,
+                data=data,
+                headers=headers,
+                timeout=120.0
+            )
+
+        if resp.status_code == 200:
+            print("Successfully uploaded and indexed document!")
+            import json
+            print(json.dumps(resp.json(), indent=2))
+        else:
+            print(f"Upload failed (Status {resp.status_code}): {resp.text}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error uploading file: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     import sys
@@ -483,6 +535,16 @@ if __name__ == "__main__":
         project_id = sys.argv[2]
         dir_path = sys.argv[3]
         run_ingest_files(project_id, dir_path)
+    elif len(sys.argv) > 1 and sys.argv[1] == "upload-file":
+        if len(sys.argv) < 4:
+            print("Usage: python -m projectbrain.main upload-file <project_id> <file_path> [url] [tags] [author]")
+            sys.exit(1)
+        project_id = sys.argv[2]
+        file_path = sys.argv[3]
+        server_url = sys.argv[4] if len(sys.argv) > 4 else None
+        tags = sys.argv[5] if len(sys.argv) > 5 else ""
+        author = sys.argv[6] if len(sys.argv) > 6 else None
+        run_upload_file(project_id, file_path, server_url, tags, author)
     else:
         print("ProjectBrain Python SDK / Server")
         print("Usage:")
@@ -490,3 +552,4 @@ if __name__ == "__main__":
         print("  python -m projectbrain.main mcp                                           # Start stdio MCP server")
         print("  python -m projectbrain.main codegraph-sync <project_id> [url] [path] [branch] [-m] [-u] # Sync local codegraph and memories to server (use -u to upload sqlite db file)")
         print("  python -m projectbrain.main ingest-files <project_id> <dir_path>           # Ingest codebase files into memories")
+        print("  python -m projectbrain.main upload-file <project_id> <file_path> [url] [tags] [author] # Upload a document to RAG server")
