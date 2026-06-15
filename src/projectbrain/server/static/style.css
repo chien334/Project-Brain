@@ -163,14 +163,79 @@ body {
 
 /* Dashboard Container */
 .dashboard-container {
-    max-width: 1400px;
+    max-width: 100%;
     width: 100%;
-    margin: 2rem auto;
-    padding: 0 2rem;
+    margin: 0;
+    padding: 0;
     display: grid;
-    grid-template-columns: 320px 1fr;
-    gap: 2rem;
+    grid-template-columns: 260px 1fr;
+    gap: 0;
     flex: 1;
+}
+
+.main-content {
+    padding: 2rem;
+    overflow-y: auto;
+    height: calc(100vh - 75px);
+}
+
+/* Left Sidebar Menu Layout */
+.navigation-sidebar {
+    background: rgba(11, 15, 25, 0.95);
+    backdrop-filter: blur(20px);
+    border-right: 1px solid var(--card-border);
+    padding: 1.5rem 1rem;
+    height: calc(100vh - 75px);
+    position: sticky;
+    top: 75px;
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+    overflow-y: auto;
+}
+
+.sidebar-logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 8px 12px 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.menu-link {
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text-secondary);
+    padding: 10px 14px;
+    border-radius: 8px;
+    text-align: left;
+    font-family: var(--font-sans);
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    transition: var(--transition);
+}
+
+.menu-link i {
+    font-size: 1rem;
+    width: 20px;
+    text-align: center;
+}
+
+.menu-link:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-primary);
+}
+
+.menu-link.active {
+    background: var(--primary-glow);
+    color: var(--primary-color);
+    border-left: 3px solid var(--primary-color);
+    border-radius: 0 8px 8px 0;
 }
 
 /* Cards (Glassmorphism design) */
@@ -1074,3 +1139,295 @@ textarea {
     word-break: break-all;
 }
 
+/* Accounts & Auth Panel Styles */
+.accounts-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-top: 10px;
+}
+.account-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: start;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--card-border);
+    padding: 1rem;
+    border-radius: 12px;
+    gap: 15px;
+    transition: var(--transition);
+}
+.account-item:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.15);
+}
+.account-details {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    flex: 1;
+}
+.account-title-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.account-username {
+    font-weight: 600;
+    color: #ffffff;
+    font-size: 1.05rem;
+}
+.account-role-badge {
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+    text-transform: capitalize;
+}
+.account-role-badge.admin {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+.account-role-badge.collaborator {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+}
+.account-role-badge.reader {
+    background: rgba(16, 185, 129, 0.15);
+    color: #34d399;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+.account-token-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0, 0, 0, 0.2);
+    padding: 4px 8px;
+    border-radius: 6px;
+    width: fit-content;
+}
+.account-token {
+    font-family: monospace;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+.btn-copy-token {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: color 0.2s;
+}
+.btn-copy-token:hover {
+    color: #ffffff;
+}
+.account-tools-info {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+.account-tools-info strong {
+    color: var(--text-primary);
+}
+.account-actions {
+    display: flex;
+    align-items: center;
+}
+
+/* Login screen styles */
+.login-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: radial-gradient(circle at 50% 50%, rgba(15, 23, 42, 0.95), rgba(8, 12, 21, 0.98));
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 2000;
+    transition: opacity 0.4s ease, visibility 0.4s ease;
+}
+
+.login-card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    backdrop-filter: blur(20px);
+    border-radius: 16px;
+    padding: 2.5rem;
+    width: 100%;
+    max-width: 440px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4), 
+                0 0 40px rgba(99, 102, 241, 0.1);
+    transform: translateY(0);
+    transition: transform 0.4s ease;
+}
+
+.login-header {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+.login-icon {
+    font-size: 3rem;
+    background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    filter: drop-shadow(0 0 15px var(--primary-glow));
+    margin-bottom: 1rem;
+}
+
+.login-card h2 {
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    margin-bottom: 0.5rem;
+    background: linear-gradient(to right, #ffffff, #e0e7ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.login-subtitle {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    line-height: 1.4;
+}
+
+.login-form .form-group {
+    margin-bottom: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.login-form label {
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.input-with-icon {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.input-with-icon i {
+    position: absolute;
+    left: 14px;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    pointer-events: none;
+    transition: color 0.2s;
+}
+
+.input-with-icon input {
+    width: 100%;
+    padding: 12px 14px 12px 42px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    color: #ffffff;
+    font-family: var(--font-sans);
+    font-size: 0.95rem;
+    outline: none;
+    transition: all 0.2s ease;
+}
+
+.input-with-icon input:focus {
+    border-color: var(--primary-color);
+    background: rgba(255, 255, 255, 0.05);
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+}
+
+.input-with-icon input:focus + i {
+    color: var(--primary-color);
+}
+
+.login-error {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: #f87171;
+    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 1.5rem;
+    animation: shake 0.4s ease-in-out;
+}
+
+.btn-block {
+    width: 100%;
+    justify-content: center;
+    gap: 10px;
+    padding: 12px;
+    font-size: 0.95rem;
+    font-weight: 600;
+}
+
+@keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-6px); }
+    75% { transform: translateX(6px); }
+}
+
+/* User Widget in Header */
+.user-profile-widget {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--card-border);
+    padding: 6px 12px;
+    border-radius: 8px;
+    margin-left: 12px;
+}
+
+.widget-role-icon {
+    font-size: 1.1rem;
+    color: var(--primary-color);
+}
+
+.widget-details {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.2;
+}
+
+.widget-username {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #ffffff;
+}
+
+.widget-role {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+#btnLogout {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text-secondary);
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    padding: 0;
+}
+
+#btnLogout:hover {
+    background: rgba(239, 68, 68, 0.15);
+    border-color: rgba(239, 68, 68, 0.3);
+    color: #f87171;
+}

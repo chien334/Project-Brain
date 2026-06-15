@@ -1,4 +1,23 @@
 document.addEventListener('DOMContentLoaded', () => {
+    // Intercept fetch to automatically include Authorization header
+    const originalFetch = window.fetch;
+    window.fetch = async function (url, options = {}) {
+        const token = localStorage.getItem('pb_auth_token');
+        if (token) {
+            options.headers = options.headers || {};
+            if (options.headers instanceof Headers) {
+                if (!options.headers.has('Authorization')) {
+                    options.headers.set('Authorization', `Bearer ${token}`);
+                }
+            } else {
+                if (!options.headers['Authorization'] && !options.headers['authorization']) {
+                    options.headers['Authorization'] = `Bearer ${token}`;
+                }
+            }
+        }
+        return originalFetch(url, options);
+    };
+
     // DOM Elements
     const currentProjectSelect = document.getElementById('currentProject');
     const currentBranchSelect = document.getElementById('currentBranch');
@@ -6,6 +25,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnAddProject = document.getElementById('btnAddProject');
     const currentUser = document.getElementById('currentUser');
     
+    // Auth & Login DOM Elements
+    const loginScreen = document.getElementById('loginScreen');
+    const loginForm = document.getElementById('loginForm');
+    const loginToken = document.getElementById('loginToken');
+    const loginError = document.getElementById('loginError');
+    const loginErrorMsg = document.getElementById('loginErrorMsg');
+    const userProfileWidget = document.getElementById('userProfileWidget');
+    const userProfileName = document.getElementById('userProfileName');
+    const userProfileRole = document.getElementById('userProfileRole');
+    const btnLogout = document.getElementById('btnLogout');
+    const dashboardContainer = document.querySelector('.dashboard-container');
+
     // Version Comparison Elements
     const diffBaseProject = document.getElementById('diffBaseProject');
     const diffTargetProject = document.getElementById('diffTargetProject');
@@ -30,7 +61,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const activeTags = document.getElementById('activeTags');
     const btnDeleteAll = document.getElementById('btnDeleteAll');
     
-    const tabLinks = document.querySelectorAll('.tab-link');
+    const tabLinks = document.querySelectorAll('.menu-link');
     const tabContents = document.querySelectorAll('.tab-content');
     
     const newMemoryContent = document.getElementById('newMemoryContent');
@@ -89,6 +120,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // State
     let activeUser = 'default';
     let projectGroups = {};
+    let userRole = 'reader'; // default to reader for safety
+    let isInitialized = false;
     
     function updateBranchDropdown(baseId) {
         currentBranchSelect.innerHTML = '';
@@ -142,10 +175,136 @@ document.addEventListener('DOMContentLoaded', () => {
             activeUser = selectedProj;
         }
         console.log("Recalculated activeUser:", activeUser);
+        updateLocalProjectConfig();
     }
-    
-    // Initialize Dashboard
-    init();
+
+    // Authentication Gate Check
+    checkAuth();
+
+    async function checkAuth() {
+        const token = localStorage.getItem('pb_auth_token');
+        if (!token) {
+            showLoginGate();
+            return;
+        }
+
+        try {
+            const res = await fetch('/auth/verify');
+            if (res.ok) {
+                const data = await res.json();
+                handleSuccessfulLogin(data, token);
+            } else {
+                localStorage.removeItem('pb_auth_token');
+                showLoginGate();
+            }
+        } catch (err) {
+            console.error('Error during token verification:', err);
+            showLoginGate();
+        }
+    }
+
+    function showLoginGate() {
+        dashboardContainer.style.display = 'none';
+        loginScreen.style.display = 'flex';
+        userProfileWidget.style.display = 'none';
+    }
+
+    function handleSuccessfulLogin(userData, token) {
+        const account = userData.account || {};
+        userRole = account.role || 'reader';
+        localStorage.setItem('pb_auth_token', token);
+        
+        userProfileName.textContent = account.username || 'unknown';
+        userProfileRole.textContent = userRole;
+        userProfileWidget.style.display = 'flex';
+        
+        if (currentUser) {
+            currentUser.value = account.username || '';
+            currentUser.disabled = true;
+            localStorage.setItem('currentUser', account.username || '');
+        }
+
+        applyRoleRestrictions();
+
+        loginScreen.style.display = 'none';
+        dashboardContainer.style.display = 'grid';
+
+        if (!isInitialized) {
+            isInitialized = true;
+            init();
+        }
+    }
+
+    function applyRoleRestrictions() {
+        const btnTabAuth = document.getElementById('btnTabAuth');
+        if (btnTabAuth) {
+            if (userRole !== 'admin') {
+                btnTabAuth.style.display = 'none';
+            } else {
+                btnTabAuth.style.display = 'flex';
+            }
+        }
+
+        const addMemoryBox = document.querySelector('.add-memory-box');
+        const uploadDocBox = document.querySelector('.upload-doc-box');
+        const dangerZone = document.querySelector('.danger-zone');
+        
+        if (userRole === 'reader') {
+            if (addMemoryBox) addMemoryBox.style.display = 'none';
+            if (uploadDocBox) uploadDocBox.style.display = 'none';
+            if (dangerZone) dangerZone.style.display = 'none';
+        } else {
+            if (addMemoryBox) addMemoryBox.style.display = 'flex';
+            if (uploadDocBox) uploadDocBox.style.display = 'flex';
+            if (dangerZone) dangerZone.style.display = 'block';
+        }
+    }
+
+    // Login Form handler
+    loginForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const token = loginToken.value.trim();
+        if (!token) return;
+
+        loginError.style.display = 'none';
+        const submitBtn = document.getElementById('btnLoginSubmit');
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = `<span>Verifying...</span> <i class="fa-solid fa-spinner fa-spin"></i>`;
+
+        try {
+            const res = await fetch('/auth/verify', {
+                headers: { 'Authorization': `Bearer ${token}` }
+            });
+
+            if (res.ok) {
+                const userData = await res.json();
+                handleSuccessfulLogin(userData, token);
+            } else {
+                let errorText = "Invalid token. Please try again.";
+                try {
+                    const errorJson = await res.json();
+                    if (errorJson.detail) errorText = errorJson.detail;
+                } catch(_) {}
+                loginErrorMsg.textContent = errorText;
+                loginError.style.display = 'flex';
+            }
+        } catch (err) {
+            loginErrorMsg.textContent = "Network error. Server might be offline.";
+            loginError.style.display = 'flex';
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = `<span>Log In to Dashboard</span> <i class="fa-solid fa-right-to-bracket"></i>`;
+        }
+    });
+
+    // Logout handler
+    btnLogout.addEventListener('click', () => {
+        localStorage.removeItem('pb_auth_token');
+        userRole = 'reader';
+        isInitialized = false;
+        loginToken.value = '';
+        showLoginGate();
+    });
 
     function init() {
         setupTabs();
@@ -291,6 +450,95 @@ document.addEventListener('DOMContentLoaded', () => {
             loadCodeGraph();
         });
         document.getElementById('btnSaveExtMcp').addEventListener('click', saveExternalMcp);
+        const authForm = document.getElementById('authAccountForm');
+        if (authForm) {
+            authForm.addEventListener('submit', saveAccount);
+        }
+        const allowedToolsInput = document.getElementById('authAllowedTools');
+        if (allowedToolsInput) {
+            allowedToolsInput.addEventListener('input', updateActiveToolTags);
+        }
+        const projectRegForm = document.getElementById('projectRegistryForm');
+        if (projectRegForm) {
+            projectRegForm.addEventListener('submit', saveProject);
+        }
+
+        // Initialize local project config generator
+        updateLocalProjectConfig();
+        const copilotConfigPre = document.getElementById('mcpCopilotConfig');
+        if (copilotConfigPre) {
+            copilotConfigPre.addEventListener('click', () => {
+                navigator.clipboard.writeText(copilotConfigPre.textContent)
+                    .then(() => {
+                        const originalBg = copilotConfigPre.style.background;
+                        copilotConfigPre.style.background = 'rgba(129, 140, 248, 0.2)';
+                        setTimeout(() => copilotConfigPre.style.background = originalBg, 200);
+                        alert("Copilot Configuration copied to clipboard!");
+                    })
+                    .catch(err => console.error("Failed to copy:", err));
+            });
+        }
+        const claudeConfigPre = document.getElementById('mcpClaudeConfig');
+        if (claudeConfigPre) {
+            claudeConfigPre.addEventListener('click', () => {
+                navigator.clipboard.writeText(claudeConfigPre.textContent)
+                    .then(() => {
+                        const originalBg = claudeConfigPre.style.background;
+                        claudeConfigPre.style.background = 'rgba(129, 140, 248, 0.2)';
+                        setTimeout(() => claudeConfigPre.style.background = originalBg, 200);
+                        alert("Claude / Cursor Configuration copied to clipboard!");
+                    })
+                    .catch(err => console.error("Failed to copy:", err));
+            });
+        }
+    }
+
+    function updateLocalProjectConfig() {
+        const copilotConfigPre = document.getElementById('mcpCopilotConfig');
+        const claudeConfigPre = document.getElementById('mcpClaudeConfig');
+        const projectDisplay = document.getElementById('activeProjectDisplay');
+        if (!copilotConfigPre && !claudeConfigPre) return;
+
+        const token = localStorage.getItem('pb_auth_token') || 'YOUR_AUTH_TOKEN';
+        const project = activeUser || 'default';
+        if (projectDisplay) {
+            projectDisplay.textContent = project;
+        }
+
+        // Determine server Origin. If localhost, use dynamic location
+        let serverOrigin = window.location.origin;
+        // If it's localhost or loopback, let's keep it, but support remote access if accessed via IP
+        const sseUrl = `${serverOrigin}/mcp/sse?token=${token}&project_id=${project}`;
+
+        // 1. GitHub Copilot Format (.vscode/mcp.json)
+        if (copilotConfigPre) {
+            const copilotJson = {
+                "servers": {
+                    "projectbrain": {
+                        "type": "http",
+                        "url": sseUrl
+                    }
+                }
+            };
+            copilotConfigPre.textContent = JSON.stringify(copilotJson, null, 2);
+        }
+
+        // 2. Claude Code / Cursor Format (.mcp.json)
+        if (claudeConfigPre) {
+            const claudeJson = {
+                "mcpServers": {
+                    "projectbrain": {
+                        "command": "npx",
+                        "args": [
+                            "-y",
+                            "mcp-remote",
+                            sseUrl
+                        ]
+                    }
+                }
+            };
+            claudeConfigPre.textContent = JSON.stringify(claudeJson, null, 2);
+        }
     }
 
     // Tabs logic
@@ -305,11 +553,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 link.classList.add('active');
                 document.getElementById(targetTab).classList.add('active');
                 
-                if (targetTab === 'codeGraphTab') {
+                if (targetTab === 'dashboardTab') {
+                    loadStats();
+                } else if (targetTab === 'codeGraphTab') {
                     loadProjects();
                     setTimeout(loadCodeGraph, 100);
                 } else if (targetTab === 'compareTab') {
                     loadProjects();
+                } else if (targetTab === 'projectRegistryTab') {
+                    loadProjectsList();
+                } else if (targetTab === 'authTab') {
+                    loadAccounts();
+                    loadAvailableTools();
                 }
             });
         });
@@ -400,6 +655,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 const saliencePercent = Math.min(100, Math.max(0, (node.salience || 0.5) * 100));
 
+                let actionButtonsHtml = '';
+                if (userRole !== 'reader') {
+                    actionButtonsHtml = `
+                        <div class="action-buttons-group">
+                            <button class="btn btn-secondary btn-sm btn-reinforce" data-id="${node.id}"><i class="fa-solid fa-bolt"></i> Reinforce</button>
+                            <button class="btn btn-danger btn-sm btn-delete" data-id="${node.id}"><i class="fa-solid fa-trash"></i> Delete</button>
+                        </div>
+                    `;
+                }
+
                 nodeCard.innerHTML = `
                     <div class="memory-node-header">
                         <span class="memory-sector-tag">${node.primary_sector}</span>
@@ -417,16 +682,15 @@ document.addEventListener('DOMContentLoaded', () => {
                                 <div class="salience-bar-fill" style="width: ${saliencePercent}%"></div>
                             </div>
                         </div>
-                        <div class="action-buttons-group">
-                            <button class="btn btn-secondary btn-sm btn-reinforce" data-id="${node.id}"><i class="fa-solid fa-bolt"></i> Reinforce</button>
-                            <button class="btn btn-danger btn-sm btn-delete" data-id="${node.id}"><i class="fa-solid fa-trash"></i> Delete</button>
-                        </div>
+                        ${actionButtonsHtml}
                     </div>
                 `;
                 
                 // Event listeners on actions
-                nodeCard.querySelector('.btn-reinforce').addEventListener('click', () => reinforceMemory(node.id));
-                nodeCard.querySelector('.btn-delete').addEventListener('click', () => deleteMemory(node.id));
+                if (userRole !== 'reader') {
+                    nodeCard.querySelector('.btn-reinforce').addEventListener('click', () => reinforceMemory(node.id));
+                    nodeCard.querySelector('.btn-delete').addEventListener('click', () => deleteMemory(node.id));
+                }
                 
                 memoriesFeed.appendChild(nodeCard);
             });
@@ -1489,6 +1753,391 @@ document.addEventListener('DOMContentLoaded', () => {
         } finally {
             btnUploadDoc.disabled = false;
             btnUploadDoc.innerHTML = `<i class="fa-solid fa-upload"></i> Upload`;
+        }
+    }
+
+    async function loadAccounts() {
+        const listContainer = document.getElementById('authAccountsList');
+        if (!listContainer) return;
+        
+        listContainer.innerHTML = '<div class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading accounts...</div>';
+        
+        try {
+            const res = await fetch('/auth/accounts');
+            if (!res.ok) throw new Error("Failed to fetch accounts");
+            const data = await res.json();
+            
+            const accounts = data.accounts || [];
+            listContainer.innerHTML = '';
+            
+            if (accounts.length === 0) {
+                listContainer.innerHTML = '<div class="placeholder-item">No accounts registered yet.</div>';
+                return;
+            }
+            
+            accounts.forEach(acc => {
+                const accItem = document.createElement('div');
+                accItem.className = 'account-item';
+                
+                const timeString = new Date(acc.created_at * 1000).toLocaleString();
+                
+                accItem.innerHTML = `
+                    <div class="account-details">
+                        <div class="account-title-row">
+                            <span class="account-username">${acc.username}</span>
+                            <span class="account-role-badge ${acc.role}">${acc.role}</span>
+                        </div>
+                        <div class="account-token-wrapper">
+                            <span class="account-token">${acc.token}</span>
+                            <button class="btn-copy-token" title="Copy Token" data-token="${acc.token}">
+                                <i class="fa-solid fa-copy"></i>
+                            </button>
+                        </div>
+                        <div class="account-tools-info">
+                            Allowed Tools: <strong>${acc.allowed_tools || '*'}</strong>
+                        </div>
+                        <div style="font-size: 11px; color: var(--text-secondary);">
+                            Created at: ${timeString}
+                        </div>
+                    </div>
+                    <div class="account-actions">
+                        <button class="btn btn-danger btn-sm btn-delete-account" data-username="${acc.username}" ${acc.username === 'admin' ? 'disabled' : ''}>
+                            <i class="fa-solid fa-trash-can"></i> Delete
+                        </button>
+                    </div>
+                `;
+                
+                // Add events
+                accItem.querySelector('.btn-copy-token').addEventListener('click', (e) => {
+                    const token = e.currentTarget.getAttribute('data-token');
+                    navigator.clipboard.writeText(token).then(() => {
+                        alert("Token copied to clipboard!");
+                    });
+                });
+                
+                const deleteBtn = accItem.querySelector('.btn-delete-account');
+                if (deleteBtn && acc.username !== 'admin') {
+                    deleteBtn.addEventListener('click', () => {
+                        if (confirm(`Are you sure you want to delete the account '${acc.username}'?`)) {
+                            deleteAccount(acc.username);
+                        }
+                    });
+                }
+                
+                listContainer.appendChild(accItem);
+            });
+        } catch (err) {
+            listContainer.innerHTML = `<div class="error-msg" style="color: var(--danger-color);"><i class="fa-solid fa-circle-exclamation"></i> Error: ${err.message}</div>`;
+        }
+    }
+
+    async function saveAccount(e) {
+        e.preventDefault();
+        
+        const username = document.getElementById('authUsername').value.trim();
+        const token = document.getElementById('authToken').value.trim() || null;
+        const role = document.getElementById('authRole').value;
+        const allowed_tools = document.getElementById('authAllowedTools').value.trim();
+        
+        try {
+            const res = await fetch('/auth/accounts', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    username,
+                    token,
+                    role,
+                    allowed_tools
+                })
+            });
+            
+            if (!res.ok) {
+                const errData = await res.json();
+                throw new Error(errData.detail || "Failed to save account");
+            }
+            
+            const result = await res.json();
+            alert(`Account '${username}' saved successfully!\nToken: ${result.token}`);
+            
+            // Reset form
+            document.getElementById('authAccountForm').reset();
+            document.getElementById('authAllowedTools').value = '*';
+            updateActiveToolTags();
+            
+            // Reload accounts list
+            loadAccounts();
+        } catch (err) {
+            alert("Error saving account: " + err.message);
+        }
+    }
+
+    async function deleteAccount(username) {
+        try {
+            const res = await fetch(`/auth/accounts/${encodeURIComponent(username)}`, {
+                method: 'DELETE'
+            });
+            
+            if (!res.ok) {
+                const errData = await res.json();
+                throw new Error(errData.detail || "Failed to delete account");
+            }
+            
+            alert(`Account '${username}' deleted successfully.`);
+            loadAccounts();
+        } catch (err) {
+            alert("Error deleting account: " + err.message);
+        }
+    }
+
+    async function loadAvailableTools() {
+        const toolsContainer = document.getElementById('authAvailableToolsList');
+        if (!toolsContainer) return;
+        
+        try {
+            const res = await fetch('/auth/tools');
+            if (!res.ok) throw new Error("Failed to fetch available tools");
+            const data = await res.json();
+            const tools = data.tools || [];
+            
+            toolsContainer.innerHTML = '';
+            
+            if (tools.length === 0) {
+                toolsContainer.innerHTML = '<span style="color: #777; font-size: 11px;">No tools registered on server.</span>';
+                return;
+            }
+            
+            // Add * (All tools) tag
+            const allTag = document.createElement('span');
+            allTag.className = 'tool-tag all-tools-tag';
+            allTag.textContent = '* (All Tools)';
+            allTag.style.cssText = 'padding: 4px 8px; font-size: 11px; border-radius: 4px; background: #333; color: #fff; cursor: pointer; border: 1px solid #555; transition: all 0.2s; user-select: none;';
+            allTag.setAttribute('data-tool', '*');
+            toolsContainer.appendChild(allTag);
+            
+            tools.forEach(tool => {
+                const tag = document.createElement('span');
+                tag.className = 'tool-tag';
+                tag.textContent = tool;
+                tag.style.cssText = 'padding: 4px 8px; font-size: 11px; border-radius: 4px; background: #2a2a2a; color: #aaa; cursor: pointer; border: 1px solid #444; transition: all 0.2s; user-select: none;';
+                tag.setAttribute('data-tool', tool);
+                toolsContainer.appendChild(tag);
+            });
+            
+            updateActiveToolTags();
+            
+            toolsContainer.querySelectorAll('.tool-tag').forEach(tag => {
+                tag.addEventListener('click', () => {
+                    const toolName = tag.getAttribute('data-tool');
+                    const input = document.getElementById('authAllowedTools');
+                    let currentVal = input.value.trim();
+                    
+                    if (toolName === '*') {
+                        input.value = '*';
+                    } else {
+                        if (currentVal === '*') {
+                            input.value = toolName;
+                        } else {
+                            let list = currentVal.split(',').map(s => s.trim()).filter(s => s);
+                            if (list.includes(toolName)) {
+                                list = list.filter(s => s !== toolName);
+                                input.value = list.length > 0 ? list.join(', ') : '*';
+                            } else {
+                                list.push(toolName);
+                                input.value = list.join(', ');
+                            }
+                        }
+                    }
+                    updateActiveToolTags();
+                });
+            });
+        } catch (err) {
+            toolsContainer.innerHTML = `<span style="color: var(--danger-color); font-size: 11px;">Error loading tools: ${err.message}</span>`;
+        }
+    }
+
+    function updateActiveToolTags() {
+        const input = document.getElementById('authAllowedTools');
+        const toolsContainer = document.getElementById('authAvailableToolsList');
+        if (!input || !toolsContainer) return;
+        
+        const currentVal = input.value.trim();
+        const list = currentVal.split(',').map(s => s.trim()).filter(s => s);
+        
+        toolsContainer.querySelectorAll('.tool-tag').forEach(tag => {
+            const toolName = tag.getAttribute('data-tool');
+            if (currentVal === '*') {
+                if (toolName === '*') {
+                    tag.style.background = '#4361ee';
+                    tag.style.color = '#fff';
+                    tag.style.borderColor = '#4361ee';
+                } else {
+                    tag.style.background = '#2a2a2a';
+                    tag.style.color = '#aaa';
+                    tag.style.borderColor = '#444';
+                }
+            } else {
+                if (toolName === '*') {
+                    tag.style.background = '#333';
+                    tag.style.color = '#fff';
+                    tag.style.borderColor = '#555';
+                } else if (list.includes(toolName)) {
+                    tag.style.background = '#4361ee';
+                    tag.style.color = '#fff';
+                    tag.style.borderColor = '#4361ee';
+                } else {
+                    tag.style.background = '#2a2a2a';
+                    tag.style.color = '#aaa';
+                    tag.style.borderColor = '#444';
+                }
+            }
+        });
+    }
+
+    async function loadProjectsList() {
+        const listContainer = document.getElementById('projectRegistryList');
+        if (!listContainer) return;
+        
+        listContainer.innerHTML = '<div class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading projects...</div>';
+        
+        try {
+            const res = await fetch('/codegraph/projects');
+            if (!res.ok) throw new Error("Failed to fetch projects");
+            const data = await res.json();
+            const projects = data.projects || [];
+            
+            listContainer.innerHTML = '';
+            
+            if (projects.length === 0) {
+                listContainer.innerHTML = '<div class="placeholder-item">No projects registered yet.</div>';
+                return;
+            }
+            
+            projects.forEach(p => {
+                const item = document.createElement('div');
+                item.className = 'account-item';
+                
+                const timeString = p.created_at ? new Date(p.created_at * 1000).toLocaleString() : 'N/A';
+                const lastSync = p.updated_at ? new Date(p.updated_at * 1000).toLocaleString() : 'N/A';
+                
+                const serverOrigin = window.location.origin;
+                const syncCmd = `python -m projectbrain.main codegraph-sync ${p.id} ${serverOrigin} . main -u -m`;
+
+                item.innerHTML = `
+                    <div class="account-details" style="flex: 1;">
+                        <div class="account-title-row">
+                            <span class="account-username" style="font-size: 14px; font-weight: 600; color: #fff;">${p.name}</span>
+                            <span class="account-role-badge collaborator" style="font-size: 10px; padding: 2px 6px;">ID: ${p.id}</span>
+                        </div>
+                        <div style="font-size: 12px; margin-top: 6px; color: var(--text-primary); font-style: italic;">
+                            ${p.description || 'No description provided.'}
+                        </div>
+                        <div style="font-size: 11px; margin-top: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; color: var(--text-secondary);">
+                            <div><strong>Project Path:</strong> ${p.project_path || 'Not synced yet'}</div>
+                            <div><strong>Registered:</strong> ${timeString}</div>
+                            <div><strong>Last Sync IP:</strong> ${p.sync_ip || 'N/A'}</div>
+                            <div><strong>Last Sync Author:</strong> ${p.sync_author || 'N/A'}</div>
+                            <div style="grid-column: span 2;"><strong>Last Synced At:</strong> ${lastSync}</div>
+                        </div>
+                        
+                        <!-- Sync command block -->
+                        <div class="sync-command-block" style="margin-top: 10px; background: rgba(0, 0, 0, 0.2); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.05); display: flex; align-items: center; gap: 10px;">
+                            <code style="font-family: monospace; font-size: 11px; color: #818cf8; flex: 1; overflow-x: auto; white-space: nowrap;">${syncCmd}</code>
+                            <button class="btn btn-secondary btn-sm btn-copy-cmd" data-cmd="${syncCmd}" style="padding: 2px 6px; font-size: 10px; height: auto;" title="Copy sync command"><i class="fa-solid fa-copy"></i> Copy</button>
+                        </div>
+                    </div>
+                    <div class="account-actions" style="margin-left: 15px; display: flex; align-items: flex-start; justify-content: flex-end;">
+                        <button class="btn btn-danger btn-sm btn-delete-project" data-id="${p.id}">
+                            <i class="fa-solid fa-trash-can"></i> Delete
+                        </button>
+                    </div>
+                `;
+                
+                const deleteBtn = item.querySelector('.btn-delete-project');
+                if (deleteBtn) {
+                    deleteBtn.addEventListener('click', () => {
+                        const pid = deleteBtn.getAttribute('data-id');
+                        if (confirm(`Are you sure you want to delete the project '${pid}'?\nThis will clear all its graph nodes and edges!`)) {
+                            deleteRegProject(pid);
+                        }
+                    });
+                }
+
+                const copyCmdBtn = item.querySelector('.btn-copy-cmd');
+                if (copyCmdBtn) {
+                    copyCmdBtn.addEventListener('click', () => {
+                        const cmd = copyCmdBtn.getAttribute('data-cmd');
+                        navigator.clipboard.writeText(cmd)
+                            .then(() => {
+                                const originalColor = copyCmdBtn.style.color;
+                                copyCmdBtn.style.color = '#34d399';
+                                setTimeout(() => copyCmdBtn.style.color = originalColor, 1000);
+                                alert("Sync command copied to clipboard!");
+                            })
+                            .catch(err => console.error("Failed to copy:", err));
+                    });
+                }
+                
+                listContainer.appendChild(item);
+            });
+        } catch (err) {
+            listContainer.innerHTML = `<div class="error-msg" style="color: var(--danger-color);"><i class="fa-solid fa-circle-exclamation"></i> Error: ${err.message}</div>`;
+        }
+    }
+
+    async function saveProject(e) {
+        e.preventDefault();
+        
+        const id = document.getElementById('regProjectId').value.trim();
+        const name = document.getElementById('regProjectName').value.trim();
+        const description = document.getElementById('regProjectDesc').value.trim();
+        
+        try {
+            const res = await fetch('/codegraph/projects', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    id,
+                    name,
+                    description
+                })
+            });
+            
+            if (!res.ok) {
+                const errData = await res.json();
+                throw new Error(errData.detail || "Failed to register project");
+            }
+            
+            alert(`Project '${name}' registered successfully!`);
+            document.getElementById('projectRegistryForm').reset();
+            loadProjectsList();
+        } catch (err) {
+            alert("Error registering project: " + err.message);
+        }
+    }
+
+    async function deleteRegProject(projectId) {
+        try {
+            const res = await fetch(`/codegraph/projects/${encodeURIComponent(projectId)}`, {
+                method: 'DELETE'
+            });
+            
+            if (!res.ok) {
+                const errData = await res.json();
+                throw new Error(errData.detail || "Failed to delete project");
+            }
+            
+            alert(`Project '${projectId}' deleted successfully.`);
+            loadProjectsList();
+            
+            if (typeof loadProjects === 'function') {
+                loadProjects();
+            }
+        } catch (err) {
+            alert("Error deleting project: " + err.message);
         }
     }
 });
