@@ -16,7 +16,14 @@ from ..ops.dynamics import applyRetrievalTraceReinforcementToMemory
 from ..core.db import db
 
 # Create FastMCP server instance
-mcp_server = FastMCP("projectbrain-mcp")
+from mcp.server.transport_security import TransportSecuritySettings
+
+mcp_server = FastMCP(
+    "projectbrain-mcp",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
+)
 mem = Memory()
 
 import contextvars
