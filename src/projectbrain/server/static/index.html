@@ -361,14 +361,27 @@
                         <span id="activeProjectDisplay" style="color: var(--primary-color); font-weight: 600; font-family: monospace; font-size: 14px;">default</span>
                     </div>
                     
-                    <div class="form-row mt-15" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px;">
+                        <!-- Col 1: HTTP/SSE Transports -->
                         <div class="form-group">
-                            <label style="font-weight: 600;"><i class="fa-solid fa-code"></i> GitHub Copilot (<code>.vscode/mcp.json</code>):</label>
-                            <pre class="code-block" id="mcpCopilotConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
+                            <label style="font-weight: 600;"><i class="fa-solid fa-code"></i> VS Code Copilot (<code>.vscode/mcp.json</code> - HTTP/SSE):</label>
+                            <pre class="code-block" id="mcpCopilotConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
                         </div>
                         <div class="form-group">
-                            <label style="font-weight: 600;"><i class="fa-solid fa-terminal"></i> Claude Code / Cursor (<code>.mcp.json</code>):</label>
-                            <pre class="code-block" id="mcpClaudeConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
+                            <label style="font-weight: 600;"><i class="fa-solid fa-cloud"></i> Claude Code / Cursor (<code>.mcp.json</code> - HTTP/SSE):</label>
+                            <pre class="code-block" id="mcpClaudeConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
+                        </div>
+                    </div>
+
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px;">
+                        <!-- Col 2: Stdio Transports -->
+                        <div class="form-group">
+                            <label style="font-weight: 600;"><i class="fa-solid fa-terminal"></i> Claude Code / Cursor (<code>.mcp.json</code> - Stdio Local):</label>
+                            <pre class="code-block" id="mcpStdioLocalConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
+                        </div>
+                        <div class="form-group">
+                            <label style="font-weight: 600;"><i class="fa-solid fa-network-wired"></i> Claude Code / Cursor (<code>.mcp.json</code> - Stdio Remote DB):</label>
+                            <pre class="code-block" id="mcpStdioRemoteConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
                         </div>
                     </div>
                 </div>
