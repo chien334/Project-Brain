@@ -23,57 +23,56 @@ mcp = FastMCP("image_to_markdown_mcp")
     )
 )
 async def img2md_extract_folder(
-    folder_path: Annotated[str, Field(description="Duong dan thu muc chua anh")],
+    folder_path: Annotated[str, Field(description="Path to the directory containing images")],
     output_path: Annotated[
         str | None,
-        Field(description="File .md dich (combined) hoac thu muc dich (per_image)"),
+        Field(description="Path to the destination Markdown file (combined mode) or destination directory (per_image mode)"),
     ] = None,
     max_concurrency: Annotated[
-        int, Field(ge=1, le=5, description="So anh xu ly song song, 1-5 (mac dinh 3)")
+        int, Field(ge=1, le=5, description="Number of images to process in parallel, 1-5 (default 3)")
     ] = 3,
     output_mode: Annotated[
         Literal["combined", "per_image"],
-        Field(description="Gop 1 file hay tach tung file"),
+        Field(description="Output mode: 'combined' to merge results into one file, or 'per_image' to write one file per image"),
     ] = "combined",
     model: Annotated[
-        str | None, Field(description="Override model, mac dinh gemini-3.1-pro-preview")
+        str | None, Field(description="Override model name (default: gemini-3.1-pro-preview)")
     ] = None,
     prompt_override: Annotated[
-        str | None, Field(description="Override prompt trich xuat")
+        str | None, Field(description="Override the extraction prompt")
     ] = None,
-    recursive: Annotated[bool, Field(description="Quet ca thu muc con")] = False,
+    recursive: Annotated[bool, Field(description="Whether to scan subdirectories recursively")] = False,
 ) -> dict:
-    """Trich text moi anh trong thu muc thanh Markdown, theo dung thu tu TEN anh (natural sort).
+    """Extract text from all images in a folder and format as Markdown, sorted naturally by filename.
 
-    Anh duoc sap xep bang natural sort (vi du 2 < 10), xu ly song song (gioi han boi
-    max_concurrency), roi ghep/ghi ket qua theo DUNG thu tu ten anh. Ghi ra file .md
-    va tra ve thong ke.
+    Processes images in parallel (up to max_concurrency) and aggregates the results in the correct order.
+    Outputs to file(s) and returns execution stats.
 
     Args:
-        folder_path: Thu muc chua anh.
-        output_path: combined -> file .md dich; per_image -> thu muc dich. Mac dinh
-            ghi vao chinh folder nguon (output.md hoac <ten_anh>.md).
-        max_concurrency: So request song song (1-5, mac dinh 3).
-        output_mode: "combined" (1 file gop) hoac "per_image" (moi anh 1 file).
-        model: Override model vision (mac dinh gemini-3.1-pro-preview).
-        prompt_override: Override prompt OCR.
-        recursive: Quet ca thu muc con.
+        folder_path: Path to the directory containing images.
+        output_path: Destination file (combined mode) or destination directory (per_image mode).
+            Defaults to writing in the source folder (output.md or <image_name>.md).
+        max_concurrency: Number of parallel requests (1-5, default 3).
+        output_mode: "combined" (one merged file) or "per_image" (one file per image).
+        model: Override vision model (default: gemini-3.1-pro-preview).
+        prompt_override: Override OCR prompt.
+        recursive: Scan subdirectories recursively.
 
     Returns:
-        dict voi schema:
+        dict with schema:
         {
-            "total": int,            # tong so anh xu ly
-            "succeeded": int,        # so anh thanh cong
-            "failed": int,           # so anh loi
-            "output": str | [str],   # duong dan file ket qua (hoac danh sach neu per_image)
-            "order": [str],          # ten anh theo dung thu tu da sort
-            "items": [               # chi tiet tung anh (khong gom markdown)
+            "total": int,            # total images processed
+            "succeeded": int,        # count of successful extractions
+            "failed": int,           # count of failed extractions
+            "output": str | [str],   # path to output file(s)
+            "order": [str],          # sorted image filenames
+            "items": [               # details of each processed image
                 {"index": int, "file": str, "ok": bool, "error": str | None}
             ]
         }
 
     Error Handling:
-        Raise ValueError neu thu muc khong ton tai hoac khong co anh hop le.
+        Raises ValueError if folder doesn't exist or contains no valid images.
     """
     return await run_extract_folder(
         folder_path=folder_path,
@@ -97,27 +96,26 @@ async def img2md_extract_folder(
     )
 )
 async def img2md_list_images(
-    folder_path: Annotated[str, Field(description="Thu muc chua anh")],
-    recursive: Annotated[bool, Field(description="Quet ca thu muc con")] = False,
+    folder_path: Annotated[str, Field(description="Path to the directory containing images")],
+    recursive: Annotated[bool, Field(description="Whether to scan subdirectories recursively")] = False,
 ) -> dict:
-    """Liet ke ten anh DA SAP XEP trong thu muc (khong goi API).
+    """List images in natural sorted order within a directory (does not make LLM calls).
 
-    Dung de xem truoc thu tu xu ly (natural sort theo ten file). Khong goi vision model,
-    khong ghi file.
+    Used to preview the processing order. Does not invoke the vision model or write files.
 
     Args:
-        folder_path: Thu muc chua anh.
-        recursive: Quet ca thu muc con.
+        folder_path: Path to the directory containing images.
+        recursive: Scan subdirectories recursively.
 
     Returns:
-        dict: {"count": int, "files": [str]}  # files theo dung thu tu natural sort.
+        dict: {"count": int, "files": [str]}  # files in natural sorted order.
 
     Error Handling:
-        Raise ValueError neu thu muc khong ton tai.
+        Raises ValueError if folder does not exist.
     """
     folder = Path(folder_path).expanduser()
     if not folder.is_dir():
-        raise ValueError(f"Khong tim thay thu muc: {folder}")
+        raise ValueError(f"Directory not found: {folder}")
     files = list_images(folder, recursive=recursive)
     return {"count": len(files), "files": [p.name for p in files]}
 
@@ -132,36 +130,36 @@ async def img2md_list_images(
     )
 )
 async def img2md_extract_image(
-    image_path: Annotated[str, Field(description="Duong dan toi 1 anh")],
-    model: Annotated[str | None, Field(description="Override model")] = None,
-    prompt_override: Annotated[str | None, Field(description="Override prompt")] = None,
+    image_path: Annotated[str, Field(description="Path to a single image")],
+    model: Annotated[str | None, Field(description="Override model name")] = None,
+    prompt_override: Annotated[str | None, Field(description="Override the extraction prompt")] = None,
     output_path: Annotated[
-        str | None, Field(description="Neu co, ghi Markdown ra file nay")
+        str | None, Field(description="Destination file path to save the generated Markdown")
     ] = None,
 ) -> dict:
-    """Trich text tu 1 anh, tra ve Markdown (tuy chon ghi ra file).
+    """Extract text from a single image and return it as Markdown (optionally saves to a file).
 
     Args:
-        image_path: Duong dan toi anh can trich.
-        model: Override model vision (mac dinh gemini-3.1-pro-preview).
-        prompt_override: Override prompt OCR.
-        output_path: Neu co, ghi Markdown ra duong dan nay.
+        image_path: Path to the image to extract.
+        model: Override vision model (default: gemini-3.1-pro-preview).
+        prompt_override: Override OCR prompt.
+        output_path: Destination file path if saving results.
 
     Returns:
         dict: {"file": str, "markdown": str}
 
     Error Handling:
-        Raise ValueError neu khong tim thay anh; RuntimeError neu trich xuat that bai.
+        Raises ValueError if image file not found; RuntimeError if extraction fails.
     """
     p = Path(image_path).expanduser()
     if not p.is_file():
-        raise ValueError(f"Khong tim thay anh: {p}")
+        raise ValueError(f"Image file not found: {p}")
     results = await extract_paths(
         [p], 1, model or CONFIG.model, prompt_override or DEFAULT_PROMPT
     )
     r = results[0]
     if not r.ok:
-        raise RuntimeError(f"Loi trich xuat: {r.error}")
+        raise RuntimeError(f"Extraction failed: {r.error}")
     if output_path:
         from .utils import write_text
 
@@ -170,7 +168,7 @@ async def img2md_extract_image(
 
 
 def main() -> None:
-    mcp.run()  # stdio (phu hop Claude Desktop/local)
+    mcp.run()  # stdio (suitable for Claude Desktop/local)
 
 
 if __name__ == "__main__":

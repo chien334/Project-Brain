@@ -71,17 +71,17 @@ async def analyze_business_logic(api_key, model, code_snippet, file_path, functi
         f"Function Name: {function_name}\n\n"
         f"```\n{code_snippet}\n```\n\n"
         f"Please write a structured business logic report following this template exactly:\n"
-        f"1. **Tên nghiệp vụ (Business Name)**: [Clear Vietnamese business name for this function]\n"
-        f"2. **Mô tả chức năng (Functional Description)**: [Explain what this function does in plain language]\n"
-        f"3. **Luồng xử lý (Processing Flow)**: [Step-by-step logic breakdown]\n"
-        f"4. **Quy tắc nghiệp vụ (Business Rules & Constraints)**: [Any validation, conditions, calculations, or constraints]\n"
-        f"5. **Tham số & Kết quả (Inputs/Outputs)**: [Describe parameters and return values]"
+        f"1. **Business Name**: [Clear business name for this function]\n"
+        f"2. **Functional Description**: [Explain what this function does in plain language]\n"
+        f"3. **Processing Flow**: [Step-by-step logic breakdown]\n"
+        f"4. **Business Rules & Constraints**: [Any validation, conditions, calculations, or constraints]\n"
+        f"5. **Inputs/Outputs**: [Describe parameters and return values]"
     )
     
     system_instruction = (
         "You are an expert systems modernization architect and business analyst. "
         "Your task is to extract clear, domain-specific, and developer-friendly business rules "
-        "and logical constraints from legacy source code snippets. Write your output in Vietnamese."
+        "and logical constraints from legacy source code snippets. Write your output in English."
     )
     
     req_body = {
@@ -179,7 +179,7 @@ async def run_batch_scan_logic(project_root, project_id):
             "failed_items": failed_items,
             "message": (
                 f"Processed {len(drafts)} functions. Some items failed to generate business logic due to LLM errors. "
-                "Please use your own model capabilities ('model hiện tại') to analyze the code snippets for the failed items, "
+                "Please use your own model capabilities ('current model') to analyze the code snippets for the failed items, "
                 "and update the draft file directly."
             )
         }
@@ -312,8 +312,8 @@ async def run_phase_planning(project_root: str, max_phases: int = 5) -> dict:
         
     # Generate and save human-readable Markdown report
     md_lines = [
-        "# Kế hoạch các Giai đoạn Di trú (Migration Phase Plan)",
-        "Kế hoạch phân rã và chia phase thực thi cho dự án di trú mã nguồn kế thừa.",
+        "# Migration Phase Plan",
+        "Decomposition and phase execution plan for the legacy codebase migration project.",
         ""
     ]
     for phase in phases_data.get("phases", []):
@@ -323,11 +323,11 @@ async def run_phase_planning(project_root: str, max_phases: int = 5) -> dict:
         p_complexity = phase.get("complexity", "medium")
         
         md_lines.append(f"## Phase {p_num}: {p_name}")
-        md_lines.append(f"- **Độ phức tạp / Rủi ro**: {p_complexity.upper()}")
-        md_lines.append(f"- **Mô tả**: {p_desc}")
-        md_lines.append("- **Danh sách các hàm di trú:**")
+        md_lines.append(f"- **Complexity / Risk**: {p_complexity.upper()}")
+        md_lines.append(f"- **Description**: {p_desc}")
+        md_lines.append("- **List of Functions to Migrate:**")
         for fn in phase.get("functions", []):
-            md_lines.append(f"  - `{fn.get('name')}` trong `{fn.get('file_path')}` (Node ID: {fn.get('node_id')})")
+            md_lines.append(f"  - `{fn.get('name')}` in `{fn.get('file_path')}` (Node ID: {fn.get('node_id')})")
         md_lines.append("")
         
     output_md_path = os.path.join(project_root, ".planning", "migration_phases.md")
