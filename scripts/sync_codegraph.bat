@@ -6,7 +6,7 @@ echo   ProjectBrain Codegraph Synchronization CLI
 echo =============================================
 
 :: Default Configuration
-set DEFAULT_SERVER_URL=http://5.104.85.38:8080
+set DEFAULT_SERVER_URL=http://localhost:8080
 set DEFAULT_PROJECT_PATH=.
 
 :: Check Python

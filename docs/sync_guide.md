@@ -1,6 +1,6 @@
 # ProjectBrain: Local-to-Server Data Synchronization Guide
 
-This guide explains how to synchronize your local project data—both codebase AST structure (classes, methods, relationships) and file content memories (for RAG query support)—to the remote ProjectBrain server (e.g., `http://5.104.85.38:8080`).
+This guide explains how to synchronize your local project data—both codebase AST structure (classes, methods, relationships) and file content memories (for RAG query support)—to the remote ProjectBrain server (e.g., `http://localhost:8080`).
 
 ---
 
@@ -16,8 +16,8 @@ export PB_MODE=remote
 export OM_MODE=remote
 
 # Set the URL of your remote ProjectBrain server
-export PB_URL="http://5.104.85.38:8080"
-export OM_URL="http://5.104.85.38:8080"
+export PB_URL="http://localhost:8080"
+export OM_URL="http://localhost:8080"
 
 # Optional: Set default authorization API key if authentication is enabled
 export PB_API_KEY="your-secret-api-key"
@@ -54,9 +54,9 @@ python -m projectbrain.main codegraph-sync <project_id> [server_url] [project_pa
     *Note: If `codegraph` CLI is not found or npm is missing, ProjectBrain automatically falls back to a pure-Python codebase AST parser.*
 3.  Run the synchronization command:
     ```bash
-    python -m projectbrain.main codegraph-sync my-app-id http://5.104.85.38:8080 . main -m
+    python -m projectbrain.main codegraph-sync my-app-id http://localhost:8080 . main -m
     ```
-    *This parses the current directory (`.`), associates the data with branch `main`, uploads the graph to `http://5.104.85.38:8080`, and ingests source files as RAG memories (`-m`).*
+    *This parses the current directory (`.`), associates the data with branch `main`, uploads the graph to `http://localhost:8080`, and ingests source files as RAG memories (`-m`).*
 
 ---
 
@@ -84,7 +84,7 @@ python -m projectbrain.main ingest-files <project_id> <dir_path>
 If you are developing a custom client interface (like a VS Code plugin, Chrome extension, or administrative script) and want to trigger a sync on the server remotely, call the `projectbrain_sync_codegraph` tool via JSON-RPC.
 
 ### JSON-RPC Payload:
-*   **Endpoint:** `POST http://5.104.85.38:8080/mcp-http/mcp`
+*   **Endpoint:** `POST http://localhost:8080/mcp-http/mcp`
 *   **Headers:**
     *   `Content-Type: application/json`
     *   `Mcp-Session-Id: <id>` (Required if executing in a continuous session context)

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Default Configuration
-DEFAULT_SERVER_URL="http://5.104.85.38:8080"
+DEFAULT_SERVER_URL="http://localhost:8080"
 DEFAULT_PROJECT_PATH="."
 
 echo "============================================="
