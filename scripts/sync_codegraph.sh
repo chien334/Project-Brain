@@ -68,6 +68,18 @@ if [ -z "$SYNC_MEMORIES" ]; then
     fi
 fi
 
+# 6. Upload Type (JSON vs DB File)
+UPLOAD_DB=$6
+if [ -z "$UPLOAD_DB" ]; then
+    read -p "Use SQLite database file upload instead of JSON payload (bypasses WAF blocks)? (y/n) [n]: " DB_ANS
+    DB_ANS=${DB_ANS:-"n"}
+    if [[ "$DB_ANS" =~ ^[Yy]$ ]]; then
+        UPLOAD_DB="--upload-db"
+    else
+        UPLOAD_DB=""
+    fi
+fi
+
 echo ""
 echo "Sync Configuration:"
 echo "-------------------"
@@ -76,9 +88,10 @@ echo "Server URL:   $SERVER_URL"
 echo "Project Path: $ABS_PROJECT_PATH"
 echo "Branch:       $BRANCH"
 echo "Sync Files:   ${SYNC_MEMORIES:-no}"
+echo "Upload DB:    ${UPLOAD_DB:-no}"
 echo "-------------------"
 echo "Running sync..."
 echo ""
 
 # Run sync command
-python3 -m projectbrain.main codegraph-sync "$PROJECT_ID" "$SERVER_URL" "$ABS_PROJECT_PATH" "$BRANCH" $SYNC_MEMORIES
+python3 -m projectbrain.main codegraph-sync "$PROJECT_ID" "$SERVER_URL" "$ABS_PROJECT_PATH" "$BRANCH" $SYNC_MEMORIES $UPLOAD_DB

@@ -64,6 +64,18 @@ if "%SYNC_MEMORIES%"=="" (
     )
 )
 
+:: 6. Sync DB File Upload
+set UPLOAD_DB=%6
+if "%UPLOAD_DB%"=="" (
+    set /p DB_ANS="Use SQLite database file upload instead of JSON payload (bypasses WAF blocks)? (y/n) [n]: "
+    if "!DB_ANS!"=="" set DB_ANS=n
+    if /i "!DB_ANS!"=="y" (
+        set UPLOAD_DB=--upload-db
+    ) else (
+        set UPLOAD_DB=
+    )
+)
+
 echo.
 echo Sync Configuration:
 echo -------------------
@@ -72,10 +84,11 @@ echo Server URL:   %SERVER_URL%
 echo Project Path: %PROJECT_PATH%
 echo Branch:       %BRANCH%
 echo Sync Files:   %SYNC_MEMORIES%
+echo Upload DB:    %UPLOAD_DB%
 echo -------------------
 echo Running sync...
 echo.
 
-python -m projectbrain.main codegraph-sync %PROJECT_ID% %SERVER_URL% %PROJECT_PATH% %BRANCH% %SYNC_MEMORIES%
+python -m projectbrain.main codegraph-sync %PROJECT_ID% %SERVER_URL% %PROJECT_PATH% %BRANCH% %SYNC_MEMORIES% %UPLOAD_DB%
 
 pause

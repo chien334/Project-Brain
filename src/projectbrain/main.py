@@ -187,7 +187,7 @@ def run_server():
     print(f"Starting ProjectBrain Server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
 
-def run_codegraph_sync(project_id: str, server_url: str = None, project_path: str = None, branch: str = None, sync_memories: bool = False):
+def run_codegraph_sync(project_id: str, server_url: str = None, project_path: str = None, branch: str = None, sync_memories: bool = False, upload_db: bool = False):
     import sqlite3
     import httpx
     import os
@@ -275,48 +275,82 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
         
     server_url = server_url or os.getenv("PB_URL") or os.getenv("PB_API_URL") or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
     
+    # Auto-detect git branch if branch is not explicitly provided
+    resolved_branch = branch
+    if not resolved_branch:
+        try:
+            import shutil
+            import subprocess
+            git_bin = shutil.which("git")
+            if git_bin and os.path.exists(os.path.join(target_dir, ".git")):
+                res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], cwd=target_dir, capture_output=True, text=True)
+                if res_git.returncode == 0:
+                    resolved_branch = res_git.stdout.strip()
+        except Exception:
+            pass
+            
+    if resolved_branch:
+        if ":" in project_id:
+            base_id, _ = project_id.split(":", 1)
+            sync_project_id = f"{base_id}:{resolved_branch}"
+        else:
+            sync_project_id = f"{project_id}:{resolved_branch}"
+        print(f"Syncing branch '{resolved_branch}' (Project ID: {sync_project_id})...")
+    else:
+        sync_project_id = project_id
+        
+    import getpass
+    author = os.getenv("PB_USER_NAME") or os.getenv("OM_USER_NAME") or os.getenv("USER") or getpass.getuser() or "anonymous"
+
+    if upload_db:
+        print(f"Synchronizing raw database file {db_path} to {server_url}/codegraph/upload-db...")
+        try:
+            with open(db_path, "rb") as f:
+                files = {"file": (os.path.basename(db_path), f, "application/octet-stream")}
+                data = {
+                    "project_id": sync_project_id,
+                    "project_name": sync_project_id,
+                    "author": author,
+                    "project_path": os.path.abspath(target_dir)
+                }
+                resp = httpx.post(
+                    f"{server_url}/codegraph/upload-db",
+                    files=files,
+                    data=data,
+                    timeout=120.0
+                )
+            
+            if resp.status_code == 200:
+                print("Successfully synchronized codegraph data via file upload backup mechanism!")
+                print(resp.json().get("message", ""))
+                
+                if sync_memories:
+                    print("Proceeding to ingest codebase files as memories...")
+                    import asyncio
+                    asyncio.run(async_ingest_files(sync_project_id, target_dir))
+            else:
+                print(f"Sync via upload failed (Status {resp.status_code}): {resp.text}")
+                sys.exit(1)
+        except Exception as e:
+            print(f"Error during upload sync: {e}")
+            sys.exit(1)
+        return
+
     print(f"Reading local codegraph database at {db_path}...")
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        conn_cursor = conn.cursor()
         
-        cursor.execute("SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at FROM nodes;")
-        nodes = [dict(row) for row in cursor.fetchall()]
+        conn_cursor.execute("SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at FROM nodes;")
+        nodes = [dict(row) for row in conn_cursor.fetchall()]
         
-        cursor.execute("SELECT id, source, target, kind, metadata, line, col FROM edges;")
-        edges = [dict(row) for row in cursor.fetchall()]
+        conn_cursor.execute("SELECT id, source, target, kind, metadata, line, col FROM edges;")
+        edges = [dict(row) for row in conn_cursor.fetchall()]
         
         conn.close()
-        
-        # Auto-detect git branch if branch is not explicitly provided
-        resolved_branch = branch
-        if not resolved_branch:
-            try:
-                import shutil
-                import subprocess
-                git_bin = shutil.which("git")
-                if git_bin and os.path.exists(os.path.join(target_dir, ".git")):
-                    res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], cwd=target_dir, capture_output=True, text=True)
-                    if res_git.returncode == 0:
-                        resolved_branch = res_git.stdout.strip()
-            except Exception:
-                pass
-                
-        if resolved_branch:
-            if ":" in project_id:
-                base_id, _ = project_id.split(":", 1)
-                sync_project_id = f"{base_id}:{resolved_branch}"
-            else:
-                sync_project_id = f"{project_id}:{resolved_branch}"
-            print(f"Syncing branch '{resolved_branch}' (Project ID: {sync_project_id})...")
-        else:
-            sync_project_id = project_id
             
         print(f"Found {len(nodes)} nodes and {len(edges)} edges. Synchronizing to {server_url}/codegraph/sync...")
-        
-        import getpass
-        author = os.getenv("PB_USER_NAME") or os.getenv("OM_USER_NAME") or os.getenv("USER") or getpass.getuser() or "anonymous"
         
         resp = httpx.post(
             f"{server_url}/codegraph/sync",
@@ -433,11 +467,15 @@ if __name__ == "__main__":
         branch = sys.argv[5] if len(sys.argv) > 5 else None
         
         sync_memories = any(arg in sys.argv for arg in ["--sync-memories", "-m"])
-        if server_url in ["--sync-memories", "-m"]: server_url = None
-        if project_path in ["--sync-memories", "-m"]: project_path = None
-        if branch in ["--sync-memories", "-m"]: branch = None
+        upload_db = any(arg in sys.argv for arg in ["--upload-db", "-u"])
         
-        run_codegraph_sync(project_id, server_url, project_path, branch, sync_memories)
+        # Filter out flags from positional arguments
+        flags = ["--sync-memories", "-m", "--upload-db", "-u"]
+        if server_url in flags: server_url = None
+        if project_path in flags: project_path = None
+        if branch in flags: branch = None
+        
+        run_codegraph_sync(project_id, server_url, project_path, branch, sync_memories, upload_db)
     elif len(sys.argv) > 1 and sys.argv[1] == "ingest-files":
         if len(sys.argv) < 4:
             print("Usage: python -m projectbrain.main ingest-files <project_id> <dir_path>")
@@ -450,5 +488,5 @@ if __name__ == "__main__":
         print("Usage:")
         print("  python -m projectbrain.main serve                                         # Start REST API & Dashboard")
         print("  python -m projectbrain.main mcp                                           # Start stdio MCP server")
-        print("  python -m projectbrain.main codegraph-sync <project_id> [url] [path] [branch] [-m] # Sync local codegraph and memories to server")
+        print("  python -m projectbrain.main codegraph-sync <project_id> [url] [path] [branch] [-m] [-u] # Sync local codegraph and memories to server (use -u to upload sqlite db file)")
         print("  python -m projectbrain.main ingest-files <project_id> <dir_path>           # Ingest codebase files into memories")
