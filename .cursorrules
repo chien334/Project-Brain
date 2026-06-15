@@ -72,4 +72,16 @@ ProjectBrain includes a dedicated framework for refactoring and migrating legacy
 - **Runbook**: Follow the step-by-step migration phases in [MIGRATION_RUNBOOK.md](file:///Users/macbbook/SourceCodes/OpenMemory/MIGRATION_RUNBOOK.md).
 - **Rules**: Refer to [.agent/rules/migration_combo.md](file:///Users/macbbook/SourceCodes/OpenMemory/.agent/rules/migration_combo.md) for legacy maintenance guidelines.
 
+---
+
+## 🔀 Unified MCP Workflows
+
+All MCP servers (Document Ingestion, OCR, CodeGraph, ProjectBrain, and Migration Helper) are designed to cooperate.
+
+### Workflow Reference & Guides
+- **Unified Skill**: Refer to [.agent/skills/unified-workflow/SKILL.md](file:///Users/macbbook/SourceCodes/OpenMemory/.agent/skills/unified-workflow/SKILL.md) for step-by-step guides on combining:
+  1. *Specs to RAG Flow*: `Document Ingestion` ➔ `Visual OCR` ➔ `ProjectBrain RAG`.
+  2. *Codebase Sync Flow*: `Local AST generation` ➔ `CLI codegraph-sync` ➔ `Remote ProjectBrain server`.
+  3. *Legacy Refactoring Flow*: `Comment Translation` ➔ `CodeGraph Call Tree Analysis` ➔ `Migration Recommendation` ➔ `ADR Planning & Gate` ➔ `Verification via Version Diffing`.
+
 
