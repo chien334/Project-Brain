@@ -56,6 +56,9 @@ async def get_projects():
 
 @router.post("/projects")
 async def create_project(req: CreateProjectRequest):
+    import os
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
     db.connect()
     ts = int(time.time())
     try:
@@ -78,6 +81,31 @@ async def create_project(req: CreateProjectRequest):
             try: db.conn.rollback()
             except: pass
         raise HTTPException(status_code=500, detail=f"Failed to create project: {str(e)}")
+
+@router.delete("/projects/{project_id:path}")
+async def delete_project(project_id: str):
+    import os
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
+    db.connect()
+    try:
+        cursor = db.conn.cursor()
+        if db.is_postgres:
+            cursor.execute("DELETE FROM project_nodes WHERE project_id = %s;", (project_id,))
+            cursor.execute("DELETE FROM project_edges WHERE project_id = %s;", (project_id,))
+            cursor.execute("DELETE FROM projects WHERE id = %s;", (project_id,))
+        else:
+            cursor.execute("DELETE FROM project_nodes WHERE project_id = ?;", (project_id,))
+            cursor.execute("DELETE FROM project_edges WHERE project_id = ?;", (project_id,))
+            cursor.execute("DELETE FROM projects WHERE id = ?;", (project_id,))
+        db.conn.commit()
+        cursor.close()
+        return {"status": "success", "message": f"Project {project_id} deleted successfully."}
+    except Exception as e:
+        if db.conn:
+            try: db.conn.rollback()
+            except: pass
+        raise HTTPException(status_code=500, detail=f"Failed to delete project: {str(e)}")
 
 @router.get("/diff")
 async def diff_projects(base_project_id: str, target_project_id: str):
@@ -425,6 +453,9 @@ async def get_codegraph_data(
 
 @router.post("/sync")
 async def sync_codegraph_data(req: SyncRequest, request: Request = None):
+    import os
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
     if not req.nodes:
         raise HTTPException(
             status_code=400,
@@ -571,6 +602,9 @@ async def upload_codegraph_db(
     project_path: Optional[str] = Form(None),
     request: Request = None
 ):
+    import os
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
     import tempfile
     import os
     import shutil

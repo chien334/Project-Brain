@@ -160,3 +160,30 @@ Call `projectbrain-projectbrain_stats` via JSON-RPC to inspect current node coun
   "user_id": "my-app-id:main"
 }
 ```
+
+---
+
+## 🔒 6. Server Security & Permissions Configuration
+
+To secure your server from exposing sensitive paths and control database modifications, set these environment variables on the remote FastAPI server:
+
+### A. Source Directory Isolation (`PB_PROJECTS_ROOT_DIR`)
+By default, the server allows scanning paths anywhere on the host system. To prevent path disclosure and isolate all project files:
+1. Set the root project directory in your server environment:
+   ```bash
+   export PB_PROJECTS_ROOT_DIR="/var/www/projects"
+   ```
+2. When this variable is set:
+   * Clients no longer need to pass absolute server-side paths. If a client executes a sync, the server automatically maps the project to `PB_PROJECTS_ROOT_DIR/<project_id_base>`.
+   * The server strictly validates all directory queries. Any path traversal attempt (e.g. using `..` or pointing outside `/var/www/projects`) is blocked, returning a security violation error.
+
+### B. Read-Only Mode (`PB_READ_ONLY`)
+To deploy a public or read-only backup instance where users can search but cannot modify or wipe code/RAG indices:
+1. Set read-only mode in your server environment:
+   ```bash
+   export PB_READ_ONLY=true
+   ```
+2. When this variable is enabled:
+   * All writing/modifying tools (`projectbrain_store`, `projectbrain_delete`, `projectbrain_delete_all`, `projectbrain_reinforce`, `projectbrain_ingest`, `projectbrain_sync_codegraph`) return a permission block.
+   * Modifying REST endpoints (`POST /sync`, `POST /upload-db`, `POST /projects`, `POST /sources/upload`) reject requests with an HTTP 403 Forbidden error: `"Operation not permitted: Server is running in Read-Only mode."`
+
