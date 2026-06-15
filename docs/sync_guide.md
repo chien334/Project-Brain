@@ -60,24 +60,39 @@ python -m projectbrain.main codegraph-sync <project_id> [server_url] [project_pa
 
 ---
 
-## 📂 3. Method 2: Ingesting Raw Files into Memories via CLI
+### 3.1 Method 2a: Ingesting Raw Text Files in Bulk
+If you want to index local text-based files (logs, code files, configs) in bulk from a directory into the RAG memory pool without generating an AST code graph, use the `ingest-files` command.
 
-If you only want to index raw files (documents, text logs, specifications, code files) into the RAG memory pool without generating an AST code graph, use the `ingest-files` command.
-
-### Command Syntax
+#### Command Syntax
 ```bash
 python -m projectbrain.main ingest-files <project_id> <dir_path>
 ```
 
-### Step-by-Step Example:
+#### Step-by-Step Example:
 1.  Configure your remote environment parameters (see Section 1).
 2.  Execute the ingestion pointing to your directory of documents:
     ```bash
     python -m projectbrain.main ingest-files my-app-id /Users/macbbook/Documents/specifications
     ```
-    *Because `PB_MODE=remote` is set, all documents in the folder will be parsed locally and pushed directly via API POST requests to the remote RAG server.*
+    *Because `PB_MODE=remote` is set, all text documents in the folder will be scanned and pushed directly via API POST requests to the remote RAG server.*
+
+### 3.2 Method 2b: Uploading a Single Binary or Text Document (PDF, XLSX, DOCX, etc.)
+Because `ingest-files` only parses text files in bulk and skips binary structures, use the `upload-file` command to upload and parse any single complex document file (PDF, Excel, Word, PPTX, or text) directly to the server's parser engine.
+
+#### Command Syntax
+```bash
+python -m projectbrain.main upload-file <project_id> <file_path> [server_url] [tags] [author]
+```
+
+#### Step-by-Step Example:
+1.  Execute the upload pointing to your document file:
+    ```bash
+    python -m projectbrain.main upload-file my-app-id /Users/macbbook/Documents/architecture.pdf http://localhost:8080 "design,pdf" "john-doe"
+    ```
+    *This reads `architecture.pdf` locally, guesses its MIME type, and uploads it via the `/sources/upload` API endpoint on the server. The server automatically parses the PDF format (including tables/layout) and stores it in the RAG memory.*
 
 ---
+
 
 ## 🔌 4. Method 3: Remote Sync Trigger via HTTP JSON-RPC Client
 
