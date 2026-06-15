@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, File, UploadFile, Form
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import sqlite3
@@ -560,4 +560,176 @@ async def sync_codegraph_data(req: SyncRequest, request: Request = None):
         raise HTTPException(
             status_code=500,
             detail=f"Database synchronization failed: {str(e)}"
+        )
+
+@router.post("/upload-db")
+async def upload_codegraph_db(
+    file: UploadFile = File(...),
+    project_id: str = Form(...),
+    project_name: Optional[str] = Form(None),
+    author: Optional[str] = Form("anonymous"),
+    project_path: Optional[str] = Form(None),
+    request: Request = None
+):
+    import tempfile
+    import os
+    import shutil
+
+    # Create a temporary file to save the uploaded SQLite database
+    fd, temp_path = tempfile.mkstemp(suffix=".db")
+    try:
+        with os.fdopen(fd, "wb") as tmp:
+            shutil.copyfileobj(file.file, tmp)
+
+        # Connect to the uploaded SQLite file
+        conn = sqlite3.connect(temp_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Read nodes
+        cursor.execute("SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at FROM nodes;")
+        nodes = [dict(row) for row in cursor.fetchall()]
+
+        # Read edges
+        cursor.execute("SELECT id, source, target, kind, metadata, line, col FROM edges;")
+        edges = [dict(row) for row in cursor.fetchall()]
+
+        conn.close()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to read and parse uploaded SQLite database: {str(e)}"
+        )
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+    # Now reuse the existing sync database logic to save it
+    db.connect()
+    ts = int(time.time())
+    client_ip = "127.0.0.1"
+    if request and request.client:
+        client_ip = request.client.host
+
+    name = project_name or project_id
+
+    try:
+        db_cursor = db.conn.cursor()
+        
+        if db.is_postgres:
+            db_cursor.execute("DELETE FROM project_edges WHERE project_id = %s", (project_id,))
+            db_cursor.execute("DELETE FROM project_nodes WHERE project_id = %s", (project_id,))
+            db_cursor.execute("DELETE FROM projects WHERE id = %s", (project_id,))
+            
+            db_cursor.execute(
+                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip, sync_author, project_path) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (project_id, name, f"Uploaded db project {name}", ts, ts, client_ip, author or "anonymous", project_path)
+            )
+            
+            if nodes:
+                node_tuples = [
+                    (
+                        project_id, n.get("id"), n.get("kind"), n.get("name"), n.get("qualified_name"),
+                        n.get("file_path"), n.get("language"), n.get("start_line", 0), n.get("end_line", 0),
+                        n.get("docstring"), n.get("signature"), n.get("updated_at", ts)
+                    )
+                    for n in nodes
+                ]
+                from psycopg2.extras import execute_values
+                execute_values(
+                    db_cursor,
+                    """
+                    INSERT INTO project_nodes 
+                    (project_id, id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at)
+                    VALUES %s
+                    """,
+                    node_tuples
+                )
+                
+            if edges:
+                edge_tuples = [
+                    (
+                        project_id, e.get("id"), e.get("source"), e.get("target"), e.get("kind"),
+                        json.dumps(e.get("metadata")) if isinstance(e.get("metadata"), (dict, list)) else e.get("metadata"),
+                        e.get("line"), e.get("col")
+                    )
+                    for e in edges
+                ]
+                from psycopg2.extras import execute_values
+                execute_values(
+                    db_cursor,
+                    """
+                    INSERT INTO project_edges 
+                    (project_id, id, source, target, kind, metadata, line, col)
+                    VALUES %s
+                    """,
+                    edge_tuples
+                )
+        else:
+            db_cursor.execute("DELETE FROM project_edges WHERE project_id = ?", (project_id,))
+            db_cursor.execute("DELETE FROM project_nodes WHERE project_id = ?", (project_id,))
+            db_cursor.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            
+            db_cursor.execute(
+                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip, sync_author, project_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (project_id, name, f"Uploaded db project {name}", ts, ts, client_ip, author or "anonymous", project_path)
+            )
+            
+            if nodes:
+                node_tuples = [
+                    (
+                        project_id, n.get("id"), n.get("kind"), n.get("name"), n.get("qualified_name"),
+                        n.get("file_path"), n.get("language"), n.get("start_line", 0), n.get("end_line", 0),
+                        n.get("docstring"), n.get("signature"), n.get("updated_at", ts)
+                    )
+                    for n in nodes
+                ]
+                db_cursor.executemany(
+                    """
+                    INSERT INTO project_nodes 
+                    (project_id, id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    node_tuples
+                )
+                
+            if edges:
+                edge_tuples = [
+                    (
+                        project_id, e.get("id"), e.get("source"), e.get("target"), e.get("kind"),
+                        json.dumps(e.get("metadata")) if isinstance(e.get("metadata"), (dict, list)) else e.get("metadata"),
+                        e.get("line"), e.get("col")
+                    )
+                    for e in edges
+                ]
+                db_cursor.executemany(
+                    """
+                    INSERT INTO project_edges 
+                    (project_id, id, source, target, kind, metadata, line, col)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    edge_tuples
+                )
+                
+        db.conn.commit()
+        db_cursor.close()
+        
+        return {
+            "status": "success",
+            "message": f"Successfully imported uploaded codegraph database for project {project_id}",
+            "nodes_synced": len(nodes),
+            "edges_synced": len(edges)
+        }
+    except Exception as e:
+        if db.conn:
+            try:
+                db.conn.rollback()
+            except:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database synchronization via upload failed: {str(e)}"
         )

@@ -189,4 +189,73 @@ async def test_remote_codegraph_sync_validation():
     assert "remote server" in res_cwd
     assert "codegraph-sync" in res_cwd
 
+def test_codegraph_upload_db(tmp_path):
+    import sqlite3
+    from fastapi.testclient import TestClient
+    from projectbrain.server.api import create_app
+
+    # 1. Create a dummy sqlite database representing local .codegraph/codegraph.db
+    db_file = tmp_path / "codegraph_temp.db"
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE nodes (
+            id TEXT PRIMARY KEY,
+            kind TEXT,
+            name TEXT,
+            qualified_name TEXT,
+            file_path TEXT,
+            language TEXT,
+            start_line INTEGER,
+            end_line INTEGER,
+            docstring TEXT,
+            signature TEXT,
+            updated_at INTEGER
+        );
+    """)
+    cursor.execute("""
+        CREATE TABLE edges (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            target TEXT,
+            kind TEXT,
+            metadata TEXT,
+            line INTEGER,
+            col INTEGER
+        );
+    """)
+    cursor.execute("""
+        INSERT INTO nodes VALUES (
+            'n1', 'function', 'test_func', 'test_func', 'main.py', 'python', 1, 10, 'doc', 'def test_func()', 12345
+        );
+    """)
+    cursor.execute("""
+        INSERT INTO edges VALUES (
+            'e1', 'n1', 'n2', 'calls', '{}', 5, 2
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+    # 2. Upload the dummy database file via TestClient
+    app = create_app()
+    client = TestClient(app)
+    with open(db_file, "rb") as f:
+        response = client.post(
+            "/codegraph/upload-db",
+            files={"file": ("codegraph.db", f, "application/octet-stream")},
+            data={
+                "project_id": "test-upload-project",
+                "project_name": "test-upload-project",
+                "author": "tester",
+                "project_path": "/mock/path"
+            }
+        )
+
+    assert response.status_code == 200
+    res_data = response.json()
+    assert res_data["status"] == "success"
+    assert res_data["nodes_synced"] == 1
+    assert res_data["edges_synced"] == 1
+
 
