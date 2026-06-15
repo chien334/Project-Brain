@@ -500,6 +500,8 @@ async def projectbrain_sync_codegraph(
     import subprocess
     
     resolved_project_path = project_path
+    path_source = "specified" if project_path else "database"
+    
     if not resolved_project_path:
         # Check database for previously synced local project_path
         try:
@@ -515,8 +517,24 @@ async def projectbrain_sync_codegraph(
         except Exception:
             pass
 
-    target_dir = resolved_project_path if (resolved_project_path and os.path.isdir(resolved_project_path)) else os.getcwd()
+    if resolved_project_path:
+        if not os.path.isdir(resolved_project_path):
+            return f"Error: The {path_source} project path '{resolved_project_path}' does not exist or is not a directory on this machine."
+        target_dir = resolved_project_path
+    else:
+        target_dir = os.getcwd()
+        
     resolved_project_path = os.path.abspath(target_dir)
+
+    # Detect if we are running on the remote server itself and scanning the server's own directory
+    is_server_dir = os.path.exists(os.path.join(resolved_project_path, "src", "projectbrain", "main.py"))
+    is_server_project = project_id.split(":")[0] in ["openmemory", "projectbrain"]
+    if is_server_dir and not is_server_project:
+        return (
+            f"Error: The sync tool is running on the remote server and tried to scan the server's own directory ({resolved_project_path}) instead of your local project.\n"
+            f"To synchronize your local project '{project_id}' to the remote server, please run the command locally on your machine:\n"
+            f"  python -m projectbrain.main codegraph-sync {project_id} {mem.url} /path/to/your/local/project"
+        )
 
     if resolved_project_path:
         if os.path.isdir(resolved_project_path):
@@ -652,7 +670,20 @@ async def projectbrain_sync_codegraph(
             project_path=resolved_project_path
         )
         
-        res = await sync_codegraph_data(req)
+        if mem.mode == "remote":
+            import httpx
+            headers = {"Authorization": f"Bearer {mem.api_key}"} if mem.api_key else {}
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{mem.url}/codegraph/sync",
+                    json=req.dict(),
+                    headers=headers,
+                    timeout=120.0
+                )
+                resp.raise_for_status()
+                res = resp.json()
+        else:
+            res = await sync_codegraph_data(req)
         
         mem_res = None
         if sync_memories:

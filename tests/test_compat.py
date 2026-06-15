@@ -175,3 +175,18 @@ def test_sse_headers_and_cors():
     assert response_sse.headers.get("x-accel-buffering") == "no"
     assert response_sse.headers.get("cache-control") == "no-cache"
 
+@pytest.mark.asyncio
+async def test_remote_codegraph_sync_validation():
+    from projectbrain.ai.mcp import projectbrain_sync_codegraph
+    # 1. Sync with a nonexistent path should return a clear error
+    res = await projectbrain_sync_codegraph(project_id="test-proj", project_path="/nonexistent/directory/path/123")
+    assert "Error" in res
+    assert "does not exist" in res
+
+    # 2. Sync with no path when CWD is the server directory should block and prompt to run locally
+    res_cwd = await projectbrain_sync_codegraph(project_id="test-proj")
+    assert "Error" in res_cwd
+    assert "remote server" in res_cwd
+    assert "codegraph-sync" in res_cwd
+
+
