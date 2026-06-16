@@ -1,6 +1,10 @@
 @echo off
 SETLOCAL EnableDelayedExpansion
 
+:: Corporate Proxy Bypass Configuration
+set NO_PROXY=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,5.104.85.38
+set no_proxy=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,5.104.85.38
+
 echo =============================================
 echo   ProjectBrain Codegraph Synchronization CLI
 echo =============================================
@@ -62,6 +66,11 @@ if "%SYNC_MEMORIES%"=="" (
     ) else (
         set SYNC_MEMORIES=
     )
+) else (
+    if /i "%SYNC_MEMORIES%"=="y" set SYNC_MEMORIES=--sync-memories
+    if /i "%SYNC_MEMORIES%"=="true" set SYNC_MEMORIES=--sync-memories
+    if /i "%SYNC_MEMORIES%"=="1" set SYNC_MEMORIES=--sync-memories
+    if /i "%SYNC_MEMORIES%"=="--sync-memories" set SYNC_MEMORIES=--sync-memories
 )
 
 :: 6. Sync DB File Upload
@@ -74,6 +83,33 @@ if "%UPLOAD_DB%"=="" (
     ) else (
         set UPLOAD_DB=
     )
+) else (
+    if /i "%UPLOAD_DB%"=="y" set UPLOAD_DB=--upload-db
+    if /i "%UPLOAD_DB%"=="true" set UPLOAD_DB=--upload-db
+    if /i "%UPLOAD_DB%"=="1" set UPLOAD_DB=--upload-db
+    if /i "%UPLOAD_DB%"=="--upload-db" set UPLOAD_DB=--upload-db
+)
+
+:: 7. Pure Python Parser Toggle
+set USE_PURE_PYTHON=%7
+if "%USE_PURE_PYTHON%"=="" (
+    set /p PY_ANS="Use pure Python codebase scanner instead of native codegraph CLI? (y/n) [y]: "
+    if "!PY_ANS!"=="" set PY_ANS=y
+    if /i "!PY_ANS!"=="y" (
+        set PB_USE_PURE_PYTHON_PARSER=true
+    ) else (
+        set PB_USE_PURE_PYTHON_PARSER=false
+    )
+) else (
+    if "%USE_PURE_PYTHON%"=="true" (
+        set PB_USE_PURE_PYTHON_PARSER=true
+    ) else if "%USE_PURE_PYTHON%"=="1" (
+        set PB_USE_PURE_PYTHON_PARSER=true
+    ) else if "%USE_PURE_PYTHON%"=="y" (
+        set PB_USE_PURE_PYTHON_PARSER=true
+    ) else (
+        set PB_USE_PURE_PYTHON_PARSER=false
+    )
 )
 
 echo.
@@ -85,6 +121,7 @@ echo Project Path: %PROJECT_PATH%
 echo Branch:       %BRANCH%
 echo Sync Files:   %SYNC_MEMORIES%
 echo Upload DB:    %UPLOAD_DB%
+echo Pure Python:  %PB_USE_PURE_PYTHON_PARSER%
 echo -------------------
 echo Running sync...
 echo.

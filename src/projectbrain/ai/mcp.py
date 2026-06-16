@@ -575,26 +575,37 @@ async def projectbrain_sync_codegraph(
     else:
         db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
         
-    if not os.path.exists(db_path):
+    # Check if we should force the pure-Python parser
+    force_python = os.getenv("PB_USE_PURE_PYTHON_PARSER", "false").lower() in ("true", "1", "yes")
+    
+    if not os.path.exists(db_path) or force_python:
         python_parser_run = False
-        # Check if codegraph command is available
-        codegraph_bin = shutil.which("codegraph")
-        if not codegraph_bin:
-            # Check if automatic installation is allowed
-            allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
-            if not allow_auto:
-                # Fallback: Run pure-Python codebase parser
-                try:
-                    from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                    run_python_parser(resolved_project_path)
-                    python_parser_run = True
-                except Exception as py_err:
-                    return (
-                        f"Error: Codegraph database not found at {db_path} and 'codegraph' CLI is not installed.\n"
-                        f"Attempted to fallback to the pure-Python codebase parser but failed: {str(py_err)}.\n"
-                        f"Please install the dependency manually using:\n"
-                        f"  npm install -g @colbymchenry/codegraph"
-                    )
+        if force_python:
+            try:
+                from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                run_python_parser(resolved_project_path)
+                python_parser_run = True
+            except Exception as py_err:
+                return f"Error: Forced to use pure-Python parser, but execution failed: {str(py_err)}"
+        else:
+            # Check if codegraph command is available
+            codegraph_bin = shutil.which("codegraph")
+            if not codegraph_bin:
+                # Check if automatic installation is allowed
+                allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
+                if not allow_auto:
+                    # Fallback: Run pure-Python codebase parser
+                    try:
+                        from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                        run_python_parser(resolved_project_path)
+                        python_parser_run = True
+                    except Exception as py_err:
+                        return (
+                            f"Error: Codegraph database not found at {db_path} and 'codegraph' CLI is not installed.\n"
+                            f"Attempted to fallback to the pure-Python codebase parser but failed: {str(py_err)}.\n"
+                            f"Please install the dependency manually using:\n"
+                            f"  npm install -g @colbymchenry/codegraph"
+                        )
             else:
                 # Force install it via npm globally
                 try:

@@ -202,11 +202,22 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
     else:
         db_path = os.path.join(os.getcwd(), ".codegraph", "codegraph.db")
         
-    if not os.path.exists(db_path):
-        import shutil
-        import subprocess
-        print(f"Codegraph database not found at {db_path}. Checking for 'codegraph' CLI...")
-        codegraph_bin = shutil.which("codegraph")
+    force_python = os.getenv("PB_USE_PURE_PYTHON_PARSER", "false").lower() in ("true", "1", "yes")
+    codegraph_bin = None
+    
+    if not os.path.exists(db_path) or force_python:
+        if force_python:
+            try:
+                from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                run_python_parser(target_dir)
+            except Exception as py_err:
+                print(f"Error: Forced to use pure-Python parser, but execution failed: {str(py_err)}")
+                sys.exit(1)
+        else:
+            import shutil
+            import subprocess
+            print(f"Codegraph database not found at {db_path}. Checking for 'codegraph' CLI...")
+            codegraph_bin = shutil.which("codegraph")
         if not codegraph_bin:
             # Check if automatic installation is allowed
             allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
@@ -256,7 +267,7 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
                         sys.exit(1)
         
         # Now run 'codegraph init' in the project directory if we have codegraph_bin and database is still missing
-        if codegraph_bin and not os.path.exists(db_path):
+        if not force_python and codegraph_bin and not os.path.exists(db_path):
             print(f"Initializing codegraph database in directory '{target_dir}' using '{codegraph_bin} init'...")
             try:
                 res_init = subprocess.run([codegraph_bin, "init"], cwd=target_dir, capture_output=True, text=True)
@@ -327,7 +338,7 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
                 if sync_memories:
                     print("Proceeding to ingest codebase files as memories...")
                     import asyncio
-                    asyncio.run(async_ingest_files(sync_project_id, target_dir))
+                    asyncio.run(async_ingest_files(sync_project_id, target_dir, server_url))
             else:
                 print(f"Sync via upload failed (Status {resp.status_code}): {resp.text}")
                 sys.exit(1)
@@ -372,7 +383,7 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
             if sync_memories:
                 print("Proceeding to ingest codebase files as memories...")
                 import asyncio
-                asyncio.run(async_ingest_files(sync_project_id, target_dir))
+                asyncio.run(async_ingest_files(sync_project_id, target_dir, server_url))
         else:
             print(f"Sync failed (Status {resp.status_code}): {resp.text}")
             sys.exit(1)
@@ -380,11 +391,14 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
         print(f"Error during sync: {e}")
         sys.exit(1)
 
-async def async_ingest_files(project_id: str, dir_path: str):
+async def async_ingest_files(project_id: str, dir_path: str, server_url: Optional[str] = None):
     import os
     from .main import Memory
     
-    mem = Memory()
+    if server_url:
+        mem = Memory(url=server_url, mode="remote")
+    else:
+        mem = Memory()
     exclude_dirs = {
         ".git", "node_modules", "dist", "build", "__pycache__", 
         ".pytest_cache", ".codegraph", "cloned_repos", "bin", "obj", 
@@ -413,12 +427,12 @@ async def async_ingest_files(project_id: str, dir_path: str):
             if ext in exclude_exts:
                 continue
             file_path = os.path.join(root, file)
-            # Extra safeguard: check if path contains any excluded directory names
-            parts = file_path.split(os.sep)
+            rel_path = os.path.relpath(file_path, dir_path)
+            # Extra safeguard: check if relative path contains any excluded directory names
+            parts = rel_path.split(os.sep)
             if any(p in exclude_dirs for p in parts):
                 continue
             
-            rel_path = os.path.relpath(file_path, dir_path)
             try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
@@ -442,10 +456,10 @@ async def async_ingest_files(project_id: str, dir_path: str):
                 print(f"Failed to ingest {rel_path}: {e}", flush=True)
     print(f"Successfully ingested {count} codebase files as memories!", flush=True)
 
-def run_ingest_files(project_id: str, dir_path: str):
+def run_ingest_files(project_id: str, dir_path: str, server_url: Optional[str] = None):
     import os
     import asyncio
-    asyncio.run(async_ingest_files(project_id, dir_path))
+    asyncio.run(async_ingest_files(project_id, dir_path, server_url))
 
 def run_upload_file(project_id: str, file_path: str, server_url: str = None, tags: str = "", author: str = None):
     import os

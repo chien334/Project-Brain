@@ -1373,7 +1373,10 @@ document.addEventListener('DOMContentLoaded', () => {
             'function': { background: '#064e3b', border: '#10b981', highlight: { background: '#047857', border: '#34d399' } },
             'method': { background: '#1e3a8a', border: '#3b82f6', highlight: { background: '#1d4ed8', border: '#60a5fa' } },
             'file': { background: '#7c2d12', border: '#ea580c', highlight: { background: '#9a3412', border: '#fb923c' } },
-            'import': { background: '#374151', border: '#9ca3af', highlight: { background: '#4b5563', border: '#d1d5db' } }
+            'import': { background: '#374151', border: '#9ca3af', highlight: { background: '#4b5563', border: '#d1d5db' } },
+            'variable': { background: '#78350f', border: '#d97706', highlight: { background: '#92400e', border: '#fbbf24' } },
+            'server': { background: '#581c87', border: '#a855f7', highlight: { background: '#701a75', border: '#c084fc' } },
+            'client': { background: '#0369a1', border: '#38bdf8', highlight: { background: '#075985', border: '#7dd3fc' } }
         };
         
         const defaultColor = { background: '#1f2937', border: '#4b5563', highlight: { background: '#374151', border: '#9ca3af' } };
