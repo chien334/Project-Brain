@@ -7,6 +7,13 @@ from dotenv import load_dotenv
 msg_root = Path(__file__).parent.parent.parent.parent / ".env"
 load_dotenv(msg_root)
 
+# Proxy bypass setup to bypass corporate proxy for internal traffic
+no_proxy_val = os.getenv("PB_NO_PROXY") or os.getenv("OM_NO_PROXY") or os.getenv("NO_PROXY") or os.getenv("no_proxy")
+if not no_proxy_val:
+    no_proxy_val = "localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,5.104.85.38"
+os.environ["NO_PROXY"] = no_proxy_val
+os.environ["no_proxy"] = no_proxy_val
+
 def num(v: Optional[str], d: int | float) -> int | float:
     try:
         return float(v) if v else d

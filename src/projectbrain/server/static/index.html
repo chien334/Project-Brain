@@ -349,6 +349,7 @@
                     <div class="form-group">
                         <label>Active Configuration JSON in Claude Desktop:</label>
                         <pre class="code-block" id="mcpActiveConfig">{}</pre>
+                    </div>
                 </div>
 
                 <!-- Local Project Config Generator -->
@@ -445,7 +446,8 @@
                             <label for="cgKindSelect">Filter by Kind:</label>
                             <select id="cgKindSelect">
                                 <option value="class,function,method,file" selected>Standard View (Clean)</option>
-                                <option value="all">All Kinds (with Imports)</option>
+                                <option value="class,function,method,file,variable,server,client">PLC/LASAL View (with Servers & Clients)</option>
+                                <option value="all">All Kinds (with Imports & Variables)</option>
                                 <option value="class">Classes Only</option>
                                 <option value="function,method">Functions & Methods</option>
                                 <option value="file">Files Only</option>

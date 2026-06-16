@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Corporate Proxy Bypass Configuration
+export NO_PROXY="localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,5.104.85.38"
+export no_proxy="localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,5.104.85.38"
+
 # Default Configuration
 DEFAULT_SERVER_URL="http://localhost:8080"
 DEFAULT_PROJECT_PATH="."
@@ -66,6 +70,12 @@ if [ -z "$SYNC_MEMORIES" ]; then
     else
         SYNC_MEMORIES=""
     fi
+else
+    if [ "$SYNC_MEMORIES" = "y" ] || [ "$SYNC_MEMORIES" = "true" ] || [ "$SYNC_MEMORIES" = "1" ] || [ "$SYNC_MEMORIES" = "--sync-memories" ]; then
+        SYNC_MEMORIES="--sync-memories"
+    else
+        SYNC_MEMORIES=""
+    fi
 fi
 
 # 6. Upload Type (JSON vs DB File)
@@ -78,6 +88,30 @@ if [ -z "$UPLOAD_DB" ]; then
     else
         UPLOAD_DB=""
     fi
+else
+    if [ "$UPLOAD_DB" = "y" ] || [ "$UPLOAD_DB" = "true" ] || [ "$UPLOAD_DB" = "1" ] || [ "$UPLOAD_DB" = "--upload-db" ]; then
+        UPLOAD_DB="--upload-db"
+    else
+        UPLOAD_DB=""
+    fi
+fi
+
+# 7. Pure Python Parser Toggle
+USE_PURE_PYTHON=$7
+if [ -z "$USE_PURE_PYTHON" ]; then
+    read -p "Use pure Python codebase scanner instead of native codegraph CLI? (y/n) [y]: " PY_ANS
+    PY_ANS=${PY_ANS:-"y"}
+    if [[ "$PY_ANS" =~ ^[Yy]$ ]]; then
+        export PB_USE_PURE_PYTHON_PARSER="true"
+    else
+        export PB_USE_PURE_PYTHON_PARSER="false"
+    fi
+else
+    if [ "$USE_PURE_PYTHON" = "true" ] || [ "$USE_PURE_PYTHON" = "1" ] || [ "$USE_PURE_PYTHON" = "y" ]; then
+        export PB_USE_PURE_PYTHON_PARSER="true"
+    else
+        export PB_USE_PURE_PYTHON_PARSER="false"
+    fi
 fi
 
 echo ""
@@ -89,6 +123,7 @@ echo "Project Path: $ABS_PROJECT_PATH"
 echo "Branch:       $BRANCH"
 echo "Sync Files:   ${SYNC_MEMORIES:-no}"
 echo "Upload DB:    ${UPLOAD_DB:-no}"
+echo "Pure Python:  $PB_USE_PURE_PYTHON_PARSER"
 echo "-------------------"
 echo "Running sync..."
 echo ""

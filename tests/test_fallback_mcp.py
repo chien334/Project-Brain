@@ -286,7 +286,7 @@ async def test_pdf_with_image_ocr(mock_pdfplumber_open, mock_extract):
     mock_extract.return_value = "Extracted Image Text Markdown!"
     
     from extensions_mcp.image_to_markdown.config import Config
-    mock_config = Config("gemini", "mock-api-key", None, "gemini-3.1-pro-preview", 3)
+    mock_config = Config("gemini", "mock-api-key", None, "gemini-3.1-pro-preview", 3, "auto", "ch", 200, False)
     with patch("extensions_mcp.image_to_markdown.config.CONFIG", mock_config):
         res = await parse_document("test.pdf", b"pdfbytes")
             
@@ -316,7 +316,7 @@ async def test_pptx_with_image_ocr(mock_presentation, mock_extract):
     mock_extract.return_value = "PPTX OCR Text!"
     
     from extensions_mcp.image_to_markdown.config import Config
-    mock_config = Config("gemini", "mock-api-key", None, "gemini-3.1-pro-preview", 3)
+    mock_config = Config("gemini", "mock-api-key", None, "gemini-3.1-pro-preview", 3, "auto", "ch", 200, False)
     with patch("extensions_mcp.image_to_markdown.config.CONFIG", mock_config):
         res = await parse_document("test.pptx", b"pptxbytes")
             
@@ -342,7 +342,7 @@ async def test_pptx_image_ocr_fallback(mock_presentation):
     mock_presentation.return_value = mock_prs
     
     from extensions_mcp.image_to_markdown.config import Config
-    mock_config = Config("gemini", "", None, "gemini-3.1-pro-preview", 3)
+    mock_config = Config("gemini", "", None, "gemini-3.1-pro-preview", 3, "auto", "ch", 200, False)
     with patch("extensions_mcp.image_to_markdown.config.CONFIG", mock_config):
         res = await parse_document("test.pptx", b"pptxbytes")
         
@@ -370,7 +370,7 @@ async def test_pptx_image_ocr_exception_fallback(mock_presentation, mock_extract
     mock_extract.side_effect = Exception("API connection error")
     
     from extensions_mcp.image_to_markdown.config import Config
-    mock_config = Config("gemini", "some-key", None, "gemini-3.1-pro-preview", 3)
+    mock_config = Config("gemini", "some-key", None, "gemini-3.1-pro-preview", 3, "auto", "ch", 200, False)
     with patch("extensions_mcp.image_to_markdown.config.CONFIG", mock_config):
         res = await parse_document("test.pptx", b"pptxbytes")
         
