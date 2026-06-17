@@ -905,6 +905,135 @@ async def projectbrain_register_external_mcp_tool(
     except Exception as e:
         return f"Error registering external MCP server: {str(e)}"
 
+@mcp_server.tool(name="projectbrain_query_codegraph", description="Query ProjectBrain's codebase structure graph (codegraph) to find classes, functions, files, variables, clients, servers, and trace their connections (edges) in the project.")
+async def projectbrain_query_codegraph(
+    project_id: str = None,
+    query: str = None,
+    kinds: str = None,
+    node_id: str = None,
+    follow_connections: bool = False
+) -> str:
+    """
+    Query ProjectBrain's codebase structure graph (codegraph) to find classes, functions, files, variables, clients, servers, and trace their connections (edges) in the project.
+    
+    Args:
+        project_id: Unique identifier for the project (e.g. 'lasal-test:master'). If omitted, automatically resolved from the workspace/environment.
+        query: Search term to match against symbol names, qualified names, or file paths.
+        kinds: Comma-separated list of node kinds to filter by (e.g., 'class,function,method,file,variable,server,client').
+        node_id: Specific node ID to fetch details for.
+        follow_connections: If True, returns incoming and outgoing edges and connected nodes for the matching nodes or the specified node_id.
+    """
+    try:
+        uid = resolve_mcp_user_id(project_id)
+        db.connect()
+        cursor = db.conn.cursor()
+        
+        nodes = []
+        if node_id:
+            # Query specific node
+            if db.is_postgres:
+                cursor.execute(
+                    "SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature FROM project_nodes WHERE project_id = %s AND id = %s",
+                    (uid, node_id)
+                )
+            else:
+                cursor.execute(
+                    "SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature FROM project_nodes WHERE project_id = ? AND id = ?",
+                    (uid, node_id)
+                )
+            rows = cursor.fetchall()
+            for r in rows:
+                if db.is_postgres:
+                    nodes.append({
+                        "id": r[0], "kind": r[1], "name": r[2], "qualified_name": r[3],
+                        "file_path": r[4], "language": r[5], "start_line": r[6], "end_line": r[7],
+                        "docstring": r[8], "signature": r[9]
+                    })
+                else:
+                    nodes.append(dict(r))
+        else:
+            # Query by text / kinds
+            where_clauses = ["project_id = " + ("%s" if db.is_postgres else "?")]
+            params = [uid]
+            
+            if query:
+                where_clauses.append("(name LIKE " + ("%s" if db.is_postgres else "?") + 
+                                     " OR qualified_name LIKE " + ("%s" if db.is_postgres else "?") + 
+                                     " OR file_path LIKE " + ("%s" if db.is_postgres else "?") + ")")
+                q_param = f"%{query}%"
+                params.extend([q_param, q_param, q_param])
+                
+            if kinds:
+                kind_list = [k.strip() for k in kinds.split(",") if k.strip()]
+                if kind_list:
+                    placeholders = ",".join(["%s" if db.is_postgres else "?"] * len(kind_list))
+                    where_clauses.append(f"kind IN ({placeholders})")
+                    params.extend(kind_list)
+                    
+            sql = f"""
+                SELECT id, kind, name, qualified_name, file_path, language, 
+                       start_line, end_line, docstring, signature 
+                FROM project_nodes 
+                WHERE {' AND '.join(where_clauses)} 
+                LIMIT 100
+            """
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            for r in rows:
+                if db.is_postgres:
+                    nodes.append({
+                        "id": r[0], "kind": r[1], "name": r[2], "qualified_name": r[3],
+                        "file_path": r[4], "language": r[5], "start_line": r[6], "end_line": r[7],
+                        "docstring": r[8], "signature": r[9]
+                    })
+                else:
+                    nodes.append(dict(r))
+                    
+        edges = []
+        if follow_connections and nodes:
+            node_ids = [n["id"] for n in nodes]
+            if len(node_ids) > 0:
+                # Query edges
+                placeholders = ",".join(["%s" if db.is_postgres else "?"] * len(node_ids))
+                edges_query = f"""
+                    SELECT id, source, target, kind, metadata, line, col
+                    FROM project_edges
+                    WHERE project_id = {("%s" if db.is_postgres else "?")} 
+                      AND (source IN ({placeholders}) OR target IN ({placeholders}))
+                    LIMIT 150
+                """
+                edge_params = [uid] + node_ids + node_ids
+                cursor.execute(edges_query, edge_params)
+                rows_e = cursor.fetchall()
+                for r in rows_e:
+                    if db.is_postgres:
+                        edges.append({
+                            "id": r[0], "source": r[1], "target": r[2], "kind": r[3],
+                            "metadata": json.loads(r[4]) if r[4] else None, "line": r[5], "col": r[6]
+                        })
+                    else:
+                        d = dict(r)
+                        if d.get("metadata"):
+                            try:
+                                d["metadata"] = json.loads(d["metadata"])
+                            except:
+                                pass
+                        edges.append(d)
+                        
+        cursor.close()
+        
+        output = {
+            "project_id": uid,
+            "nodes_count": len(nodes),
+            "edges_count": len(edges),
+            "nodes": nodes,
+            "edges": edges
+        }
+        return json.dumps(output, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error querying codegraph: {str(e)}"
+
 # Dynamically register custom extensions
 try:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
