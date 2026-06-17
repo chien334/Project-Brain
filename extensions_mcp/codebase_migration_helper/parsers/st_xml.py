@@ -56,6 +56,14 @@ class StructuredTextParser(BaseParser):
                         sig = f"{elem.tag} {name}"
                         if tag_lower == "object":
                             sig = f"Object {name} : {elem.get('Class', 'unknown')}"
+                            if elem.get("Class"):
+                                edges.append({
+                                    "source": node_id,
+                                    "target_name": elem.get("Class"),
+                                    "kind": "instantiates",
+                                    "line": 1,
+                                    "col": 0
+                                })
                             
                         nodes.append({
                             "id": node_id,
