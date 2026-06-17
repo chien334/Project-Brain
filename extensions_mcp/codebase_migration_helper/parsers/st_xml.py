@@ -7,7 +7,7 @@ class StructuredTextParser(BaseParser):
     def parse(self, relative_path, code):
         is_xml = False
         stripped = code.strip()
-        if stripped.startswith("<") or relative_path.endswith((".xml", ".lcp", ".lcn", ".lba", ".lob")):
+        if stripped.startswith("<"):
             is_xml = True
             
         if is_xml:
