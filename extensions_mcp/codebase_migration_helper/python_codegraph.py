@@ -110,7 +110,24 @@ def parse_project(root_path):
         ".dll.config", ".exe.config", ".bak", ".tmp"
     }
     
-    all_nodes = []
+    project_name = os.path.basename(os.path.abspath(root_path))
+    project_node_id = f"{project_name}::Project"
+    
+    all_nodes = [{
+        "id": project_node_id,
+        "kind": "project",
+        "name": project_name,
+        "qualified_name": project_name,
+        "file_path": "",
+        "language": "project",
+        "start_line": 1,
+        "end_line": 1,
+        "start_column": 0,
+        "end_column": 0,
+        "docstring": f"Project Root Node for {project_name}",
+        "signature": f"project {project_name}",
+        "visibility": "public"
+    }]
     all_edges = []
     global_defined_symbols = {}
     
@@ -154,6 +171,15 @@ def parse_project(root_path):
                     "docstring": "",
                     "signature": f"file {rel_path}",
                     "visibility": "public"
+                })
+                
+                # Connect project to file node to prevent isolated file nodes
+                all_edges.append({
+                    "source": project_node_id,
+                    "target": file_node_id,
+                    "kind": "contains",
+                    "line": 1,
+                    "col": 0
                 })
                 
                 # Run modular parser
