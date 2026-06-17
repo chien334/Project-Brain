@@ -338,7 +338,7 @@ async def get_codegraph_data(
                 FROM project_edges
                 WHERE project_id {edge_op} {("%s" if db.is_postgres else "?")} 
                   AND (source IN ({placeholders}) OR target IN ({placeholders}))
-                LIMIT 200
+                LIMIT 2000
             """
             
             edge_params = [project_id] + list(node_ids) + list(node_ids)

@@ -1,5 +1,7 @@
-import pytest
 import os
+os.environ["PB_USE_PURE_PYTHON_PARSER"] = "false"
+
+import pytest
 import subprocess
 from unittest.mock import MagicMock, patch
 from projectbrain.ai.mcp import projectbrain_sync_codegraph
@@ -33,7 +35,7 @@ async def test_sync_db_exists(mock_sync, mock_connect, mock_run, mock_which, moc
     
     mock_sync.return_value = {"status": "success", "nodes_count": 0, "edges_count": 0}
     
-    res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
+    res = await projectbrain_sync_codegraph("test-project", sync_memories=False)
     
     # Assertions
     mock_exists.assert_called_once()
@@ -87,7 +89,7 @@ async def test_sync_db_missing_cli_exists(mock_sync, mock_connect, mock_run, moc
     
     mock_sync.return_value = {"status": "success", "nodes_count": 0, "edges_count": 0}
     
-    res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
+    res = await projectbrain_sync_codegraph("test-project", sync_memories=False)
     
     # Assertions
     assert mock_exists.call_count >= 2
@@ -146,7 +148,7 @@ async def test_sync_db_missing_cli_missing_install_success(mock_py_main, mock_sy
     mock_sync.return_value = {"status": "success"}
     
     with patch.dict(os.environ, {"PB_ALLOW_AUTO_INSTALL": "true"}):
-        res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
+        res = await projectbrain_sync_codegraph("test-project", sync_memories=False)
     
     # Assertions
     assert mock_which.call_count == 3
@@ -176,7 +178,7 @@ async def test_sync_db_missing_cli_missing_install_fails(mock_py_main, mock_run,
     mock_run.return_value = mock_npm_res
     
     with patch.dict(os.environ, {"PB_ALLOW_AUTO_INSTALL": "true"}):
-        res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
+        res = await projectbrain_sync_codegraph("test-project", sync_memories=False)
     
     # Assertions
     mock_which.assert_called_once_with("codegraph")
@@ -198,7 +200,7 @@ async def test_sync_db_missing_cli_missing_install_disabled(mock_py_main, mock_r
     mock_exists.return_value = False
     mock_which.return_value = None
     
-    res = await projectbrain_sync_codegraph("test-project", "tester", sync_memories=False)
+    res = await projectbrain_sync_codegraph("test-project", sync_memories=False)
     
     # Assertions
     mock_which.assert_called_once_with("codegraph")

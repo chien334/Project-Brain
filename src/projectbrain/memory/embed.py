@@ -47,8 +47,9 @@ async def embed_multi_sector(id: str, txt: str, secs: List[str], chunks: Optiona
 
     res = []
     try:
-        for s in secs:
-            v = await embed_for_sector(txt, s)
+        tasks = [embed_for_sector(txt, s) for s in secs]
+        vectors = await asyncio.gather(*tasks)
+        for s, v in zip(secs, vectors):
             res.append({"sector": s, "vector": v, "dim": len(v)})
 
         q.upd_log(id=id, status="completed", err=None)

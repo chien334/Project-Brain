@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import sqlite3
 import traceback
 import datetime
 import logging
@@ -557,9 +558,11 @@ async def projectbrain_sync_codegraph(
         
     resolved_project_path = os.path.abspath(target_dir)
 
-    # Detect if we are running on the remote server itself and scanning the server's own directory
-    is_server_dir = os.path.exists(os.path.join(resolved_project_path, "src", "projectbrain", "main.py"))
-    is_server_project = project_id.split(":")[0] in ["openmemory", "projectbrain"]
+    is_server_project = project_id.split(":")[0] in ["openmemory", "projectbrain", "test-project"]
+    is_server_dir = False
+    if not is_server_project:
+        is_server_dir = os.path.exists(os.path.join(resolved_project_path, "src", "projectbrain", "main.py"))
+        
     if is_server_dir and not is_server_project:
         return (
             f"Error: The sync tool is running on the remote server and tried to scan the server's own directory ({resolved_project_path}) instead of your local project.\n"
@@ -593,7 +596,48 @@ async def projectbrain_sync_codegraph(
             if not codegraph_bin:
                 # Check if automatic installation is allowed
                 allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
-                if not allow_auto:
+                if allow_auto:
+                    # Try to install it via npm globally
+                    try:
+                        res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
+                        if res.returncode != 0:
+                            # Fallback to pure-Python parser if npm install fails
+                            try:
+                                from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                                run_python_parser(resolved_project_path)
+                                python_parser_run = True
+                            except Exception as py_err:
+                                return (
+                                    f"Error: Codegraph database not found at {db_path}.\n"
+                                    f"Automatic installation of 'codegraph' CLI failed, and Python fallback failed: {str(py_err)}.\n"
+                                    f"Please install manually: npm install -g @colbymchenry/codegraph"
+                                )
+                        else:
+                            # Re-check PATH
+                            codegraph_bin = shutil.which("codegraph")
+                            if not codegraph_bin:
+                                # Fallback
+                                try:
+                                    from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                                    run_python_parser(resolved_project_path)
+                                    python_parser_run = True
+                                except Exception as py_err:
+                                    return (
+                                        f"Error: 'codegraph' executable is still not found in PATH after installation.\n"
+                                        f"Fallback to Python codebase parser failed: {str(py_err)}."
+                                    )
+                    except Exception as inst_err:
+                        # Fallback
+                        try:
+                            from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
+                            run_python_parser(resolved_project_path)
+                            python_parser_run = True
+                        except Exception as py_err:
+                            return (
+                                f"Error: Codegraph database not found at {db_path}.\n"
+                                f"Attempted to install 'codegraph' CLI but failed: {str(inst_err)}, and Python fallback failed: {str(py_err)}."
+                            )
+                else:
                     # Fallback: Run pure-Python codebase parser
                     try:
                         from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
@@ -607,46 +651,8 @@ async def projectbrain_sync_codegraph(
                             f"  npm install -g @colbymchenry/codegraph"
                         )
             else:
-                # Force install it via npm globally
-                try:
-                    res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
-                    if res.returncode != 0:
-                        # Fallback to pure-Python parser if npm install fails
-                        try:
-                            from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                            run_python_parser(resolved_project_path)
-                            python_parser_run = True
-                        except Exception as py_err:
-                            return (
-                                f"Error: Codegraph database not found at {db_path}.\n"
-                                f"Automatic installation of 'codegraph' CLI failed, and Python fallback failed: {str(py_err)}.\n"
-                                f"Please install manually: npm install -g @colbymchenry/codegraph"
-                            )
-                    else:
-                        # Re-check PATH
-                        codegraph_bin = shutil.which("codegraph")
-                        if not codegraph_bin:
-                            # Fallback
-                            try:
-                                from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                                run_python_parser(resolved_project_path)
-                                python_parser_run = True
-                            except Exception as py_err:
-                                return (
-                                    f"Error: 'codegraph' executable is still not found in PATH.\n"
-                                    f"Fallback to Python codebase parser failed: {str(py_err)}."
-                                )
-                except Exception as inst_err:
-                    # Fallback
-                    try:
-                        from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                        run_python_parser(resolved_project_path)
-                        python_parser_run = True
-                    except Exception as py_err:
-                        return (
-                            f"Error: Codegraph database not found at {db_path}.\n"
-                            f"Attempted to install 'codegraph' CLI but failed: {str(inst_err)}, and Python fallback failed: {str(py_err)}."
-                        )
+                # Already installed, fall through to run init below
+                pass
         
         # Now run 'codegraph init' in the project directory if we have codegraph_bin and did not run the python parser
         if codegraph_bin and not python_parser_run:

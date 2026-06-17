@@ -40,6 +40,8 @@ def detect_lang(file_path):
         ".f90": "fortran",
         ".st": "structured_text",
         ".lsl": "structured_text",
+        ".lba": "structured_text",
+        ".lob": "structured_text",
         ".xml": "xml",
         ".lcp": "xml",
         ".lcn": "xml"

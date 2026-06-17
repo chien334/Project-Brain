@@ -31,7 +31,7 @@ class Memory:
         if self.mode == "remote":
             import httpx
             headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(
                     f"{self.url}/memory/add",
                     json={
