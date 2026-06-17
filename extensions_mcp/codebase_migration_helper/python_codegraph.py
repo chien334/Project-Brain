@@ -97,8 +97,18 @@ def setup_db(db_path):
     conn.close()
 
 def parse_project(root_path):
-    exclude_dirs = {".git", "node_modules", "venv", ".venv", "__pycache__", "bin", "obj", ".vs", ".codegraph", "dist", "build"}
-    exclude_exts = {".db", ".sqlite", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg", ".pdf", ".zip", ".tar", ".gz", ".rar", ".exe", ".bin", ".dll", ".so", ".dylib"}
+    exclude_dirs = {".git", "node_modules", "venv", ".venv", "__pycache__", "bin", "obj", ".vs", ".codegraph", "dist", "build", ".cache"}
+    exclude_exts = {
+        ".db", ".sqlite", ".sqlite3",
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg",
+        ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
+        ".exe", ".bin", ".dll", ".pdb", ".so", ".dylib",
+        ".woff", ".woff2", ".ttf", ".eot",
+        ".cache", ".up2date", ".log",
+        ".suo", ".user", ".map", ".lock",
+        ".mp3", ".mp4", ".wav", ".avi", ".mov", ".flac", ".ogg",
+        ".dll.config", ".exe.config", ".bak", ".tmp"
+    }
     
     all_nodes = []
     all_edges = []

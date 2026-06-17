@@ -330,15 +330,15 @@ async def get_codegraph_data(
                 cursor.close()
                 return {"nodes": [], "edges": []}
                 
-            # Query edges connecting these nodes
+            # Query edges connecting to/from these nodes
             placeholders = ",".join(["%s" if db.is_postgres else "?"] * len(node_ids))
             edge_op = "LIKE" if ("%" in project_id or "_" in project_id) else "="
             edges_query = f"""
                 SELECT id, source, target, kind, metadata, line, col
                 FROM project_edges
                 WHERE project_id {edge_op} {("%s" if db.is_postgres else "?")} 
-                  AND source IN ({placeholders}) 
-                  AND target IN ({placeholders})
+                  AND (source IN ({placeholders}) OR target IN ({placeholders}))
+                LIMIT 200
             """
             
             edge_params = [project_id] + list(node_ids) + list(node_ids)
@@ -346,22 +346,49 @@ async def get_codegraph_data(
             rows = cursor.fetchall()
             
             edges = []
+            all_referenced_node_ids = set()
             for r in rows:
                 if db.is_postgres:
                     meta_raw = r[4]
                     meta = json.loads(meta_raw) if meta_raw else None
-                    edges.append({
+                    edge_data = {
                         "id": r[0], "source": r[1], "target": r[2], "kind": r[3],
                         "metadata": meta, "line": r[5], "col": r[6]
-                    })
+                    }
                 else:
-                    d = dict(r)
-                    if d.get("metadata"):
+                    edge_data = dict(r)
+                    if edge_data.get("metadata"):
                         try:
-                            d["metadata"] = json.loads(d["metadata"])
+                            edge_data["metadata"] = json.loads(edge_data["metadata"])
                         except:
                             pass
-                    edges.append(d)
+                edges.append(edge_data)
+                all_referenced_node_ids.add(edge_data["source"])
+                all_referenced_node_ids.add(edge_data["target"])
+                
+            # Fetch any missing referenced nodes (parents/connects) so they are not isolated in graph view
+            missing_node_ids = all_referenced_node_ids - node_ids
+            if missing_node_ids:
+                missing_placeholders = ",".join(["%s" if db.is_postgres else "?"] * len(missing_node_ids))
+                missing_query = f"""
+                    SELECT id, kind, name, qualified_name, file_path, language, 
+                           start_line, end_line, docstring, signature 
+                    FROM project_nodes
+                    WHERE project_id {edge_op} {("%s" if db.is_postgres else "?")}
+                      AND id IN ({missing_placeholders})
+                """
+                cursor.execute(missing_query, [project_id] + list(missing_node_ids))
+                missing_rows = cursor.fetchall()
+                for r in missing_rows:
+                    if db.is_postgres:
+                        node_data = {
+                            "id": r[0], "kind": r[1], "name": r[2], "qualified_name": r[3],
+                            "file_path": r[4], "language": r[5], "start_line": r[6], "end_line": r[7],
+                            "docstring": r[8], "signature": r[9]
+                        }
+                    else:
+                        node_data = dict(r)
+                    nodes.append(node_data)
                     
             cursor.close()
             return {
@@ -425,12 +452,14 @@ async def get_codegraph_data(
         edges_query = f"""
             SELECT id, source, target, kind, metadata, line, col
             FROM edges
-            WHERE source IN ({placeholders}) AND target IN ({placeholders})
+            WHERE source IN ({placeholders}) OR target IN ({placeholders})
+            LIMIT 200
         """
         cursor.execute(edges_query, list(node_ids) + list(node_ids))
         edge_rows = cursor.fetchall()
         
         edges = []
+        all_referenced_node_ids = set()
         for r in edge_rows:
             d = dict(r)
             if d.get("metadata"):
@@ -439,7 +468,24 @@ async def get_codegraph_data(
                 except:
                     pass
             edges.append(d)
+            all_referenced_node_ids.add(d["source"])
+            all_referenced_node_ids.add(d["target"])
             
+        # Fetch any missing referenced nodes (parents/connects) locally
+        missing_node_ids = all_referenced_node_ids - node_ids
+        if missing_node_ids:
+            missing_placeholders = ",".join(["?"] * len(missing_node_ids))
+            missing_query = f"""
+                SELECT id, kind, name, qualified_name, file_path, language, 
+                       start_line, end_line, docstring, signature 
+                FROM nodes
+                WHERE id IN ({missing_placeholders})
+            """
+            cursor.execute(missing_query, list(missing_node_ids))
+            missing_rows = cursor.fetchall()
+            for r in missing_rows:
+                nodes.append(dict(r))
+                
         conn.close()
         return {
             "nodes": nodes,
