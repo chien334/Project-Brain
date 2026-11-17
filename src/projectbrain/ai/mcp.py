@@ -1682,6 +1682,281 @@ async def projectbrain_promote_branch_graph(
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_promote_branch_graph: {str(e)}"
 
+@mcp_server.tool(
+    name="projectbrain_build_complete_kb",
+    description="Synthesize zero-hallucination Markdown wiki, multimodal Office documents (.docx, .xlsx, .pptx), chunk documents into HSG cognitive memory, and build multi-signal code-doc-test cross-links."
+)
+async def projectbrain_build_complete_kb(
+    workspace_path: str = ".",
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    persist_memory: bool = True,
+    output_dir: Optional[str] = None,
+    generate_office_exports: bool = True
+) -> str:
+    """
+    Build and cross-link complete ProjectBrain Knowledge Base for the workspace.
+    """
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            api_key = get_pb_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            payload = {
+                "project_id": target_proj,
+                "branch": target_branch,
+                "workspace_path": workspace_path,
+                "persist_memory": persist_memory,
+                "output_dir": output_dir,
+                "generate_office_exports": generate_office_exports,
+            }
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                resp = await client.post(f"{server_url}/kb/build", json=payload, headers=headers)
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            from ..graphify_engine.kb_linker import UnifiedKBBuilder
+            db_path = (
+                os.getenv("PB_GRAPH_DB_PATH")
+                or os.getenv("OM_GRAPH_DB_PATH")
+                or os.getenv("PB_DB_PATH")
+                or os.getenv("OM_DB_PATH")
+            )
+            builder = UnifiedKBBuilder(workspace_path=workspace_path)
+            res = await builder.build_unified_kb(
+                project_id=target_proj,
+                branch=target_branch,
+                persist_memory=persist_memory,
+                output_dir=output_dir,
+                generate_office_exports=generate_office_exports,
+                store=_get_mcp_graph_store(),
+                db_path=db_path,
+            )
+            return json.dumps(res, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_build_complete_kb: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_trace_code_and_docs",
+    description="Trace unified code AST symbols, linked documentation chunks, tests, callers/callees, and drift detection status for any symbol, route, or file."
+)
+async def projectbrain_trace_code_and_docs(
+    target: str,
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    workspace_path: str = "."
+) -> str:
+    """
+    Trace code, doc chunks, and test links for a target query.
+    """
+    try:
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            api_key = get_pb_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            params = {
+                "project_id": target_proj,
+                "target": target,
+                "branch": target_branch,
+                "workspace_path": workspace_path,
+            }
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.get(f"{server_url}/kb/trace", params=params, headers=headers)
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            from ..graphify_engine.kb_linker import UnifiedKBBuilder
+            builder = UnifiedKBBuilder(workspace_path=workspace_path)
+            builder.store = _get_mcp_graph_store()
+            res = builder.trace_code_and_docs(
+                project_id=target_proj,
+                target=target,
+                branch=target_branch,
+            )
+            return json.dumps(res.model_dump(), indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_trace_code_and_docs: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_kb_coverage_report",
+    description="Get repository-wide knowledge base coverage analytics, documented/inferred/undocumented ratios, API & MCP coverage %, and drift alerts."
+)
+async def projectbrain_kb_coverage_report(
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    workspace_path: str = "."
+) -> str:
+    """
+    Compute and return repository-wide documentation and test coverage analytics.
+    """
+    try:
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            api_key = get_pb_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            params = {
+                "project_id": target_proj,
+                "branch": target_branch,
+                "workspace_path": workspace_path,
+            }
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.get(f"{server_url}/kb/coverage", params=params, headers=headers)
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            from ..graphify_engine.kb_linker import UnifiedKBBuilder
+            builder = UnifiedKBBuilder(workspace_path=workspace_path)
+            builder.store = _get_mcp_graph_store()
+            res = builder.get_kb_coverage_report(
+                project_id=target_proj,
+                branch=target_branch,
+            )
+            return json.dumps(res.model_dump(), indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_kb_coverage_report: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_generate_project_docs",
+    description="Generate on-demand Markdown Knowledge Wiki and Multimodal Office exports (.docx, .xlsx, .pptx) from current GraphStore."
+)
+async def projectbrain_generate_project_docs(
+    workspace_path: str = ".",
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    output_dir: str = "docs/kb",
+    formats: Optional[List[str]] = None
+) -> str:
+    """
+    Generate documentation and office exports on-demand.
+    """
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        target_formats = [f.lower().strip() for f in formats] if formats else ["wiki", "docx", "xlsx", "pptx"]
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            api_key = get_pb_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            payload = {
+                "project_id": target_proj,
+                "branch": target_branch,
+                "workspace_path": workspace_path,
+                "output_dir": output_dir,
+                "formats": target_formats,
+            }
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                resp = await client.post(f"{server_url}/kb/export", json=payload, headers=headers)
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            from ..graphify_engine.doc_synthesizer import ProjectDocSynthesizer
+            store = _get_mcp_graph_store()
+            subgraph = store.get_resolved_subgraph(target_proj, target_branch, limit=100000)
+            synthesizer = ProjectDocSynthesizer(workspace_path=workspace_path)
+            out_p = Path(output_dir)
+            if not out_p.is_absolute():
+                out_p = Path(workspace_path).resolve() / out_p
+            out_p.mkdir(parents=True, exist_ok=True)
+            wiki_dir = out_p / "wiki" if "wiki" not in out_p.parts else out_p
+            exports_dir = out_p / "exports" if "exports" not in out_p.parts else out_p
+
+            artifacts = []
+            if "wiki" in target_formats:
+                pages = synthesizer.synthesize_wiki(subgraph, output_dir=wiki_dir)
+                artifacts.append({"format": "wiki", "count": len(pages), "dir": str(wiki_dir)})
+            if "docx" in target_formats:
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                r = synthesizer.export_docx_specification(subgraph, output_path=exports_dir / "ProjectBrain_Architecture_Spec.docx")
+                artifacts.append(r.model_dump())
+            if "xlsx" in target_formats:
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                linker_index = {
+                    "links": [
+                        e
+                        for e in subgraph.get("edges", [])
+                        if e.get("relation")
+                        in (
+                            "documents_symbol",
+                            "documented_in",
+                            "conceptually_related_to",
+                            "verifies_symbol",
+                            "verifies_requirement",
+                            "specifies_endpoint",
+                        )
+                    ],
+                    "chunks": [n for n in subgraph.get("nodes", []) if n.get("file_type") == "document"],
+                    "coverage": {},
+                }
+                r = synthesizer.export_xlsx_traceability_matrix(subgraph, output_path=exports_dir / "ProjectBrain_Traceability_Matrix.xlsx", linker_index=linker_index)
+                artifacts.append(r.model_dump())
+            if "pptx" in target_formats:
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                r = synthesizer.export_pptx_architecture_deck(subgraph, output_path=exports_dir / "ProjectBrain_Architecture_Deck.pptx")
+                artifacts.append(r.model_dump())
+
+            res = {
+                "status": "success",
+                "project_id": target_proj,
+                "branch": target_branch,
+                "output_dir": str(out_p),
+                "formats": target_formats,
+                "artifacts": artifacts,
+            }
+            return json.dumps(res, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_generate_project_docs: {str(e)}"
+
+
+
 # Dynamically register custom extensions
 try:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))

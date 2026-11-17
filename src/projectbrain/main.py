@@ -672,6 +672,102 @@ def run_upload_doc(
     print(json.dumps(res, indent=2))
 
 
+def run_build_kb(
+    project_id: str = "project-brain",
+    workspace_path: str = ".",
+    branch: str = "main",
+    persist_memory: bool = True,
+    generate_office_exports: bool = True,
+    output_dir: Optional[str] = None,
+    db_path: Optional[str] = None,
+):
+    import os
+    import sys
+    import asyncio
+    import json
+    from .graphify_engine.kb_linker import UnifiedKBBuilder
+
+    target_dir = os.path.abspath(workspace_path)
+    if not os.path.isdir(target_dir):
+        print(f"Error: Target directory '{target_dir}' does not exist.")
+        sys.exit(1)
+
+    print(f"Building unified knowledge base for '{project_id}' at '{target_dir}' (branch: {branch})...")
+    builder = UnifiedKBBuilder(workspace_path=target_dir)
+    res = asyncio.run(builder.build_unified_kb(
+        project_id=project_id,
+        branch=branch,
+        persist_memory=persist_memory,
+        output_dir=output_dir,
+        generate_office_exports=generate_office_exports,
+        db_path=db_path,
+    ))
+    print("Successfully built Unified Knowledge Base!")
+    print(json.dumps(res, indent=2))
+
+
+def run_kb_trace(
+    project_id: str,
+    target: str,
+    branch: str = "main",
+    workspace_path: str = ".",
+    db_path: Optional[str] = None,
+):
+    import os
+    import json
+    from .graphify_engine.kb_linker import UnifiedKBBuilder
+
+    target_dir = os.path.abspath(workspace_path)
+    builder = UnifiedKBBuilder(workspace_path=target_dir)
+    effective_db = (
+        db_path
+        or os.getenv("OM_DB_PATH")
+        or os.getenv("PB_DB_PATH")
+        or (os.path.join(target_dir, ".projectbrain", "kb", "projectbrain_kb.db")
+            if os.path.exists(os.path.join(target_dir, ".projectbrain", "kb", "projectbrain_kb.db"))
+            else None)
+    )
+    if effective_db:
+        from .graphify_engine.store import get_graph_store
+        builder.store = get_graph_store(db_path=effective_db)
+    res = builder.trace_code_and_docs(
+        project_id=project_id,
+        target=target,
+        branch=branch,
+    )
+    print(json.dumps(res.model_dump(), indent=2))
+
+
+def run_kb_coverage(
+    project_id: str = "project-brain",
+    branch: str = "main",
+    workspace_path: str = ".",
+    db_path: Optional[str] = None,
+):
+    import os
+    import json
+    from .graphify_engine.kb_linker import UnifiedKBBuilder
+
+    target_dir = os.path.abspath(workspace_path)
+    builder = UnifiedKBBuilder(workspace_path=target_dir)
+    effective_db = (
+        db_path
+        or os.getenv("OM_DB_PATH")
+        or os.getenv("PB_DB_PATH")
+        or (os.path.join(target_dir, ".projectbrain", "kb", "projectbrain_kb.db")
+            if os.path.exists(os.path.join(target_dir, ".projectbrain", "kb", "projectbrain_kb.db"))
+            else None)
+    )
+    if effective_db:
+        from .graphify_engine.store import get_graph_store
+        builder.store = get_graph_store(db_path=effective_db)
+    res = builder.get_kb_coverage_report(
+        project_id=project_id,
+        branch=branch,
+    )
+    print(json.dumps(res.model_dump(), indent=2))
+
+
 if __name__ == "__main__":
     import sys
     import os
@@ -761,6 +857,37 @@ if __name__ == "__main__":
         tags = sys.argv[5] if len(sys.argv) > 5 else ""
         author = sys.argv[6] if len(sys.argv) > 6 else None
         run_upload_file(project_id, file_path, server_url, tags, author)
+    elif len(sys.argv) > 1 and sys.argv[1] == "build-kb":
+        pos_args = [a for a in sys.argv[2:] if not a.startswith("-")]
+        project_id = pos_args[0] if len(pos_args) > 0 else "project-brain"
+        workspace_path = pos_args[1] if len(pos_args) > 1 else "."
+        branch = _get_flag("--branch", "main")
+        persist_memory = not any(a in sys.argv for a in ["--no-memory"])
+        generate_office = not any(a in sys.argv for a in ["--no-office"])
+        output_dir = _get_flag("--output", None)
+        db_path = _get_flag("--db-path", None)
+        run_build_kb(project_id, workspace_path, branch, persist_memory, generate_office, output_dir, db_path)
+    elif len(sys.argv) > 1 and sys.argv[1] == "kb-trace":
+        pos_args = [a for a in sys.argv[2:] if not a.startswith("-")]
+        if len(pos_args) < 2:
+            print("Usage: python -m projectbrain.main kb-trace <project_id> <target> [--branch B] [--path PATH] [--db-path DB]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        target = pos_args[1]
+        branch = _get_flag("--branch", "main")
+        workspace_path = _get_flag("--path", ".")
+        db_path = _get_flag("--db-path", None)
+        run_kb_trace(project_id, target, branch, workspace_path, db_path)
+    elif len(sys.argv) > 1 and sys.argv[1] == "kb-coverage":
+        pos_args = [a for a in sys.argv[2:] if not a.startswith("-")]
+        if len(pos_args) < 1:
+            print("Usage: python -m projectbrain.main kb-coverage <project_id> [--branch B] [--path PATH] [--db-path DB]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        branch = _get_flag("--branch", "main")
+        workspace_path = _get_flag("--path", ".")
+        db_path = _get_flag("--db-path", None)
+        run_kb_coverage(project_id, branch, workspace_path, db_path)
     else:
         print("ProjectBrain Python SDK / Server")
         print("Usage:")
@@ -772,3 +899,6 @@ if __name__ == "__main__":
         print("  python -m projectbrain.main codegraph-sync <project_id> [url] [path] [branch] [-m] [-u] # Sync local codegraph and memories to server (use -u to upload sqlite db file)")
         print("  python -m projectbrain.main ingest-files <project_id> <dir_path>           # Ingest codebase files into memories")
         print("  python -m projectbrain.main upload-file <project_id> <file_path> [url] [tags] [author] # Upload a document to RAG server")
+        print("  python -m projectbrain.main build-kb [project_id] [path] [--branch B] [--no-memory] [--no-office] [--output DIR] [--db-path DB]")
+        print("  python -m projectbrain.main kb-trace <project_id> <target> [--branch B] [--path PATH] [--db-path DB]")
+        print("  python -m projectbrain.main kb-coverage <project_id> [--branch B] [--path PATH] [--db-path DB]")
