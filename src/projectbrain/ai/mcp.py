@@ -5,6 +5,7 @@ import sqlite3
 import traceback
 import datetime
 import logging
+from typing import Optional, List, Dict, Any, Union, Tuple
 from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger("mcp")
@@ -994,6 +995,25 @@ async def projectbrain_query_codegraph(
                     })
                 else:
                     nodes.append(dict(r))
+
+        if not nodes:
+            try:
+                from ..graphify_engine.store import get_graph_store
+                store = _get_mcp_graph_store()
+                proj_name = uid.split(":")[0] if ":" in uid else uid
+                branch_name = uid.split(":")[1] if ":" in uid else "main"
+                vis = store.to_legacy_visjs(project_id=proj_name, branch_name=branch_name, query=query, kinds=kinds)
+                if vis.get("nodes"):
+                    cursor.close()
+                    return json.dumps({
+                        "project_id": uid,
+                        "nodes_count": len(vis["nodes"]),
+                        "edges_count": len(vis["edges"]),
+                        "nodes": vis["nodes"],
+                        "edges": vis["edges"]
+                    }, indent=2)
+            except Exception:
+                pass
                     
         edges = []
         if follow_connections and nodes:
@@ -1039,6 +1059,628 @@ async def projectbrain_query_codegraph(
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error querying codegraph: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# Graphify Engine FastMCP Integration (Hybrid Local / Remote Tools)
+# ---------------------------------------------------------------------------
+
+def is_pb_remote_mode() -> bool:
+    return (
+        os.getenv("PB_MODE", "local").lower() == "remote"
+        or getattr(mem, "mode", "local") == "remote"
+    )
+
+def get_pb_server_url() -> str:
+    url = (
+        os.getenv("PB_URL")
+        or os.getenv("PB_API_URL")
+        or os.getenv("OM_URL")
+        or os.getenv("OM_API_URL")
+        or getattr(mem, "url", "http://localhost:8080")
+    )
+    return str(url).rstrip("/")
+
+def get_pb_api_key() -> Optional[str]:
+    return (
+        os.getenv("PB_API_KEY")
+        or os.getenv("OM_API_KEY")
+        or getattr(mem, "api_key", None)
+    )
+
+def _get_mcp_graph_store():
+    from ..graphify_engine.store import get_graph_store
+    db_path = (
+        os.getenv("PB_GRAPH_DB_PATH")
+        or os.getenv("OM_GRAPH_DB_PATH")
+        or os.getenv("PB_DB_PATH")
+        or os.getenv("OM_DB_PATH")
+    )
+    if not db_path:
+        try:
+            from ..core.config import env
+            db_url = getattr(env, "database_url", "")
+            if db_url.startswith("sqlite:///"):
+                db_path = db_url.replace("sqlite:///", "")
+        except Exception:
+            pass
+    return get_graph_store(db_path=db_path)
+
+def get_hybrid_resolver():
+    from ..graphify_engine.hybrid_resolver import HybridResolver
+    if is_pb_remote_mode():
+        return HybridResolver(remote_url=get_pb_server_url(), api_token=get_pb_api_key())
+    return HybridResolver(store=_get_mcp_graph_store())
+
+@mcp_server.tool(
+    name="projectbrain_sync_graphify",
+    description="Extract AST code graph and document entities via Graphify and synchronize to ProjectBrain local or remote graph store."
+)
+async def projectbrain_sync_graphify(
+    workspace_path: str = ".",
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    scoped_paths: Optional[List[str]] = None,
+    git_dirty_only: bool = False,
+    local_only: bool = False,
+    cluster: bool = True,
+    include_docs: bool = True
+) -> str:
+    """
+    Extract AST code graph and document entities via Graphify and synchronize to ProjectBrain.
+    """
+    try:
+        if not local_only and check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        from ..graphify_engine.extractor import GraphifyExtractor
+        from ..graphify_engine.models import GraphDelta
+        from ..graphify_engine.store import get_graph_store
+
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        extractor = GraphifyExtractor()
+        delta = extractor.extract_workspace(
+            workspace_path=workspace_path,
+            project_id=target_proj,
+            branch=target_branch,
+            scoped_paths=scoped_paths,
+            git_dirty_only=git_dirty_only,
+            include_docs=include_docs,
+        )
+
+        if cluster and delta.nodes:
+            try:
+                delta = extractor.cluster_graph(delta)
+            except Exception as ce:
+                logger.debug(f"Clustering skipped: {ce}")
+
+        # Always save or update local partial graph cache
+        local_file = extractor.save_local_partial_graph(
+            delta,
+            output_dir=os.path.join(workspace_path, ".projectbrain", "local_graph")
+        )
+
+        if local_only:
+            return json.dumps({
+                "status": "cached_local",
+                "project_id": target_proj,
+                "branch": target_branch,
+                "local_path": local_file,
+                "nodes_count": len(delta.nodes),
+                "edges_count": len(delta.edges),
+                "hyperedges_count": len(delta.hyperedges),
+                "partial": bool(scoped_paths or git_dirty_only),
+            }, indent=2)
+
+        is_partial = bool(scoped_paths or git_dirty_only)
+        synced_files_list = [sf["file_path"] if isinstance(sf, dict) else str(sf) for sf in delta.synced_files]
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            api_key = get_pb_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            payload = {
+                "project_id": target_proj,
+                "branch": target_branch,
+                "nodes": [n.to_dict() if hasattr(n, "to_dict") else n.model_dump() for n in delta.nodes],
+                "edges": [e.to_dict() if hasattr(e, "to_dict") else e.model_dump() for e in delta.edges],
+                "hyperedges": [h.to_dict() if hasattr(h, "to_dict") else h.model_dump() for h in delta.hyperedges],
+                "node_tombstones": delta.node_tombstones,
+                "edge_tombstones": delta.edge_tombstones,
+                "hyperedge_tombstones": delta.hyperedge_tombstones,
+                "synced_files": delta.synced_files,
+                "partial": is_partial,
+                "author": os.getenv("USER", "system"),
+                "cluster": False,
+            }
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(f"{server_url}/graphify/sync", json=payload, headers=headers)
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            store = _get_mcp_graph_store()
+            res = store.sync_branch_delta(
+                project_id=target_proj,
+                branch_name=target_branch,
+                delta=delta,
+                partial=is_partial,
+                synced_files=synced_files_list,
+                author=os.getenv("USER", "system"),
+            )
+            return json.dumps(res, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_sync_graphify: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_query_graphify",
+    description="Query ProjectBrain Graphify hybrid graph with actions: query, trace, impact, callers, callees, node, god_nodes, community."
+)
+async def projectbrain_query_graphify(
+    query: str,
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    action: str = "query",
+    target_symbol: Optional[str] = None,
+    mode: str = "bfs",
+    max_hops: int = 3,
+    budget: int = 2500
+) -> str:
+    """
+    Query ProjectBrain Graphify hybrid graph with various graph analytics and traversal actions.
+    """
+    try:
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        resolver = get_hybrid_resolver()
+        act = (action or "query").lower().strip()
+
+        if act == "query":
+            res = resolver.query(
+                project_id=target_proj,
+                query_text=query,
+                branch=target_branch,
+                mode=mode,
+                budget=budget,
+            )
+        elif act == "trace":
+            res = resolver.trace_path(
+                project_id=target_proj,
+                source_id=query,
+                target_id=target_symbol or "",
+                branch=target_branch,
+            )
+        elif act == "impact":
+            res = resolver.get_impact_radius(
+                project_id=target_proj,
+                node_id=query,
+                max_hops=max_hops,
+                branch=target_branch,
+            )
+        elif act == "callers":
+            res = resolver.get_callers(
+                project_id=target_proj,
+                node_id=query,
+                branch=target_branch,
+            )
+        elif act == "callees":
+            res = resolver.get_callees(
+                project_id=target_proj,
+                node_id=query,
+                branch=target_branch,
+            )
+        elif act == "node":
+            res = resolver.get_node_details(
+                project_id=target_proj,
+                node_id=query,
+                branch=target_branch,
+            )
+        elif act == "god_nodes":
+            top_n = max_hops if max_hops > 0 else 10
+            res = resolver.get_god_nodes(
+                project_id=target_proj,
+                branch=target_branch,
+                top_n=top_n,
+            )
+        elif act == "community":
+            comm_id = int(query) if query.isdigit() else 0
+            res = resolver.get_community(
+                project_id=target_proj,
+                community_id=comm_id,
+                branch=target_branch,
+            )
+        else:
+            return f"Error: Unknown action '{action}'. Supported actions: query, trace, impact, callers, callees, node, god_nodes, community."
+
+        return json.dumps(res, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_query_graphify: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_local_graphify_diff",
+    description="Compute structural difference between local uncommitted graph and remote server branch/root overlay."
+)
+async def projectbrain_local_graphify_diff(
+    workspace_path: str = ".",
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    scoped_paths: Optional[List[str]] = None,
+    git_dirty_only: bool = False,
+    refresh_local: bool = True
+) -> str:
+    """
+    Compute structural difference between local uncommitted graph and remote server branch/root overlay.
+    """
+    try:
+        from ..graphify_engine.extractor import GraphifyExtractor
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        extractor = GraphifyExtractor()
+        if refresh_local:
+            delta = extractor.extract_workspace(
+                workspace_path=workspace_path,
+                project_id=target_proj,
+                branch=target_branch,
+                scoped_paths=scoped_paths,
+                git_dirty_only=git_dirty_only,
+            )
+            extractor.save_local_partial_graph(
+                delta,
+                output_dir=os.path.join(workspace_path, ".projectbrain", "local_graph")
+            )
+
+        local_path = os.path.join(workspace_path, ".projectbrain", "local_graph", "partial_graph.json")
+        resolver = get_hybrid_resolver()
+        res = resolver.diff_local_vs_remote(
+            project_id=target_proj,
+            branch=target_branch,
+            local_path=local_path if os.path.exists(local_path) else None,
+        )
+        return json.dumps(res, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_local_graphify_diff: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_hybrid_query",
+    description="Execute 3-tier Hybrid Knowledge Base query combining Graphify structural graph traversal and HSG cognitive memories."
+)
+async def projectbrain_hybrid_query(
+    query: str,
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    local_path: Optional[str] = None,
+    include_memories: bool = True,
+    mode: str = "bfs",
+    budget: int = 2500
+) -> str:
+    """
+    Execute 3-tier Hybrid Knowledge Base query combining Graphify structural graph traversal and HSG cognitive memories.
+    """
+    try:
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        resolver = get_hybrid_resolver()
+        graph_res = resolver.query(
+            project_id=target_proj,
+            query_text=query,
+            branch=target_branch,
+            local_path=local_path,
+            mode=mode,
+            budget=budget,
+        )
+
+        memories = []
+        if include_memories:
+            mem_user_id = f"{target_proj}:{target_branch}" if target_branch and target_branch != "main" and ":" not in target_proj else target_proj
+            try:
+                memories = await mem.search(query=query, user_id=mem_user_id, limit=5)
+            except Exception as me:
+                logger.debug(f"Memory search error in hybrid query: {me}")
+
+        matched_nodes = graph_res.get("nodes", [])
+        linked_doc_chunks = [
+            n for n in matched_nodes
+            if n.get("file_type") == "document" or "chunk_id" in (n.get("metadata") or {})
+        ]
+        output = {
+            "query": query,
+            "project_id": target_proj,
+            "branch": target_branch,
+            "graph_summary": graph_res.get("context_markdown", ""),
+            "matched_nodes": matched_nodes,
+            "linked_doc_chunks": linked_doc_chunks,
+            "traversal_stats": graph_res.get("tier_breakdown", {}),
+            "cognitive_memories_count": len(memories),
+            "cognitive_memories": memories,
+        }
+        return json.dumps(output, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_hybrid_query: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_upload_document",
+    description="Process and ingest multimodal document (.pdf, .docx, .xlsx, .pptx, .csv, .md, images) into Graphify and ProjectBrain memory."
+)
+async def projectbrain_upload_document(
+    file_path: str,
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    author: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    push_to_server: Optional[bool] = None
+) -> str:
+    """
+    Process and ingest multimodal document into Graphify and ProjectBrain memory.
+    """
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        from ..graphify_engine.doc_pipeline import DocumentPipeline
+        from ..graphify_engine.models import GraphDelta
+        from ..graphify_engine.store import get_graph_store
+        from ..memory.hsg import add_hsg_memory
+
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        pipeline = DocumentPipeline()
+        payload = await pipeline.process_file(
+            file_path=file_path,
+            project_id=target_proj,
+            branch=target_branch,
+            author=author,
+            tags=tags,
+        )
+
+        should_push = push_to_server if push_to_server is not None else is_pb_remote_mode()
+        if should_push:
+            res = await pipeline.push_processed_to_server(
+                server_url=get_pb_server_url(),
+                payload=payload,
+                token=get_pb_api_key(),
+            )
+            return json.dumps(res, indent=2)
+        else:
+            doc = payload["document"]
+            effective_user = f"{target_proj}:{target_branch}" if target_branch and target_branch != "main" and ":" not in target_proj else target_proj
+            memories_created = 0
+            for ch in doc.get("chunks", []):
+                content = ch.get("content") or ch.get("text") or ""
+                if not content.strip():
+                    continue
+                chunk_tags = ch.get("tags") or ["document"]
+                tag_str = ",".join(chunk_tags) if isinstance(chunk_tags, list) else str(chunk_tags)
+                await add_hsg_memory(
+                    content=content,
+                    tags=tag_str,
+                    metadata={"filename": doc.get("filename"), "sha256": doc.get("sha256"), "author": author},
+                    user_id=effective_user,
+                )
+                memories_created += 1
+
+            store = _get_mcp_graph_store()
+            delta_dict = payload["graph_delta"]
+            delta = GraphDelta(
+                project_id=target_proj,
+                branch=target_branch,
+                nodes=delta_dict.get("nodes", []),
+                edges=delta_dict.get("edges", []),
+                hyperedges=delta_dict.get("hyperedges", []),
+                node_tombstones=delta_dict.get("node_tombstones", []),
+                edge_tombstones=delta_dict.get("edge_tombstones", []),
+                hyperedge_tombstones=delta_dict.get("hyperedge_tombstones", []),
+                synced_files=delta_dict.get("synced_files", []),
+            )
+            sync_res = store.sync_branch_delta(
+                project_id=target_proj,
+                branch_name=target_branch,
+                delta=delta,
+                partial=True,
+                synced_files=[str(file_path)],
+                author=author or "system",
+            )
+            return json.dumps({
+                "status": "success",
+                "mode": "local",
+                "project_id": target_proj,
+                "branch": target_branch,
+                "memories_created": memories_created,
+                "nodes_upserted": sync_res.get("nodes_upserted", len(delta.nodes)),
+                "edges_upserted": sync_res.get("edges_upserted", len(delta.edges)),
+            }, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_upload_document: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_push_processed_document",
+    description="Directly push pre-extracted document Markdown and Graphify entities to ProjectBrain server or local memory."
+)
+async def projectbrain_push_processed_document(
+    filename: str,
+    markdown_content: str,
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    author: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    server_url: Optional[str] = None
+) -> str:
+    """
+    Directly push pre-extracted document Markdown and Graphify entities to ProjectBrain server or local memory.
+    """
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        from ..graphify_engine.extractor import GraphifyExtractor
+        from ..graphify_engine.models import GraphDelta
+        from ..graphify_engine.store import get_graph_store
+        from ..memory.hsg import add_hsg_memory
+        from ..utils.chunking import chunk_text
+
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch != "main" else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch or "main"
+
+        import hashlib
+        sha256 = hashlib.sha256(markdown_content.encode("utf-8")).hexdigest()
+        extractor = GraphifyExtractor()
+        doc_metadata = {"author": author or "system", "sha256": sha256, "file_type": "document"}
+        delta = extractor.extract_document_graph(
+            file_path=filename,
+            markdown_content=markdown_content,
+            project_id=target_proj,
+            branch=target_branch,
+            metadata=doc_metadata,
+        )
+
+        raw_chunks = chunk_text(markdown_content, tgt=768, ovr=0.1)
+        chunks = [{"content": c["text"], "chunk_id": f"p_{i+1}", "tags": tags or ["document"]} for i, c in enumerate(raw_chunks)]
+
+        payload = {
+            "project_id": target_proj,
+            "branch": target_branch,
+            "document": {
+                "filename": filename,
+                "sha256": sha256,
+                "author": author or "system",
+                "file_type": "document",
+                "markdown_content": markdown_content,
+                "chunks": chunks,
+            },
+            "graph_delta": delta.to_dict() if hasattr(delta, "to_dict") else delta.model_dump(),
+        }
+
+        target_url = server_url or (get_pb_server_url() if is_pb_remote_mode() else None)
+        if target_url:
+            import httpx
+            headers = {"Authorization": f"Bearer {get_pb_api_key()}"} if get_pb_api_key() else {}
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(f"{target_url.rstrip('/')}/sources/push-processed", json=payload, headers=headers)
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            effective_user = f"{target_proj}:{target_branch}" if target_branch and target_branch != "main" and ":" not in target_proj else target_proj
+            memories_created = 0
+            for ch in chunks:
+                await add_hsg_memory(
+                    content=ch["content"],
+                    tags=",".join(ch["tags"]),
+                    metadata={"filename": filename, "sha256": sha256, "author": author},
+                    user_id=effective_user,
+                )
+                memories_created += 1
+
+            store = _get_mcp_graph_store()
+            sync_res = store.sync_branch_delta(
+                project_id=target_proj,
+                branch_name=target_branch,
+                delta=delta,
+                partial=True,
+                synced_files=[filename],
+                author=author or "system",
+            )
+            return json.dumps({
+                "status": "success",
+                "mode": "local",
+                "project_id": target_proj,
+                "branch": target_branch,
+                "memories_created": memories_created,
+                "nodes_upserted": sync_res.get("nodes_upserted", len(delta.nodes)),
+                "edges_upserted": sync_res.get("edges_upserted", len(delta.edges)),
+            }, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_push_processed_document: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_promote_branch_graph",
+    description="Atomically promote branch overlay schema mutations into canonical root schema."
+)
+async def projectbrain_promote_branch_graph(
+    project_id: str,
+    branch: str
+) -> str:
+    """
+    Atomically promote branch overlay schema mutations into canonical root schema.
+    """
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        from ..graphify_engine.store import get_graph_store
+        resolved_proj = resolve_mcp_user_id(project_id)
+        if ":" in resolved_proj:
+            p_parts = resolved_proj.split(":", 1)
+            target_proj = p_parts[0]
+            target_branch = branch if branch else (p_parts[1] or "main")
+        else:
+            target_proj = resolved_proj
+            target_branch = branch
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            headers = {"Authorization": f"Bearer {get_pb_api_key()}"} if get_pb_api_key() else {}
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{server_url}/graphify/promote",
+                    json={"project_id": target_proj, "branch": target_branch},
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            store = _get_mcp_graph_store()
+            res = store.promote_branch_to_root(project_id=target_proj, branch_name=target_branch)
+            return json.dumps(res, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_promote_branch_graph: {str(e)}"
 
 # Dynamically register custom extensions
 try:

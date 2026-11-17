@@ -1,8 +1,9 @@
+import os
 import asyncio
 import httpx
 
 async def main():
-    api_key = "sk-yKYtlrDAXEGvxl0g_mcNRA"
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",

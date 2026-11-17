@@ -9,23 +9,183 @@ POST /sources/webhook/{source}
 """
 from fastapi import APIRouter, Request, HTTPException, File, UploadFile, Form
 from typing import Optional, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+import logging
+
+logger = logging.getLogger("server.routes.sources")
 
 router = APIRouter(prefix="/sources", tags=["sources"])
+
+
+def _get_store():
+    import os
+    from ...graphify_engine.store import get_graph_store
+    db_path = (
+        os.getenv("PB_GRAPH_DB_PATH")
+        or os.getenv("OM_GRAPH_DB_PATH")
+        or os.getenv("PB_DB_PATH")
+        or os.getenv("OM_DB_PATH")
+    )
+    if not db_path:
+        try:
+            from ...core.config import env
+            db_url = getattr(env, "database_url", "")
+            if db_url.startswith("sqlite:///"):
+                db_path = db_url.replace("sqlite:///", "")
+        except Exception:
+            pass
+    return get_graph_store(db_path=db_path)
+
+class PushDocumentRequest(BaseModel):
+    project_id: str = "default"
+    branch: str = "main"
+    document: Dict[str, Any]
+    graph_delta: Optional[Dict[str, Any]] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+@router.post("/push-processed")
+async def push_processed(req: PushDocumentRequest):
+    import os
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
+    try:
+        project_id = req.project_id or "default"
+        branch = req.branch or "main"
+        doc = req.document or {}
+
+        filename = doc.get("filename", "unknown_doc")
+        sha256 = doc.get("sha256", "")
+        author = doc.get("author", "system")
+        file_type = doc.get("file_type", "document")
+        markdown_content = doc.get("markdown_content", "")
+        chunks = doc.get("chunks")
+
+        # Determine effective user_id
+        if ":" in project_id:
+            effective_user_id = project_id
+        elif branch and branch != "main":
+            effective_user_id = f"{project_id}:{branch}"
+        else:
+            effective_user_id = project_id
+
+        # 1. Ingest chunks into HSG memory
+        from ...memory.hsg import add_hsg_memory
+        from ...utils.chunking import chunk_text
+
+        if not chunks and markdown_content:
+            raw_chunks = chunk_text(markdown_content, tgt=768, ovr=0.1)
+            chunks = [{"content": c["text"], "chunk_id": f"p_{i + 1}"} for i, c in enumerate(raw_chunks)]
+
+        memories_created = 0
+        if chunks:
+            for ch in chunks:
+                chunk_text_content = ch.get("content") or ch.get("text") or ""
+                if not chunk_text_content.strip():
+                    continue
+                chunk_tags = ch.get("tags") or ["document", file_type]
+                tag_str = ",".join(chunk_tags) if isinstance(chunk_tags, list) else str(chunk_tags)
+                chunk_meta = {
+                    "source": "push-processed",
+                    "filename": filename,
+                    "sha256": sha256,
+                    "author": author,
+                    "file_type": file_type,
+                    "chunk_id": ch.get("chunk_id"),
+                    "project_id": project_id,
+                    "branch": branch,
+                }
+                await add_hsg_memory(
+                    content=chunk_text_content,
+                    tags=tag_str,
+                    metadata=chunk_meta,
+                    user_id=effective_user_id,
+                )
+                memories_created += 1
+
+        # 2. Ingest GraphDelta into GraphStore
+        from ...graphify_engine.models import GraphDelta
+        from ...graphify_engine.store import get_graph_store
+        from ...graphify_engine.extractor import GraphifyExtractor
+
+        if req.graph_delta and isinstance(req.graph_delta, dict):
+            delta = GraphDelta(
+                project_id=project_id,
+                branch=branch,
+                nodes=req.graph_delta.get("nodes", []),
+                edges=req.graph_delta.get("edges", []),
+                hyperedges=req.graph_delta.get("hyperedges", []),
+                node_tombstones=req.graph_delta.get("node_tombstones", []),
+                edge_tombstones=req.graph_delta.get("edge_tombstones", []),
+                hyperedge_tombstones=req.graph_delta.get("hyperedge_tombstones", []),
+                synced_files=req.graph_delta.get("synced_files", []),
+            )
+        else:
+            extractor = GraphifyExtractor()
+            delta = extractor.extract_document_graph(
+                file_path=filename,
+                markdown_content=markdown_content,
+                project_id=project_id,
+                branch=branch,
+                metadata={"author": author, "sha256": sha256, "file_type": file_type},
+            )
+
+        store = _get_store()
+        sync_res = store.sync_branch_delta(
+            project_id=project_id,
+            branch_name=branch,
+            delta=delta,
+            partial=True,
+            synced_files=[filename],
+            author=author,
+        )
+
+        schema_used = sync_res.get("schema_name") or sync_res.get("schema_used") or ("root" if store.is_root_branch(branch) else f"branch_{branch}")
+        nodes_upserted = sync_res.get("nodes_upserted", len(delta.nodes))
+        edges_upserted = sync_res.get("edges_upserted", len(delta.edges))
+
+        return {
+            "status": "success",
+            "project_id": project_id,
+            "branch": branch,
+            "schema_used": schema_used,
+            "nodes_upserted": nodes_upserted,
+            "edges_upserted": edges_upserted,
+            "memories_created": memories_created,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Failed to push processed document: {str(e)}")
+
 
 @router.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
     project_id: str = Form("default"),
+    branch: str = Form("main"),
     tags: Optional[str] = Form(""),
-    author: Optional[str] = Form(None)
+    author: Optional[str] = Form(None),
+    request: Request = None,
 ):
     import os
+    from pathlib import Path
     if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
         raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
+
+    safe_name = Path(file.filename or "uploaded_file").name
+    max_mb = float(os.getenv("PB_MAX_UPLOAD_MB", "50"))
+    max_bytes = int(max_mb * 1024 * 1024)
+
+    content_len = request.headers.get("content-length") if request else None
+    if content_len and int(content_len) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"Payload Too Large: Maximum allowed upload is {max_mb}MB")
+
     try:
-        file_bytes = await file.read()
-        filename = file.filename
+        chunk = await file.read(max_bytes + 1)
+        if len(chunk) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"Payload Too Large: Maximum allowed upload is {max_mb}MB")
+        file_bytes = chunk
+        filename = safe_name
         
         # 1. Parse document to markdown using our utility
         from ...utils.doc_parser import parse_document
@@ -46,25 +206,64 @@ async def upload_document(
             "source": "upload",
             "filename": filename,
             "size": len(file_bytes),
-            "project_id": project_id
+            "project_id": project_id,
+            "branch": branch,
         }
         if author:
             meta["author"] = author
+
+        user_target = project_id
+        if ":" not in user_target and branch and branch != "main":
+            user_target = f"{project_id}:{branch}"
             
         res = await mem.add(
             content=f"Document: {filename}\n\n{markdown_content}",
-            user_id=project_id,
+            user_id=user_target,
             meta=meta,
             tags=tag_list
         )
+
+        # 3. Extract and sync document graph into GraphStore branch overlay
+        nodes_upserted = 0
+        edges_upserted = 0
+        try:
+            from ...graphify_engine.extractor import GraphifyExtractor
+            from ...graphify_engine.store import get_graph_store
+            extractor = GraphifyExtractor()
+            delta = extractor.extract_document_graph(
+                file_path=filename,
+                markdown_content=markdown_content,
+                project_id=project_id,
+                branch=branch,
+                metadata=meta,
+            )
+            store = _get_store()
+            sync_res = store.sync_branch_delta(
+                project_id=project_id,
+                branch_name=branch,
+                delta=delta,
+                partial=True,
+                synced_files=[filename],
+                author=author or "system",
+            )
+            nodes_upserted = sync_res.get("nodes_upserted", len(delta.nodes))
+            edges_upserted = sync_res.get("edges_upserted", len(delta.edges))
+        except Exception as ge:
+            logger.warning(f"Graphify extraction for uploaded file {filename} skipped or failed: {ge}")
         
         return {
             "status": "success",
             "filename": filename,
             "project_id": project_id,
+            "branch": branch,
             "memory_id": res.get("root_memory_id") or res.get("id"),
-            "tags": tag_list
+            "tags": tag_list,
+            "graphify_synced": True,
+            "nodes_upserted": nodes_upserted,
+            "edges_upserted": edges_upserted,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Failed to upload and parse document: {str(e)}")
 

@@ -5,7 +5,7 @@ import time
 import logging
 from pathlib import Path
 from ..core.config import env
-from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth
+from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth, graphify
 
 logger = logging.getLogger("server")
 
@@ -40,7 +40,7 @@ class SSEFilter:
                             allowed_list = []
                             if self.allowed_tools_str != "*":
                                 allowed_list = [t.strip() for t in self.allowed_tools_str.split(",") if t.strip()]
-                            write_keywords = ["store", "delete", "sync", "ingest", "register", "reinforce"]
+                            write_keywords = ["store", "delete", "sync", "ingest", "register", "reinforce", "push", "promote", "upload"]
                             
                             for tool in tools:
                                 tool_name = tool.get("name", "")
@@ -231,7 +231,7 @@ def create_app() -> FastAPI:
                         
                 # Check read-only operations for reader role
                 if role == "reader":
-                    write_keywords = ["store", "delete", "sync", "ingest", "register", "reinforce"]
+                    write_keywords = ["store", "delete", "sync", "ingest", "register", "reinforce", "push", "promote", "upload"]
                     is_write_tool = any(kw in tool_name.lower() for kw in write_keywords)
                     if is_write_tool:
                         from fastapi.responses import JSONResponse
@@ -257,7 +257,7 @@ def create_app() -> FastAPI:
                             allowed_list = []
                             if allowed_tools_str != "*":
                                 allowed_list = [t.strip() for t in allowed_tools_str.split(",") if t.strip()]
-                            write_keywords = ["store", "delete", "sync", "ingest", "register", "reinforce"]
+                            write_keywords = ["store", "delete", "sync", "ingest", "register", "reinforce", "push", "promote", "upload"]
                             for tool in tools:
                                 tool_name = tool.get("name", "")
                                 short_tool_name = tool_name.split("-", 1)[1] if "-" in tool_name else tool_name
@@ -325,6 +325,7 @@ def create_app() -> FastAPI:
     app.include_router(codegraph.router, prefix="/codegraph", tags=["codegraph"])
     app.include_router(auth.router, prefix="/auth", tags=["auth"])
     app.include_router(sources.router)
+    app.include_router(graphify.router)
     app.include_router(pm.router, prefix="/pm", tags=["pm"])
 
     # Mount FastMCP SSE app and Streamable HTTP app
