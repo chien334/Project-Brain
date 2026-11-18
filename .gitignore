@@ -28,4 +28,6 @@ cloned_repos/
 *.db
 *.db-shm
 *.db-wal
+tmp_test.db
 projectbrain.db-shm
+graphify-out/
