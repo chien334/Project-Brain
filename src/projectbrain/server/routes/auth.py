@@ -7,6 +7,7 @@ from ...core.db import db
 
 router = APIRouter(tags=["auth"])
 
+
 def _mask_token(token: str) -> str:
     """Mask middle characters of API token for list views."""
     if not token:
@@ -15,45 +16,84 @@ def _mask_token(token: str) -> str:
         return "********"
     return token[:4] + "*" * (len(token) - 8) + token[-4:]
 
-def _check_admin_auth(request: Optional[Request]) -> bool:
-    """Check if the incoming request provides a valid admin Bearer token."""
+
+def extract_bearer_token(request: Optional[Request]) -> Optional[str]:
+    """Extract Bearer token from Authorization header or query parameters."""
     if not request:
-        return False
+        return None
     auth_header = request.headers.get("Authorization", "")
     token = None
-    if auth_header.startswith("Bearer "):
-        token = auth_header.replace("Bearer ", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
     if not token:
-        token = request.query_params.get("token")
+        token = request.query_params.get("token") or request.query_params.get("api_key")
+        if token:
+            token = token.strip()
+    return token or None
+
+
+def get_authenticated_account(request: Optional[Request]) -> Optional[Dict[str, Any]]:
+    """Look up authenticated MCP account by Bearer/query token."""
+    token = extract_bearer_token(request)
     if not token:
-        return False
+        return None
 
     db.connect()
     try:
         cursor = db.conn.cursor()
-        sql = db.translate_query("SELECT role FROM mcp_accounts WHERE token = ?;")
+        sql = db.translate_query("SELECT username, role, allowed_tools FROM mcp_accounts WHERE token = ?;")
         cursor.execute(sql, (token,))
         row = cursor.fetchone()
         cursor.close()
-        if row:
-            role = row[0] if not isinstance(row, dict) else row.get("role")
-            if role == "admin":
-                return True
+        if not row:
+            return None
+        if isinstance(row, dict):
+            return {
+                "username": row.get("username"),
+                "role": row.get("role"),
+                "allowed_tools": row.get("allowed_tools"),
+            }
+        try:
+            if hasattr(row, "keys"):
+                d = dict(row)
+                return {
+                    "username": d.get("username"),
+                    "role": d.get("role"),
+                    "allowed_tools": d.get("allowed_tools"),
+                }
+        except Exception:
+            pass
+        return {
+            "username": row[0],
+            "role": row[1],
+            "allowed_tools": row[2],
+        }
     except Exception:
-        pass
-    return False
+        return None
+
+
+def _check_admin_auth(request: Optional[Request]) -> bool:
+    """Check if the incoming request provides a valid admin Bearer token."""
+    account = get_authenticated_account(request)
+    return bool(account and account.get("role") == "admin")
+
 
 def _enforce_rest_auth_if_configured(request: Optional[Request]) -> None:
-    """Enforce admin authorization on auth routes if PB_REQUIRE_REST_AUTH is set."""
+    """Enforce admin authorization on admin routes if PB_REQUIRE_REST_AUTH is set."""
     if os.getenv("PB_REQUIRE_REST_AUTH", "false").lower() in ("true", "1", "yes"):
-        if not _check_admin_auth(request):
+        account = get_authenticated_account(request)
+        if not account:
             raise HTTPException(status_code=401, detail="Authentication required: Valid admin token required.")
+        if account.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Permission denied: Admin role required.")
+
 
 class AccountRequest(BaseModel):
     username: str
     token: Optional[str] = None
-    role: str # 'admin', 'collaborator', 'reader'
-    allowed_tools: Optional[str] = "*" # Comma-separated list or '*'
+    role: str  # 'admin', 'collaborator', 'reader'
+    allowed_tools: Optional[str] = "*"  # Comma-separated list or '*'
+
 
 def init_default_admin():
     db.connect()
@@ -78,11 +118,13 @@ def init_default_admin():
     except Exception as e:
         print(f"[AUTH] Failed to initialize default admin account: {e}")
 
+
 # Automatically initialize admin account when route is loaded
 try:
     init_default_admin()
 except Exception:
     pass
+
 
 @router.get("/accounts")
 async def list_accounts(request: Request = None):
@@ -116,16 +158,17 @@ async def list_accounts(request: Request = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load accounts: {str(e)}")
 
+
 @router.post("/accounts")
 async def create_or_update_account(req: AccountRequest, request: Request = None):
     _enforce_rest_auth_if_configured(request)
     db.connect()
     ts = int(time.time())
-    
+
     # Generate token if not provided
     import secrets
     token = req.token or f"pb_tok_{secrets.token_hex(12)}"
-    
+
     # Validate role
     role = req.role.lower().strip()
     if role not in ["admin", "collaborator", "reader"]:
@@ -164,9 +207,12 @@ async def create_or_update_account(req: AccountRequest, request: Request = None)
         raise
     except Exception as e:
         if db.conn:
-            try: db.conn.rollback()
-            except: pass
+            try:
+                db.conn.rollback()
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=f"Failed to save account: {str(e)}")
+
 
 @router.delete("/accounts/{username}")
 async def delete_account(username: str, request: Request = None):
@@ -185,46 +231,36 @@ async def delete_account(username: str, request: Request = None):
         raise
     except Exception as e:
         if db.conn:
-            try: db.conn.rollback()
-            except: pass
+            try:
+                db.conn.rollback()
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
 
+
 @router.get("/tools")
-async def list_available_tools():
+async def list_available_tools(request: Request = None):
+    _enforce_rest_auth_if_configured(request)
     try:
         from ...ai.mcp import mcp_server
         tools = mcp_server._tool_manager.list_tools()
         return {"tools": [t.name for t in tools]}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch tools: {str(e)}")
 
+
 @router.get("/verify")
 async def verify_token(request: Request):
-    auth_header = request.headers.get("Authorization", "")
-    token = None
-    if auth_header.startswith("Bearer "):
-        token = auth_header.replace("Bearer ", "").strip()
-    if not token:
-        token = request.query_params.get("token")
-        
+    token = extract_bearer_token(request)
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required. Please provide a token.")
-        
-    db.connect()
+
     try:
-        cursor = db.conn.cursor()
-        sql = db.translate_query("SELECT username, role, allowed_tools FROM mcp_accounts WHERE token = ?;")
-        cursor.execute(sql, (token,))
-        row = cursor.fetchone()
-        cursor.close()
-        
-        if not row:
+        account = get_authenticated_account(request)
+        if not account:
             raise HTTPException(status_code=401, detail="Invalid token. Access denied.")
-            
-        if db.is_postgres:
-            account = {"username": row[0], "role": row[1], "allowed_tools": row[2]}
-        else:
-            account = dict(row)
         return {"status": "success", "account": account}
     except HTTPException:
         raise

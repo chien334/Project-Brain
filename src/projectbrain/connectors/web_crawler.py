@@ -4,9 +4,107 @@ requires: httpx, beautifulsoup4
 no auth required for public urls
 """
 from typing import List, Dict, Optional, Set
+import ipaddress
 import os
+import socket
 from urllib.parse import urljoin, urlparse
 from .base import base_connector
+
+
+def _check_public_ip(ip_str: str, url: str) -> None:
+    cleaned = ip_str.split("%", 1)[0] if "%" in ip_str else ip_str
+    addr = ipaddress.ip_address(cleaned)
+    candidates = [addr]
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        candidates.append(addr.ipv4_mapped)
+
+    for candidate in candidates:
+        if (
+            candidate.is_private
+            or candidate.is_loopback
+            or candidate.is_link_local
+            or candidate.is_multicast
+            or candidate.is_reserved
+            or candidate.is_unspecified
+        ):
+            raise ValueError(
+                f"SSRF protection blocked URL '{url}': resolved IP '{cleaned}' is non-public."
+            )
+
+
+def _validate_public_url(url: str) -> str:
+    """Validate that a crawl target URL uses http/https and resolves strictly to public IPs."""
+    if not url or not isinstance(url, str):
+        raise ValueError("Invalid URL: URL must be a non-empty string.")
+
+    parsed = urlparse(url.strip())
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Blocked URL '{url}': scheme must be http or https.")
+
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        raise ValueError(f"Blocked URL '{url}': missing hostname.")
+
+    if os.getenv("PB_ALLOW_PRIVATE_CRAWL", "false").lower() in ("true", "1", "yes"):
+        return url
+
+    if (
+        hostname == "localhost"
+        or hostname.endswith(".localhost")
+        or hostname.endswith(".local")
+        or hostname.endswith(".internal")
+    ):
+        raise ValueError(f"SSRF protection blocked URL '{url}': internal hostname '{hostname}' is not permitted.")
+
+    # Direct IP literal check before DNS resolution
+    try:
+        _check_public_ip(hostname, url)
+        return url
+    except ValueError as ve:
+        if "SSRF protection blocked URL" in str(ve):
+            raise
+    except Exception:
+        pass
+
+    port = parsed.port or (443 if scheme == "https" else 80)
+    try:
+        addr_infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Blocked URL '{url}': failed to resolve hostname '{hostname}' ({exc}).") from exc
+
+    if not addr_infos:
+        raise ValueError(f"Blocked URL '{url}': hostname '{hostname}' resolved to no addresses.")
+
+    for _, _, _, _, sockaddr in addr_infos:
+        if sockaddr and len(sockaddr) >= 1:
+            _check_public_ip(str(sockaddr[0]), url)
+
+    return url
+
+
+async def _safe_fetch_with_redirects(
+    client: "httpx.AsyncClient",
+    url: str,
+    headers: Dict[str, str],
+    max_redirects: int = 5,
+) -> "httpx.Response":
+    """Fetch URL with follow_redirects disabled, validating every redirect hop via _validate_public_url."""
+    current_url = url
+    for _ in range(max_redirects + 1):
+        _validate_public_url(current_url)
+        resp = await client.get(current_url, headers=headers, follow_redirects=False)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location")
+            if not location:
+                return resp
+            next_url = urljoin(current_url, location)
+            _validate_public_url(next_url)
+            current_url = next_url
+            continue
+        return resp
+    raise ValueError(f"Too many redirects (> {max_redirects}) while fetching '{url}'.")
+
 
 class web_crawler_connector(base_connector):
     """connector for crawling web pages"""
@@ -36,6 +134,8 @@ class web_crawler_connector(base_connector):
         if not start_url:
             raise ValueError("start_url is required")
 
+        _validate_public_url(start_url)
+
         try:
             import httpx
             from bs4 import BeautifulSoup
@@ -47,8 +147,9 @@ class web_crawler_connector(base_connector):
 
         base_domain = urlparse(start_url).netloc
         to_visit = [(start_url, 0)]
+        headers = {"User-Agent": "ProjectBrain-Crawler/1.0 (compatible)"}
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
             while to_visit and len(self.crawled) < self.max_pages:
                 url, depth = to_visit.pop(0)
 
@@ -61,9 +162,7 @@ class web_crawler_connector(base_connector):
                 self.visited.add(url)
 
                 try:
-                    resp = await client.get(url, headers={
-                        "User-Agent": "ProjectBrain-Crawler/1.0 (compatible)"
-                    })
+                    resp = await _safe_fetch_with_redirects(client, url, headers=headers)
 
                     if resp.status_code != 200:
                         continue
@@ -87,10 +186,14 @@ class web_crawler_connector(base_connector):
                             href = link["href"]
                             full_url = urljoin(url, href)
                             parsed = urlparse(full_url)
-                            if parsed.netloc == base_domain:
+                            if (parsed.scheme or "").lower() in ("http", "https") and parsed.netloc == base_domain:
                                 clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
                                 if clean_url not in self.visited:
-                                    to_visit.append((clean_url, depth + 1))
+                                    try:
+                                        _validate_public_url(clean_url)
+                                        to_visit.append((clean_url, depth + 1))
+                                    except ValueError:
+                                        continue
 
                 except Exception as e:
                     print(f"[crawler] failed to fetch {url}: {e}")
@@ -104,16 +207,17 @@ class web_crawler_connector(base_connector):
 
         item_id is the url to fetch
         """
+        _validate_public_url(item_id)
+
         try:
             import httpx
             from bs4 import BeautifulSoup
         except ImportError:
             raise ImportError("pip install httpx beautifulsoup4")
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            resp = await client.get(item_id, headers={
-                "User-Agent": "ProjectBrain-Crawler/1.0 (compatible)"
-            })
+        headers = {"User-Agent": "ProjectBrain-Crawler/1.0 (compatible)"}
+        async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
+            resp = await _safe_fetch_with_redirects(client, item_id, headers=headers)
             resp.raise_for_status()
 
             soup = BeautifulSoup(resp.text, "html.parser")
