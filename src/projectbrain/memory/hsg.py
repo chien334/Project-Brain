@@ -1,11 +1,13 @@
 import time
 import math
 import asyncio
+import hashlib
 import json
 import re
 import random
 import numpy as np
 import uuid
+from collections import OrderedDict
 from typing import List, Dict, Any, Optional, Set, Tuple
 
 from ..core.db import q, db, transaction
@@ -166,26 +168,14 @@ def compute_simhash(text: str) -> str:
     tokens = canonical_token_set(text)
     if not tokens:
         return stable_text_fallback_hash(text)
-    hashes = []
-    for t in tokens:
-        h = 0
-        for c in t:
-            h = (h << 5) - h + ord(c)
-            h = h & 0xffffffff
-        h = 0
-        for c in t:
-             val = (h << 5) - h + ord(c)
-             val = val & 0xffffffff
-             if val & 0x80000000: val = -((val ^ 0xffffffff) + 1)
-             h = val
-        hashes.append(h)
-
     vec = [0] * 64
-    for h in hashes:
+    for t in tokens:
+        h = int.from_bytes(hashlib.blake2b(t.encode("utf-8"), digest_size=8).digest(), "big")
         for i in range(64):
-            bit = 1 << (i % 32)
-            if h & bit: vec[i] += 1
-            else: vec[i] -= 1
+            if h & (1 << i):
+                vec[i] += 1
+            else:
+                vec[i] -= 1
 
     res_hash = ""
     for i in range(0, 64, 4):
@@ -306,16 +296,20 @@ async def create_inter_mem_waypoints(new_id: str, prim_sec: str, new_vec: List[f
     nm = np.array(new_vec, dtype=np.float32)
 
     for vr in vecs:
-        if vr["id"] == new_id: continue
-        ex_vec = np.array(vr["vector"], dtype=np.float32)
+        vr_id = vr["id"] if isinstance(vr, dict) else vr.id
+        if vr_id == new_id: continue
+        vr_vec = vr["vector"] if isinstance(vr, dict) else vr.vector
+        ex_vec = np.array(vr_vec, dtype=np.float32)
+        if ex_vec.shape != nm.shape:
+            continue
         sim = cos_sim(nm, ex_vec)
 
         if sim >= thresh:
             uid = user_id or "anonymous"
             db.execute("INSERT OR REPLACE INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?)",
-                       (new_id, vr["id"], uid, wt, ts, ts))
+                       (new_id, vr_id, uid, wt, ts, ts))
             db.execute("INSERT OR REPLACE INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?)",
-                       (vr["id"], new_id, uid, wt, ts, ts))
+                       (vr_id, new_id, uid, wt, ts, ts))
     db.commit()
 
 async def create_contextual_waypoints(mem_id: str, rel_ids: List[str], base_wt: float = 0.3, user_id: Optional[str] = None):
@@ -377,14 +371,16 @@ async def calc_multi_vec_fusion_score(mid: str, qe: Dict[str, List[float]], w: D
     return s / tot if tot > 0 else 0.0
 
 async def add_hsg_memory(content: str, tags: Optional[str] = None, metadata: Any = None, user_id: Optional[str] = None) -> Dict[str, Any]:
+    uid = user_id or "anonymous"
     simhash = compute_simhash(content)
-    existing = db.fetchone("SELECT * FROM memories WHERE simhash=? ORDER BY salience DESC LIMIT 1", (simhash,))
+    existing = db.fetchone("SELECT * FROM memories WHERE simhash=? AND user_id=? ORDER BY salience DESC LIMIT 1", (simhash, uid))
 
     if existing and hamming_dist(simhash, existing["simhash"]) <= 3:
         now = int(time.time()*1000)
         boost = min(1.0, (existing["salience"] or 0) + 0.15)
         db.execute("UPDATE memories SET last_seen_at=?, salience=?, updated_at=? WHERE id=?", (now, boost, now, existing["id"]))
         db.commit()
+        invalidate_query_cache()
         return {
             "id": existing["id"],
             "primary_sector": existing["primary_sector"],
@@ -453,6 +449,7 @@ async def add_hsg_memory(content: str, tags: Optional[str] = None, metadata: Any
         await create_single_waypoint(mid, mean_vec, now, user_id)
         if user_id:
             await update_user_summary(user_id)
+        invalidate_query_cache()
         return {
             "id": mid,
             "content": content,
@@ -463,8 +460,13 @@ async def add_hsg_memory(content: str, tags: Optional[str] = None, metadata: Any
         }
     except Exception as e:
         raise e
-cache = {}
+
+MAX_CACHE_SIZE = 512
+cache: OrderedDict = OrderedDict()
 TTL = 60000
+
+def invalidate_query_cache() -> None:
+    cache.clear()
 
 async def expand_via_waypoints(ids: List[str], max_exp: int = 10):
     exp = []
@@ -493,15 +495,19 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
     start_q = time.time()
     inc_q()
     try:
-        cache_key = f"{qt}:{k}:{json.dumps(f)}"
+        cache_key = f"{qt}:{k}:{json.dumps(f, sort_keys=True, default=str)}"
         if cache_key in cache:
             entry = cache[cache_key]
-            if time.time()*1000 - entry["t"] < TTL: return entry["r"]
+            if time.time()*1000 - entry["t"] < TTL:
+                cache.move_to_end(cache_key)
+                return entry["r"]
+            cache.pop(cache_key, None)
 
         qc = classify_content(qt)
         qtk = canonical_token_set(qt)
 
-        ss = f.get("sectors") or list(SECTOR_CONFIGS.keys())
+        f_dict = f or {}
+        ss = f_dict.get("sectors") or list(SECTOR_CONFIGS.keys())
         if not ss: ss = ["semantic"]
 
         qe = await embed_query_for_all_sectors(qt, ss)
@@ -516,7 +522,7 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
         sr = {}
         for s in ss:
             qv = qe[s]
-            res = await store.search(qv, s, k*3, {"user_id": f.get("user_id")})
+            res = await store.search(qv, s, k*3, {"user_id": f_dict.get("user_id")})
             sr[s] = res
 
         all_sims = []
@@ -643,6 +649,9 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
              await on_query_hit(r["id"], r["primary_sector"], lambda t: embed_for_sector(t, r["primary_sector"]))
 
         cache[cache_key] = {"r": top, "t": time.time()*1000}
+        cache.move_to_end(cache_key)
+        while len(cache) > MAX_CACHE_SIZE:
+            cache.popitem(last=False)
         return top
 
     finally:

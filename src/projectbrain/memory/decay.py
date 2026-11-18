@@ -132,7 +132,7 @@ async def apply_decay():
     tier_counts = {"hot": 0, "warm": 0, "cold": 0}
 
     for seg in segments:
-        rows = db.fetchall("SELECT id,content,summary,salience,decay_lambda,last_seen_at,updated_at,primary_sector,feedback_score as coactivations FROM memories WHERE segment=?", (seg,))
+        rows = db.fetchall("SELECT id,content,salience,decay_lambda,last_seen_at,updated_at,primary_sector,feedback_score as coactivations FROM memories WHERE segment=?", (seg,))
 
         decay_ratio = env.decay_ratio or 0.03
         batch_sz = max(1, int(len(rows) * decay_ratio))
@@ -170,7 +170,6 @@ async def apply_decay():
                 sector = dict_m["primary_sector"] or "semantic"
                 fp = fingerprint_mem(dict_m)
                 await store.storeVector(dict_m["id"], sector, fp["vector"], len(fp["vector"]))
-                db.execute("UPDATE memories SET summary=? WHERE id=?", (fp["summary"], dict_m["id"]))
                 tot_fp += 1
                 changed = True
 
@@ -196,14 +195,13 @@ async def on_query_hit(mem_id: str, sector: str, reembed_fn = None):
         vec_row = await store.getVector(mem_id, sector)
         if vec_row and vec_row.vector and len(vec_row.vector) <= 64:
              try:
-                 base = m["summary"] or m["content"] or ""
+                 base = m.get("summary") or m.get("content") or ""
                  new_vec = await reembed_fn(base)
                  await store.storeVector(mem_id, sector, new_vec, len(new_vec))
                  updated = True
              except Exception:
                  pass
     if cfg.reinforce_on_query:
-        new_sal = min(1.0, (m["salience"] or 0.5) + 0.15)
         new_sal = min(1.0, (m["salience"] or 0.5) + 0.5)
 
         db.execute("UPDATE memories SET salience=?, last_seen_at=? WHERE id=?", (new_sal, int(time.time()*1000), mem_id))

@@ -137,7 +137,7 @@ async def reflection_loop():
 
 def start_reflection():
     global _timer_task
-    if not env.get("auto_reflect", True) or _timer_task: return
+    if not getattr(env, "auto_reflect", True) or _timer_task: return
     _timer_task = asyncio.create_task(reflection_loop())
     print(f"[REFLECT] Started: every {env.reflect_interval or 10}m")
 

@@ -3,7 +3,8 @@ import os
 import sys
 from typing import List, Dict, Optional, Any
 from .core.db import db, q
-from .memory.hsg import hsg_query, add_hsg_memory
+from .core.vector_store import vector_store
+from .memory.hsg import hsg_query, add_hsg_memory, invalidate_query_cache
 from .ops.ingest import ingest_document
 from .openai_handler import OpenAIRegistrar
 
@@ -99,8 +100,11 @@ class Memory:
             async with httpx.AsyncClient() as client:
                 resp = await client.delete(f"{self.url}/memory/{memory_id}", headers=headers)
                 resp.raise_for_status()
+            invalidate_query_cache()
         else:
+            await vector_store.deleteVectors(memory_id)
             q.del_mem(memory_id)
+            invalidate_query_cache()
 
     async def delete_all(self, user_id: str = None):
         uid = user_id or self.default_user
@@ -114,9 +118,17 @@ class Memory:
                     headers=headers
                 )
                 resp.raise_for_status()
+            invalidate_query_cache()
         else:
             if uid:
+                if "%" in uid or "_" in uid:
+                    rows = db.fetchall("SELECT id FROM memories WHERE user_id LIKE ?", (uid,))
+                else:
+                    rows = db.fetchall("SELECT id FROM memories WHERE user_id=?", (uid,))
+                for r in rows:
+                    await vector_store.deleteVectors(r["id"])
                 q.del_mem_by_user(uid)
+            invalidate_query_cache()
 
     def history(self, user_id: str = None, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
         uid = user_id or self.default_user
@@ -768,6 +780,40 @@ def run_kb_coverage(
     print(json.dumps(res.model_dump(), indent=2))
 
 
+_CLI_VALUE_FLAGS = frozenset({
+    "--branch",
+    "--url",
+    "--scoped",
+    "--base",
+    "--target",
+    "--path",
+    "--author",
+    "--output",
+    "--db-path",
+})
+
+
+def _get_positional_args(argv_slice: List[str], value_flags: Optional[Any] = None) -> List[str]:
+    flags_with_values = set(value_flags) if value_flags is not None else _CLI_VALUE_FLAGS
+    pos: List[str] = []
+    i = 0
+    n = len(argv_slice)
+    while i < n:
+        arg = argv_slice[i]
+        if arg in flags_with_values:
+            if i + 1 < n and not argv_slice[i + 1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        pos.append(arg)
+        i += 1
+    return pos
+
+
 if __name__ == "__main__":
     import sys
     import os
@@ -787,12 +833,12 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "mcp":
         run_mcp()
     elif len(sys.argv) > 1 and sys.argv[1] == "graphify-sync":
-        if len(sys.argv) < 3:
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
             print("Usage: python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--url URL] [--scoped P1,P2] [--dirty] [--local-only]")
             sys.exit(1)
-        project_id = sys.argv[2]
-        pos_args = [a for a in sys.argv[3:] if not a.startswith("-")]
-        workspace_path = pos_args[0] if pos_args else "."
+        project_id = pos_args[0]
+        workspace_path = pos_args[1] if len(pos_args) > 1 else _get_flag("--path", ".")
         branch = _get_flag("--branch", "main")
         server_url = _get_flag("--url", None)
         scoped_raw = _get_flag("--scoped", None)
@@ -801,10 +847,11 @@ if __name__ == "__main__":
         local_only = any(a in sys.argv for a in ["--local-only", "-l"])
         run_graphify_sync(project_id, workspace_path, branch, server_url, scoped_paths, git_dirty, local_only)
     elif len(sys.argv) > 1 and sys.argv[1] == "graphify-diff":
-        if len(sys.argv) < 3:
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
             print("Usage: python -m projectbrain.main graphify-diff <project_id> [--base main] [--target branch] [--local] [--path .] [--url URL]")
             sys.exit(1)
-        project_id = sys.argv[2]
+        project_id = pos_args[0]
         base_branch = _get_flag("--base", "main")
         target_branch = _get_flag("--target", None)
         local = any(a in sys.argv for a in ["--local", "-l"])
@@ -812,33 +859,29 @@ if __name__ == "__main__":
         server_url = _get_flag("--url", None)
         run_graphify_diff(project_id, base_branch, target_branch, local, workspace_path, server_url)
     elif len(sys.argv) > 1 and sys.argv[1] == "upload-doc":
-        if len(sys.argv) < 4:
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 2:
             print("Usage: python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--url URL] [--author A]")
             sys.exit(1)
-        project_id = sys.argv[2]
-        file_path = sys.argv[3]
+        project_id = pos_args[0]
+        file_path = pos_args[1]
         branch = _get_flag("--branch", "main")
         server_url = _get_flag("--url", None)
         author = _get_flag("--author", None)
         run_upload_doc(project_id, file_path, branch, server_url, author)
     elif len(sys.argv) > 1 and sys.argv[1] == "codegraph-sync":
-        if len(sys.argv) < 3:
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
             print("Usage: python -m projectbrain.main codegraph-sync <project_id> [server_url] [project_path] [branch]")
             sys.exit(1)
-        project_id = sys.argv[2]
-        server_url = sys.argv[3] if len(sys.argv) > 3 else None
-        project_path = sys.argv[4] if len(sys.argv) > 4 else None
-        branch = sys.argv[5] if len(sys.argv) > 5 else None
-        
+        project_id = pos_args[0]
+        server_url = pos_args[1] if len(pos_args) > 1 else _get_flag("--url", None)
+        project_path = pos_args[2] if len(pos_args) > 2 else _get_flag("--path", None)
+        branch = pos_args[3] if len(pos_args) > 3 else _get_flag("--branch", None)
+
         sync_memories = any(arg in sys.argv for arg in ["--sync-memories", "-m"])
         upload_db = any(arg in sys.argv for arg in ["--upload-db", "-u"])
-        
-        # Filter out flags from positional arguments
-        flags = ["--sync-memories", "-m", "--upload-db", "-u"]
-        if server_url in flags: server_url = None
-        if project_path in flags: project_path = None
-        if branch in flags: branch = None
-        
+
         run_codegraph_sync(project_id, server_url, project_path, branch, sync_memories, upload_db)
     elif len(sys.argv) > 1 and sys.argv[1] == "ingest-files":
         if len(sys.argv) < 4:
@@ -858,9 +901,9 @@ if __name__ == "__main__":
         author = sys.argv[6] if len(sys.argv) > 6 else None
         run_upload_file(project_id, file_path, server_url, tags, author)
     elif len(sys.argv) > 1 and sys.argv[1] == "build-kb":
-        pos_args = [a for a in sys.argv[2:] if not a.startswith("-")]
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         project_id = pos_args[0] if len(pos_args) > 0 else "project-brain"
-        workspace_path = pos_args[1] if len(pos_args) > 1 else "."
+        workspace_path = pos_args[1] if len(pos_args) > 1 else _get_flag("--path", ".")
         branch = _get_flag("--branch", "main")
         persist_memory = not any(a in sys.argv for a in ["--no-memory"])
         generate_office = not any(a in sys.argv for a in ["--no-office"])
@@ -868,7 +911,7 @@ if __name__ == "__main__":
         db_path = _get_flag("--db-path", None)
         run_build_kb(project_id, workspace_path, branch, persist_memory, generate_office, output_dir, db_path)
     elif len(sys.argv) > 1 and sys.argv[1] == "kb-trace":
-        pos_args = [a for a in sys.argv[2:] if not a.startswith("-")]
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 2:
             print("Usage: python -m projectbrain.main kb-trace <project_id> <target> [--branch B] [--path PATH] [--db-path DB]")
             sys.exit(1)
@@ -879,7 +922,7 @@ if __name__ == "__main__":
         db_path = _get_flag("--db-path", None)
         run_kb_trace(project_id, target, branch, workspace_path, db_path)
     elif len(sys.argv) > 1 and sys.argv[1] == "kb-coverage":
-        pos_args = [a for a in sys.argv[2:] if not a.startswith("-")]
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 1:
             print("Usage: python -m projectbrain.main kb-coverage <project_id> [--branch B] [--path PATH] [--db-path DB]")
             sys.exit(1)

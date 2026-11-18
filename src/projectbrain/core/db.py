@@ -254,5 +254,16 @@ class Queries:
 
 q = Queries()
 
+def log_maint_op(op_type: str, count: int = 0) -> None:
+    ts = int(time.time() * 1000)
+    logger.info(f"[MAINT] op={op_type} count={count}")
+    if db.conn:
+        try:
+            metrics = json.dumps({"op": op_type, "count": count})
+            db.execute("INSERT INTO stats(ts, metrics) VALUES (?, ?)", (ts, metrics))
+            db.commit()
+        except Exception as e:
+            logger.debug(f"[MAINT] Failed to log stats for {op_type}: {e}")
+
 def transaction():
     return db.conn
