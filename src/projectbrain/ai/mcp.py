@@ -1,5 +1,6 @@
 import sys
 import os
+import asyncio
 import json
 import sqlite3
 import traceback
@@ -70,7 +71,7 @@ def resolve_mcp_user_id(user_id: str = None) -> str:
                 git_bin = shutil.which("git")
                 if git_bin and has_git:
                     # Run git command from CWD to get active branch
-                    res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=2)
+                    res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=5)
                     if res_git.returncode == 0:
                         branch = res_git.stdout.strip()
                         if branch and branch != "HEAD":
@@ -147,8 +148,8 @@ async def projectbrain_query(
             facts = await query_facts_at_time(
                 subject=pattern.get("subject"),
                 predicate=pattern.get("predicate"),
-                obj=pattern.get("object"),
-                at_time=at_ts,
+                subject_object=pattern.get("object"),
+                at=at_ts,
                 min_confidence=0.0,
                 user_id=uid
             )
@@ -515,7 +516,8 @@ async def projectbrain_sync_codegraph(
     projects_root = os.getenv("PB_PROJECTS_ROOT_DIR") or os.getenv("OM_PROJECTS_ROOT_DIR")
     
     if projects_root:
-        projects_root = os.path.abspath(projects_root)
+        projects_root_resolved = Path(projects_root).resolve()
+        projects_root = str(projects_root_resolved)
         project_dir_name = project_id.split(":")[0]
         if project_path:
             if os.path.isabs(project_path):
@@ -524,9 +526,11 @@ async def projectbrain_sync_codegraph(
                 resolved_project_path = os.path.abspath(os.path.join(projects_root, project_path))
         else:
             resolved_project_path = os.path.abspath(os.path.join(projects_root, project_dir_name))
-            
-        if not resolved_project_path.startswith(projects_root):
+
+        if not Path(resolved_project_path).resolve().is_relative_to(Path(projects_root).resolve()):
             return f"Error: Security violation. Path '{resolved_project_path}' is outside of the configured root directory '{projects_root}'."
+
+        resolved_project_path = str(Path(resolved_project_path).resolve())
             
         if not os.path.isdir(resolved_project_path):
             return f"Error: The resolved project directory '{resolved_project_path}' does not exist or is not a directory on the server."
@@ -541,12 +545,17 @@ async def projectbrain_sync_codegraph(
                 from ..core.db import db
                 db.connect()
                 cursor = db.conn.cursor()
-                base_id = project_id.split(":", 1)[0] if ":" in project_id else project_id
-                cursor.execute("SELECT project_path FROM projects WHERE id = ? OR id LIKE ? ORDER BY updated_at DESC LIMIT 1;", (project_id, f"{base_id}%"))
-                row = cursor.fetchone()
-                if row and row[0]:
-                    resolved_project_path = row[0]
-                cursor.close()
+                try:
+                    base_id = project_id.split(":", 1)[0] if ":" in project_id else project_id
+                    cursor.execute(
+                        db.translate_query("SELECT project_path FROM projects WHERE id = ? OR id LIKE ? ORDER BY updated_at DESC LIMIT 1;"),
+                        (project_id, f"{base_id}%"),
+                    )
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        resolved_project_path = row[0]
+                finally:
+                    cursor.close()
             except Exception:
                 pass
 
@@ -584,10 +593,11 @@ async def projectbrain_sync_codegraph(
     
     if not os.path.exists(db_path) or force_python:
         python_parser_run = False
+        codegraph_bin = None
         if force_python:
             try:
                 from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                run_python_parser(resolved_project_path)
+                await asyncio.to_thread(run_python_parser, resolved_project_path)
                 python_parser_run = True
             except Exception as py_err:
                 return f"Error: Forced to use pure-Python parser, but execution failed: {str(py_err)}"
@@ -600,12 +610,12 @@ async def projectbrain_sync_codegraph(
                 if allow_auto:
                     # Try to install it via npm globally
                     try:
-                        res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
+                        res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True, timeout=120)
                         if res.returncode != 0:
                             # Fallback to pure-Python parser if npm install fails
                             try:
                                 from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                                run_python_parser(resolved_project_path)
+                                await asyncio.to_thread(run_python_parser, resolved_project_path)
                                 python_parser_run = True
                             except Exception as py_err:
                                 return (
@@ -620,7 +630,7 @@ async def projectbrain_sync_codegraph(
                                 # Fallback
                                 try:
                                     from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                                    run_python_parser(resolved_project_path)
+                                    await asyncio.to_thread(run_python_parser, resolved_project_path)
                                     python_parser_run = True
                                 except Exception as py_err:
                                     return (
@@ -631,7 +641,7 @@ async def projectbrain_sync_codegraph(
                         # Fallback
                         try:
                             from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                            run_python_parser(resolved_project_path)
+                            await asyncio.to_thread(run_python_parser, resolved_project_path)
                             python_parser_run = True
                         except Exception as py_err:
                             return (
@@ -642,7 +652,7 @@ async def projectbrain_sync_codegraph(
                     # Fallback: Run pure-Python codebase parser
                     try:
                         from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                        run_python_parser(resolved_project_path)
+                        await asyncio.to_thread(run_python_parser, resolved_project_path)
                         python_parser_run = True
                     except Exception as py_err:
                         return (
@@ -658,7 +668,7 @@ async def projectbrain_sync_codegraph(
         # Now run 'codegraph init' in the project directory if we have codegraph_bin and did not run the python parser
         if codegraph_bin and not python_parser_run:
             try:
-                res_init = subprocess.run([codegraph_bin, "init"], cwd=resolved_project_path, capture_output=True, text=True)
+                res_init = subprocess.run([codegraph_bin, "init"], cwd=resolved_project_path, capture_output=True, text=True, timeout=120)
                 if res_init.returncode != 0:
                     return (
                         f"Error: Failed to initialize codegraph database via '{codegraph_bin} init' (exit code {res_init.returncode}) in directory {resolved_project_path}.\n"
@@ -691,7 +701,7 @@ async def projectbrain_sync_codegraph(
             try:
                 git_bin = shutil.which("git")
                 if git_bin and os.path.exists(os.path.join(resolved_project_path, ".git")):
-                    res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], cwd=resolved_project_path, capture_output=True, text=True)
+                    res_git = subprocess.run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], cwd=resolved_project_path, capture_output=True, text=True, timeout=5)
                     if res_git.returncode == 0:
                         resolved_branch = res_git.stdout.strip()
             except Exception:
@@ -1000,9 +1010,12 @@ async def projectbrain_query_codegraph(
             try:
                 from ..graphify_engine.store import get_graph_store
                 store = _get_mcp_graph_store()
-                proj_name = uid.split(":")[0] if ":" in uid else uid
-                branch_name = uid.split(":")[1] if ":" in uid else "main"
-                vis = store.to_legacy_visjs(project_id=proj_name, branch_name=branch_name, query=query, kinds=kinds)
+                try:
+                    proj_name = uid.split(":")[0] if ":" in uid else uid
+                    branch_name = uid.split(":")[1] if ":" in uid else "main"
+                    vis = store.to_legacy_visjs(project_id=proj_name, branch_name=branch_name, query=query, kinds=kinds)
+                finally:
+                    store.close()
                 if vis.get("nodes"):
                     cursor.close()
                     return json.dumps({
@@ -1207,15 +1220,18 @@ async def projectbrain_sync_graphify(
                 return json.dumps(resp.json(), indent=2)
         else:
             store = _get_mcp_graph_store()
-            res = store.sync_branch_delta(
-                project_id=target_proj,
-                branch_name=target_branch,
-                delta=delta,
-                partial=is_partial,
-                synced_files=synced_files_list,
-                author=os.getenv("USER", "system"),
-            )
-            return json.dumps(res, indent=2)
+            try:
+                res = store.sync_branch_delta(
+                    project_id=target_proj,
+                    branch_name=target_branch,
+                    delta=delta,
+                    partial=is_partial,
+                    synced_files=synced_files_list,
+                    author=os.getenv("USER", "system"),
+                )
+                return json.dumps(res, indent=2)
+            finally:
+                store.close()
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_sync_graphify: {str(e)}"
@@ -1248,66 +1264,70 @@ async def projectbrain_query_graphify(
             target_branch = branch or "main"
 
         resolver = get_hybrid_resolver()
-        act = (action or "query").lower().strip()
+        try:
+            act = (action or "query").lower().strip()
 
-        if act == "query":
-            res = resolver.query(
-                project_id=target_proj,
-                query_text=query,
-                branch=target_branch,
-                mode=mode,
-                budget=budget,
-            )
-        elif act == "trace":
-            res = resolver.trace_path(
-                project_id=target_proj,
-                source_id=query,
-                target_id=target_symbol or "",
-                branch=target_branch,
-            )
-        elif act == "impact":
-            res = resolver.get_impact_radius(
-                project_id=target_proj,
-                node_id=query,
-                max_hops=max_hops,
-                branch=target_branch,
-            )
-        elif act == "callers":
-            res = resolver.get_callers(
-                project_id=target_proj,
-                node_id=query,
-                branch=target_branch,
-            )
-        elif act == "callees":
-            res = resolver.get_callees(
-                project_id=target_proj,
-                node_id=query,
-                branch=target_branch,
-            )
-        elif act == "node":
-            res = resolver.get_node_details(
-                project_id=target_proj,
-                node_id=query,
-                branch=target_branch,
-            )
-        elif act == "god_nodes":
-            top_n = max_hops if max_hops > 0 else 10
-            res = resolver.get_god_nodes(
-                project_id=target_proj,
-                branch=target_branch,
-                top_n=top_n,
-            )
-        elif act == "community":
-            comm_id = int(query) if query.isdigit() else 0
-            res = resolver.get_community(
-                project_id=target_proj,
-                community_id=comm_id,
-                branch=target_branch,
-            )
-        else:
-            return f"Error: Unknown action '{action}'. Supported actions: query, trace, impact, callers, callees, node, god_nodes, community."
+            if act == "query":
+                res = resolver.query(
+                    project_id=target_proj,
+                    query_text=query,
+                    branch=target_branch,
+                    mode=mode,
+                    budget=budget,
+                )
+            elif act == "trace":
+                res = resolver.trace_path(
+                    project_id=target_proj,
+                    source_id=query,
+                    target_id=target_symbol or "",
+                    branch=target_branch,
+                )
+            elif act == "impact":
+                res = resolver.get_impact_radius(
+                    project_id=target_proj,
+                    node_id=query,
+                    max_hops=max_hops,
+                    branch=target_branch,
+                )
+            elif act == "callers":
+                res = resolver.get_callers(
+                    project_id=target_proj,
+                    node_id=query,
+                    branch=target_branch,
+                )
+            elif act == "callees":
+                res = resolver.get_callees(
+                    project_id=target_proj,
+                    node_id=query,
+                    branch=target_branch,
+                )
+            elif act == "node":
+                res = resolver.get_node_details(
+                    project_id=target_proj,
+                    node_id=query,
+                    branch=target_branch,
+                )
+            elif act == "god_nodes":
+                top_n = max_hops if max_hops > 0 else 10
+                res = resolver.get_god_nodes(
+                    project_id=target_proj,
+                    branch=target_branch,
+                    top_n=top_n,
+                )
+            elif act == "community":
+                comm_id = int(query) if query.isdigit() else 0
+                res = resolver.get_community(
+                    project_id=target_proj,
+                    community_id=comm_id,
+                    branch=target_branch,
+                )
+            else:
+                return f"Error: Unknown action '{action}'. Supported actions: query, trace, impact, callers, callees, node, god_nodes, community."
 
-        return json.dumps(res, indent=2)
+            return json.dumps(res, indent=2)
+        finally:
+            if getattr(resolver, "store", None) is not None:
+                resolver.store.close()
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_query_graphify: {str(e)}"
@@ -1354,12 +1374,16 @@ async def projectbrain_local_graphify_diff(
 
         local_path = os.path.join(workspace_path, ".projectbrain", "local_graph", "partial_graph.json")
         resolver = get_hybrid_resolver()
-        res = resolver.diff_local_vs_remote(
-            project_id=target_proj,
-            branch=target_branch,
-            local_path=local_path if os.path.exists(local_path) else None,
-        )
-        return json.dumps(res, indent=2)
+        try:
+            res = resolver.diff_local_vs_remote(
+                project_id=target_proj,
+                branch=target_branch,
+                local_path=local_path if os.path.exists(local_path) else None,
+            )
+            return json.dumps(res, indent=2)
+        finally:
+            if getattr(resolver, "store", None) is not None:
+                resolver.store.close()
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_local_graphify_diff: {str(e)}"
@@ -1391,14 +1415,18 @@ async def projectbrain_hybrid_query(
             target_branch = branch or "main"
 
         resolver = get_hybrid_resolver()
-        graph_res = resolver.query(
-            project_id=target_proj,
-            query_text=query,
-            branch=target_branch,
-            local_path=local_path,
-            mode=mode,
-            budget=budget,
-        )
+        try:
+            graph_res = resolver.query(
+                project_id=target_proj,
+                query_text=query,
+                branch=target_branch,
+                local_path=local_path,
+                mode=mode,
+                budget=budget,
+            )
+        finally:
+            if getattr(resolver, "store", None) is not None:
+                resolver.store.close()
 
         memories = []
         if include_memories:
@@ -1497,7 +1525,6 @@ async def projectbrain_upload_document(
                 )
                 memories_created += 1
 
-            store = _get_mcp_graph_store()
             delta_dict = payload["graph_delta"]
             delta = GraphDelta(
                 project_id=target_proj,
@@ -1510,14 +1537,18 @@ async def projectbrain_upload_document(
                 hyperedge_tombstones=delta_dict.get("hyperedge_tombstones", []),
                 synced_files=delta_dict.get("synced_files", []),
             )
-            sync_res = store.sync_branch_delta(
-                project_id=target_proj,
-                branch_name=target_branch,
-                delta=delta,
-                partial=True,
-                synced_files=[str(file_path)],
-                author=author or "system",
-            )
+            store = _get_mcp_graph_store()
+            try:
+                sync_res = store.sync_branch_delta(
+                    project_id=target_proj,
+                    branch_name=target_branch,
+                    delta=delta,
+                    partial=True,
+                    synced_files=[str(file_path)],
+                    author=author or "system",
+                )
+            finally:
+                store.close()
             return json.dumps({
                 "status": "success",
                 "mode": "local",
@@ -1616,14 +1647,17 @@ async def projectbrain_push_processed_document(
                 memories_created += 1
 
             store = _get_mcp_graph_store()
-            sync_res = store.sync_branch_delta(
-                project_id=target_proj,
-                branch_name=target_branch,
-                delta=delta,
-                partial=True,
-                synced_files=[filename],
-                author=author or "system",
-            )
+            try:
+                sync_res = store.sync_branch_delta(
+                    project_id=target_proj,
+                    branch_name=target_branch,
+                    delta=delta,
+                    partial=True,
+                    synced_files=[filename],
+                    author=author or "system",
+                )
+            finally:
+                store.close()
             return json.dumps({
                 "status": "success",
                 "mode": "local",
@@ -1676,8 +1710,11 @@ async def projectbrain_promote_branch_graph(
                 return json.dumps(resp.json(), indent=2)
         else:
             store = _get_mcp_graph_store()
-            res = store.promote_branch_to_root(project_id=target_proj, branch_name=target_branch)
-            return json.dumps(res, indent=2)
+            try:
+                res = store.promote_branch_to_root(project_id=target_proj, branch_name=target_branch)
+                return json.dumps(res, indent=2)
+            finally:
+                store.close()
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_promote_branch_graph: {str(e)}"
@@ -1735,17 +1772,21 @@ async def projectbrain_build_complete_kb(
                 or os.getenv("PB_DB_PATH")
                 or os.getenv("OM_DB_PATH")
             )
-            builder = UnifiedKBBuilder(workspace_path=workspace_path)
-            res = await builder.build_unified_kb(
-                project_id=target_proj,
-                branch=target_branch,
-                persist_memory=persist_memory,
-                output_dir=output_dir,
-                generate_office_exports=generate_office_exports,
-                store=_get_mcp_graph_store(),
-                db_path=db_path,
-            )
-            return json.dumps(res, indent=2)
+            store = _get_mcp_graph_store()
+            try:
+                builder = UnifiedKBBuilder(workspace_path=workspace_path)
+                res = await builder.build_unified_kb(
+                    project_id=target_proj,
+                    branch=target_branch,
+                    persist_memory=persist_memory,
+                    output_dir=output_dir,
+                    generate_office_exports=generate_office_exports,
+                    store=store,
+                    db_path=db_path,
+                )
+                return json.dumps(res, indent=2)
+            finally:
+                store.close()
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_build_complete_kb: {str(e)}"
@@ -1790,14 +1831,18 @@ async def projectbrain_trace_code_and_docs(
                 return json.dumps(resp.json(), indent=2)
         else:
             from ..graphify_engine.kb_linker import UnifiedKBBuilder
-            builder = UnifiedKBBuilder(workspace_path=workspace_path)
-            builder.store = _get_mcp_graph_store()
-            res = builder.trace_code_and_docs(
-                project_id=target_proj,
-                target=target,
-                branch=target_branch,
-            )
-            return json.dumps(res.model_dump(), indent=2)
+            store = _get_mcp_graph_store()
+            try:
+                builder = UnifiedKBBuilder(workspace_path=workspace_path)
+                builder.store = store
+                res = builder.trace_code_and_docs(
+                    project_id=target_proj,
+                    target=target,
+                    branch=target_branch,
+                )
+                return json.dumps(res.model_dump(), indent=2)
+            finally:
+                store.close()
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_trace_code_and_docs: {str(e)}"
@@ -1840,13 +1885,17 @@ async def projectbrain_kb_coverage_report(
                 return json.dumps(resp.json(), indent=2)
         else:
             from ..graphify_engine.kb_linker import UnifiedKBBuilder
-            builder = UnifiedKBBuilder(workspace_path=workspace_path)
-            builder.store = _get_mcp_graph_store()
-            res = builder.get_kb_coverage_report(
-                project_id=target_proj,
-                branch=target_branch,
-            )
-            return json.dumps(res.model_dump(), indent=2)
+            store = _get_mcp_graph_store()
+            try:
+                builder = UnifiedKBBuilder(workspace_path=workspace_path)
+                builder.store = store
+                res = builder.get_kb_coverage_report(
+                    project_id=target_proj,
+                    branch=target_branch,
+                )
+                return json.dumps(res.model_dump(), indent=2)
+            finally:
+                store.close()
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_kb_coverage_report: {str(e)}"
@@ -1899,7 +1948,10 @@ async def projectbrain_generate_project_docs(
         else:
             from ..graphify_engine.doc_synthesizer import ProjectDocSynthesizer
             store = _get_mcp_graph_store()
-            subgraph = store.get_resolved_subgraph(target_proj, target_branch, limit=100000)
+            try:
+                subgraph = store.get_resolved_subgraph(target_proj, target_branch, limit=100000)
+            finally:
+                store.close()
             synthesizer = ProjectDocSynthesizer(workspace_path=workspace_path)
             out_p = Path(output_dir)
             if not out_p.is_absolute():

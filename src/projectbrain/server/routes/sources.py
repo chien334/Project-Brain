@@ -11,14 +11,22 @@ from fastapi import APIRouter, Request, HTTPException, File, UploadFile, Form
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, ConfigDict
 import logging
+import os
 
 logger = logging.getLogger("server.routes.sources")
 
 router = APIRouter(prefix="/sources", tags=["sources"])
 
 
+def _check_read_only() -> None:
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(
+            status_code=403,
+            detail="Operation not permitted: Server is running in Read-Only mode."
+        )
+
+
 def _get_store():
-    import os
     from ...graphify_engine.store import get_graph_store
     db_path = (
         os.getenv("PB_GRAPH_DB_PATH")
@@ -36,6 +44,7 @@ def _get_store():
             pass
     return get_graph_store(db_path=db_path)
 
+
 class PushDocumentRequest(BaseModel):
     project_id: str = "default"
     branch: str = "main"
@@ -47,9 +56,7 @@ class PushDocumentRequest(BaseModel):
 
 @router.post("/push-processed")
 async def push_processed(req: PushDocumentRequest):
-    import os
-    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
-        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
+    _check_read_only()
     try:
         project_id = req.project_id or "default"
         branch = req.branch or "main"
@@ -132,16 +139,18 @@ async def push_processed(req: PushDocumentRequest):
             )
 
         store = _get_store()
-        sync_res = store.sync_branch_delta(
-            project_id=project_id,
-            branch_name=branch,
-            delta=delta,
-            partial=True,
-            synced_files=[filename],
-            author=author,
-        )
-
-        schema_used = sync_res.get("schema_name") or sync_res.get("schema_used") or ("root" if store.is_root_branch(branch) else f"branch_{branch}")
+        try:
+            sync_res = store.sync_branch_delta(
+                project_id=project_id,
+                branch_name=branch,
+                delta=delta,
+                partial=True,
+                synced_files=[filename],
+                author=author,
+            )
+            schema_used = sync_res.get("schema_name") or sync_res.get("schema_used") or ("root" if store.is_root_branch(branch) else f"branch_{branch}")
+        finally:
+            store.close()
         nodes_upserted = sync_res.get("nodes_upserted", len(delta.nodes))
         edges_upserted = sync_res.get("edges_upserted", len(delta.edges))
 
@@ -154,6 +163,8 @@ async def push_processed(req: PushDocumentRequest):
             "edges_upserted": edges_upserted,
             "memories_created": memories_created,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Failed to push processed document: {str(e)}")
 
@@ -167,10 +178,8 @@ async def upload_document(
     author: Optional[str] = Form(None),
     request: Request = None,
 ):
-    import os
     from pathlib import Path
-    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
-        raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
+    _check_read_only()
 
     safe_name = Path(file.filename or "uploaded_file").name
     max_mb = float(os.getenv("PB_MAX_UPLOAD_MB", "50"))
@@ -186,22 +195,22 @@ async def upload_document(
             raise HTTPException(status_code=413, detail=f"Payload Too Large: Maximum allowed upload is {max_mb}MB")
         file_bytes = chunk
         filename = safe_name
-        
+
         # 1. Parse document to markdown using our utility
         from ...utils.doc_parser import parse_document
         markdown_content = await parse_document(filename, file_bytes)
-        
+
         if not markdown_content.strip():
             raise HTTPException(400, "Document content is empty or could not be parsed.")
-            
+
         # 2. Add to memory under the project_id (which maps to user_id)
         from ...main import Memory
         mem = Memory()
-        
+
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
         if "document" not in tag_list:
             tag_list.append("document")
-            
+
         meta = {
             "source": "upload",
             "filename": filename,
@@ -215,7 +224,7 @@ async def upload_document(
         user_target = project_id
         if ":" not in user_target and branch and branch != "main":
             user_target = f"{project_id}:{branch}"
-            
+
         res = await mem.add(
             content=f"Document: {filename}\n\n{markdown_content}",
             user_id=user_target,
@@ -226,6 +235,7 @@ async def upload_document(
         # 3. Extract and sync document graph into GraphStore branch overlay
         nodes_upserted = 0
         edges_upserted = 0
+        graphify_synced = False
         try:
             from ...graphify_engine.extractor import GraphifyExtractor
             from ...graphify_engine.store import get_graph_store
@@ -238,19 +248,24 @@ async def upload_document(
                 metadata=meta,
             )
             store = _get_store()
-            sync_res = store.sync_branch_delta(
-                project_id=project_id,
-                branch_name=branch,
-                delta=delta,
-                partial=True,
-                synced_files=[filename],
-                author=author or "system",
-            )
+            try:
+                sync_res = store.sync_branch_delta(
+                    project_id=project_id,
+                    branch_name=branch,
+                    delta=delta,
+                    partial=True,
+                    synced_files=[filename],
+                    author=author or "system",
+                )
+            finally:
+                store.close()
             nodes_upserted = sync_res.get("nodes_upserted", len(delta.nodes))
             edges_upserted = sync_res.get("edges_upserted", len(delta.edges))
+            graphify_synced = True
         except Exception as ge:
+            graphify_synced = False
             logger.warning(f"Graphify extraction for uploaded file {filename} skipped or failed: {ge}")
-        
+
         return {
             "status": "success",
             "filename": filename,
@@ -258,7 +273,7 @@ async def upload_document(
             "branch": branch,
             "memory_id": res.get("root_memory_id") or res.get("id"),
             "tags": tag_list,
-            "graphify_synced": True,
+            "graphify_synced": graphify_synced,
             "nodes_upserted": nodes_upserted,
             "edges_upserted": edges_upserted,
         }
@@ -267,10 +282,12 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(500, f"Failed to upload and parse document: {str(e)}")
 
+
 class ingest_req(BaseModel):
     creds: Dict[str, Any] = {}
     filters: Dict[str, Any] = {}
     user_id: Optional[str] = None
+
 
 @router.get("")
 async def list_sources():
@@ -282,9 +299,11 @@ async def list_sources():
         }
     }
 
+
 @router.post("/{source}/ingest")
 async def ingest_source(source: str, req: ingest_req):
-    from ..connectors import (
+    _check_read_only()
+    from ...connectors import (
         github_connector, notion_connector, google_drive_connector,
         google_sheets_connector, google_slides_connector,
         onedrive_connector, web_crawler_connector
@@ -308,12 +327,16 @@ async def ingest_source(source: str, req: ingest_req):
         await src.connect(**req.creds)
         ids = await src.ingest_all(**req.filters)
         return {"ok": True, "ingested": len(ids), "memory_ids": ids}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
+
 @router.post("/webhook/github")
 async def github_webhook(request: Request):
-    from ..ops.ingest import ingest_document
+    _check_read_only()
+    from ...ops.ingest import ingest_document
 
     event_type = request.headers.get("x-github-event", "unknown")
     payload = await request.json()
@@ -348,12 +371,16 @@ async def github_webhook(request: Request):
             result = await ingest_document("text", content, meta=meta)
             return {"ok": True, "memory_id": result.get("root_memory_id"), "event": event_type}
         return {"ok": True, "skipped": True, "reason": "no content"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
+
 @router.post("/webhook/notion")
 async def notion_webhook(request: Request):
-    from ..ops.ingest import ingest_document
+    _check_read_only()
+    from ...ops.ingest import ingest_document
     import json
 
     payload = await request.json()
@@ -362,5 +389,7 @@ async def notion_webhook(request: Request):
         content = json.dumps(payload, indent=2)
         result = await ingest_document("text", content, meta={"source": "notion_webhook"})
         return {"ok": True, "memory_id": result.get("root_memory_id")}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))

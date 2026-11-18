@@ -91,7 +91,10 @@ async def get_projects():
         try:
             from ...graphify_engine.store import get_graph_store
             store = _get_store()
-            store_projects = store.list_projects()
+            try:
+                store_projects = store.list_projects()
+            finally:
+                store.close()
             now_ts = int(time.time())
             for sp in store_projects:
                 if sp not in seen_ids:
@@ -150,11 +153,14 @@ async def delete_project(project_id: str):
     try:
         from ...graphify_engine.store import get_graph_store
         store = _get_store()
-        proj, branch = parse_project_and_branch(project_id)
-        if branch != "main":
-            store.delete_branch(proj, branch)
-        else:
-            store.delete_project(proj)
+        try:
+            proj, branch = parse_project_and_branch(project_id)
+            if branch != "main":
+                store.delete_branch(proj, branch)
+            else:
+                store.delete_project(proj)
+        finally:
+            store.close()
     except Exception as ge:
         logger.debug(f"GraphStore delete project cleanup: {ge}")
 
@@ -184,29 +190,32 @@ async def diff_projects(base_project_id: str, target_project_id: str):
     try:
         from ...graphify_engine.store import get_graph_store
         store = _get_store()
-        base_proj, base_br = parse_project_and_branch(base_project_id)
-        target_proj, target_br = parse_project_and_branch(target_project_id)
-        if base_proj == target_proj:
-            base_stats = store.get_stats(base_proj, base_br)
-            target_stats = store.get_stats(target_proj, target_br)
-            base_node_cnt = base_stats.get("node_count", 0) or base_stats.get("nodes_count", 0)
-            target_node_cnt = target_stats.get("node_count", 0) or target_stats.get("nodes_count", 0)
-            if base_node_cnt > 0 or target_node_cnt > 0:
-                diff_res = store.diff_branches(
-                    project_id=base_proj,
-                    base_branch=base_br,
-                    target_branch=target_br
-                )
-                added = diff_res.new_nodes
-                modified = diff_res.modified_nodes
-                deleted = [{"id": did} for did in diff_res.deleted_node_ids]
-                return {
-                    "base_project_id": base_project_id,
-                    "target_project_id": target_project_id,
-                    "added": added,
-                    "deleted": deleted,
-                    "modified": modified
-                }
+        try:
+            base_proj, base_br = parse_project_and_branch(base_project_id)
+            target_proj, target_br = parse_project_and_branch(target_project_id)
+            if base_proj == target_proj:
+                base_stats = store.get_stats(base_proj, base_br)
+                target_stats = store.get_stats(target_proj, target_br)
+                base_node_cnt = base_stats.get("node_count", 0) or base_stats.get("nodes_count", 0)
+                target_node_cnt = target_stats.get("node_count", 0) or target_stats.get("nodes_count", 0)
+                if base_node_cnt > 0 or target_node_cnt > 0:
+                    diff_res = store.diff_branches(
+                        project_id=base_proj,
+                        base_branch=base_br,
+                        target_branch=target_br
+                    )
+                    added = diff_res.new_nodes
+                    modified = diff_res.modified_nodes
+                    deleted = [{"id": did} for did in diff_res.deleted_node_ids]
+                    return {
+                        "base_project_id": base_project_id,
+                        "target_project_id": target_project_id,
+                        "added": added,
+                        "deleted": deleted,
+                        "modified": modified
+                    }
+        finally:
+            store.close()
     except Exception as ge:
         logger.debug(f"GraphStore diff fallback: {ge}")
 
@@ -308,7 +317,10 @@ async def get_codegraph_status(project_id: Optional[str] = None):
         # Try GraphStore first
         try:
             store = _get_store()
-            stats = store.get_stats(proj_id, branch)
+            try:
+                stats = store.get_stats(proj_id, branch)
+            finally:
+                store.close()
             node_cnt = stats.get("node_count", 0) or stats.get("nodes_count", 0)
             edge_cnt = stats.get("edge_count", 0) or stats.get("edges_count", 0)
             if node_cnt > 0 or edge_cnt > 0:
@@ -400,13 +412,16 @@ async def get_codegraph_data(
         try:
             from ...graphify_engine.store import get_graph_store
             store = _get_store()
-            visjs = store.to_legacy_visjs(
-                project_id=proj_id,
-                branch_name=branch,
-                query=query,
-                kinds=kinds,
-                limit=limit,
-            )
+            try:
+                visjs = store.to_legacy_visjs(
+                    project_id=proj_id,
+                    branch_name=branch,
+                    query=query,
+                    kinds=kinds,
+                    limit=limit,
+                )
+            finally:
+                store.close()
             if visjs.get("nodes"):
                 return visjs
         except Exception as ge:
@@ -798,13 +813,16 @@ async def sync_codegraph_data(req: SyncRequest, request: Request = None):
             ]
             delta = GraphDelta(project_id=proj, branch=branch, nodes=g_nodes, edges=g_edges)
             store = _get_store()
-            store.sync_branch_delta(
-                project_id=proj,
-                branch_name=branch,
-                delta=delta,
-                partial=False,
-                author=req.author or "anonymous"
-            )
+            try:
+                store.sync_branch_delta(
+                    project_id=proj,
+                    branch_name=branch,
+                    delta=delta,
+                    partial=False,
+                    author=req.author or "anonymous"
+                )
+            finally:
+                store.close()
         except Exception as ge:
             logger.debug(f"GraphStore bridge sync failed: {ge}")
         
@@ -1039,13 +1057,16 @@ async def upload_codegraph_db(
             ]
             delta = GraphDelta(project_id=proj, branch=branch, nodes=g_nodes, edges=g_edges)
             store = _get_store()
-            store.sync_branch_delta(
-                project_id=proj,
-                branch_name=branch,
-                delta=delta,
-                partial=False,
-                author=author or "anonymous"
-            )
+            try:
+                store.sync_branch_delta(
+                    project_id=proj,
+                    branch_name=branch,
+                    delta=delta,
+                    partial=False,
+                    author=author or "anonymous"
+                )
+            finally:
+                store.close()
         except Exception as ge:
             logger.debug(f"GraphStore bridge upload failed: {ge}")
         

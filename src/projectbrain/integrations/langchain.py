@@ -5,9 +5,25 @@ try:
     from langchain_core.retrievers import BaseRetriever
     from langchain_core.documents import Document
     from langchain_core.callbacks import CallbackManagerForRetrieverRun
+    _HAS_LANGCHAIN = True
 except ImportError:
+    _HAS_LANGCHAIN = False
     BaseChatMessageHistory = object
     BaseRetriever = object
+    BaseMessage = Any
+    CallbackManagerForRetrieverRun = Any
+
+    class _FallbackMsg:
+        def __init__(self, content: str = "", **kwargs: Any):
+            self.content = content
+
+    HumanMessage = _FallbackMsg
+    AIMessage = _FallbackMsg
+
+    class Document:  # type: ignore[no-redef]
+        def __init__(self, page_content: str = "", metadata: Optional[dict] = None, **kwargs: Any):
+            self.page_content = page_content
+            self.metadata = metadata or {}
 
 from ..main import Memory
 
@@ -79,8 +95,22 @@ class ProjectBrainRetriever(BaseRetriever):
     user_id: str
     k: int = 5
 
-    def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> List[Document]:
-        results = self.memory.search(query, user_id=self.user_id)
+    if not _HAS_LANGCHAIN:
+        def __init__(self, memory: Memory = None, user_id: str = "default", k: int = 5, **kwargs: Any):
+            self.memory = memory
+            self.user_id = user_id
+            self.k = k
+
+    def _get_relevant_documents(self, query: str, *, run_manager: Any = None) -> List[Document]:
+        from .agents import _run_async
+        results = _run_async(self.memory.search(query, user_id=self.user_id)) or []
+        docs = []
+        for r in results[:self.k]:
+            docs.append(Document(page_content=r["content"], metadata=r))
+        return docs
+
+    async def _aget_relevant_documents(self, query: str, *, run_manager: Any = None) -> List[Document]:
+        results = await self.memory.search(query, user_id=self.user_id) or []
         docs = []
         for r in results[:self.k]:
             docs.append(Document(page_content=r["content"], metadata=r))

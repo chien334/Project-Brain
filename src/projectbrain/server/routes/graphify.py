@@ -202,15 +202,18 @@ async def sync_graph(req: SyncBranchRequest, request: Request = None):
             ]
 
         store = _get_store()
-        res = store.sync_branch_delta(
-            project_id=req.project_id,
-            branch_name=req.branch,
-            delta=delta,
-            partial=req.partial,
-            synced_files=synced_files,
-            deleted_files=req.deleted_files,
-            author=req.author,
-        )
+        try:
+            res = store.sync_branch_delta(
+                project_id=req.project_id,
+                branch_name=req.branch,
+                delta=delta,
+                partial=req.partial,
+                synced_files=synced_files,
+                deleted_files=req.deleted_files,
+                author=req.author,
+            )
+        finally:
+            store.close()
 
         # Ensure project exists in legacy projects catalog
         client_ip = request.client.host if request and request.client else "127.0.0.1"
@@ -235,15 +238,18 @@ async def get_subgraph(
     limit: int = 1000,
 ):
     try:
-        store = _get_store()
         file_list = [f.strip() for f in files.split(",") if f.strip()] if files else None
-        res = store.get_resolved_subgraph(
-            project_id=project_id,
-            branch_name=branch,
-            files=file_list,
-            limit=limit,
-        )
-        return res
+        store = _get_store()
+        try:
+            res = store.get_resolved_subgraph(
+                project_id=project_id,
+                branch_name=branch,
+                files=file_list,
+                limit=limit,
+            )
+            return res
+        finally:
+            store.close()
     except Exception as e:
         logger.error(f"Failed to get subgraph for {project_id}:{branch}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to retrieve subgraph: {str(e)}")
@@ -260,22 +266,25 @@ async def diff_graph(
 ):
     try:
         store = _get_store()
-        if target_branch:
-            res = store.diff_branches(
-                project_id=project_id,
-                base_branch=base_branch,
-                target_branch=target_branch,
-                file_filter=file_filter,
-                community=community,
-            )
-        else:
-            diff_target = branch or target_branch or "main"
-            res = store.diff_branch_vs_root(
-                project_id=project_id,
-                branch_name=diff_target,
-                file_filter=file_filter,
-                community=community,
-            )
+        try:
+            if target_branch:
+                res = store.diff_branches(
+                    project_id=project_id,
+                    base_branch=base_branch,
+                    target_branch=target_branch,
+                    file_filter=file_filter,
+                    community=community,
+                )
+            else:
+                diff_target = branch or target_branch or "main"
+                res = store.diff_branch_vs_root(
+                    project_id=project_id,
+                    branch_name=diff_target,
+                    file_filter=file_filter,
+                    community=community,
+                )
+        finally:
+            store.close()
 
         if hasattr(res, "to_dict"):
             return res.to_dict()
@@ -292,11 +301,14 @@ async def promote_branch(req: PromoteRequest):
     _check_read_only()
     try:
         store = _get_store()
-        res = store.promote_branch_to_root(
-            project_id=req.project_id,
-            branch_name=req.branch,
-        )
-        return res
+        try:
+            res = store.promote_branch_to_root(
+                project_id=req.project_id,
+                branch_name=req.branch,
+            )
+            return res
+        finally:
+            store.close()
     except Exception as e:
         logger.error(f"Failed to promote branch {req.branch} for {req.project_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Branch promotion failed: {str(e)}")
@@ -316,17 +328,20 @@ async def query_graph(req: QueryRequest):
 
     try:
         store = _get_store()
-        resolver = HybridResolver(store=store)
-        res = resolver.query(
-            project_id=req.project_id,
-            query_text=req.query,
-            branch=req.branch,
-            local_path=local_path,
-            mode=req.mode,
-            min_confidence=req.min_confidence,
-            budget=req.budget,
-        )
-        return res
+        try:
+            resolver = HybridResolver(store=store)
+            res = resolver.query(
+                project_id=req.project_id,
+                query_text=req.query,
+                branch=req.branch,
+                local_path=local_path,
+                mode=req.mode,
+                min_confidence=req.min_confidence,
+                budget=req.budget,
+            )
+            return res
+        finally:
+            store.close()
     except HTTPException:
         raise
     except Exception as e:
@@ -354,9 +369,8 @@ async def local_diff(req: LocalDiffRequest):
 
     try:
         store = _get_store()
-        resolver = HybridResolver(store=store)
-
         try:
+            resolver = HybridResolver(store=store)
             res = resolver.diff_local_vs_remote(
                 project_id=req.project_id,
                 branch=req.branch,
@@ -365,6 +379,7 @@ async def local_diff(req: LocalDiffRequest):
             )
             return res
         finally:
+            store.close()
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
@@ -381,8 +396,11 @@ async def local_diff(req: LocalDiffRequest):
 async def list_branches(project_id: str):
     try:
         store = _get_store()
-        branches = store.list_branches(project_id)
-        return {"project_id": project_id, "branches": branches}
+        try:
+            branches = store.list_branches(project_id)
+            return {"project_id": project_id, "branches": branches}
+        finally:
+            store.close()
     except Exception as e:
         logger.error(f"Failed to list branches for {project_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to list branches: {str(e)}")
@@ -393,8 +411,11 @@ async def delete_branch(project_id: str = Query(...), branch: str = Query(...)):
     _check_read_only()
     try:
         store = _get_store()
-        success = store.delete_branch(project_id, branch)
-        return {"status": "deleted" if success else "not_found", "project_id": project_id, "branch": branch}
+        try:
+            success = store.delete_branch(project_id, branch)
+            return {"status": "deleted" if success else "not_found", "project_id": project_id, "branch": branch}
+        finally:
+            store.close()
     except Exception as e:
         logger.error(f"Failed to delete branch {branch} for {project_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to delete branch: {str(e)}")
@@ -404,8 +425,11 @@ async def delete_branch(project_id: str = Query(...), branch: str = Query(...)):
 async def get_stats(project_id: str, branch: str = "main"):
     try:
         store = _get_store()
-        stats = store.get_stats(project_id, branch)
-        return stats
+        try:
+            stats = store.get_stats(project_id, branch)
+            return stats
+        finally:
+            store.close()
     except Exception as e:
         logger.error(f"Failed to get stats for {project_id}:{branch}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")

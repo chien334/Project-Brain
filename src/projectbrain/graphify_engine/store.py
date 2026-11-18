@@ -86,6 +86,16 @@ class GraphStore(ABC):
     def __init__(self, root_branch: str = "main"):
         self.root_branch = root_branch or "main"
 
+    def close(self) -> None:
+        """Close underlying database connection if owned by this store."""
+        pass
+
+    def __enter__(self) -> "GraphStore":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
     def is_root_branch(self, branch_name: Optional[str]) -> bool:
         """Check whether branch_name targets the canonical root schema."""
         if not branch_name:
@@ -503,6 +513,13 @@ class SqliteOverlayGraphStore(GraphStore):
         if self._conn is None:
             self._init_connection()
         return self._conn
+
+    def close(self) -> None:
+        if self._external_conn is None and self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
 
     def ensure_root_schema(self) -> None:
         conn = self.get_conn()
@@ -1761,22 +1778,39 @@ class PostgresSchemaGraphStore(GraphStore):
     ):
         super().__init__(root_branch=root_branch)
         self.connection_url = connection_url
-        self.conn = conn
+        self._external_conn = conn
+        self._conn = conn
+
+    @property
+    def conn(self) -> Optional[Any]:
+        return self._conn
+
+    @conn.setter
+    def conn(self, value: Optional[Any]) -> None:
+        self._conn = value
 
     def get_conn(self):
-        if self.conn and not getattr(self.conn, "closed", False):
-            return self.conn
+        if self._conn and not getattr(self._conn, "closed", False):
+            return self._conn
         if self.connection_url:
-            self.conn = psycopg2.connect(self.connection_url)
-            self.conn.autocommit = True
-            return self.conn
+            self._conn = psycopg2.connect(self.connection_url)
+            self._conn.autocommit = True
+            return self._conn
         try:
             from ..core.config import env
-            self.conn = psycopg2.connect(env.db_url)
-            self.conn.autocommit = True
-            return self.conn
+            self._conn = psycopg2.connect(env.db_url)
+            self._conn.autocommit = True
+            return self._conn
         except Exception as e:
             raise RuntimeError(f"Failed to connect to PostgreSQL: {e}")
+
+    def close(self) -> None:
+        if self._external_conn is None and self._conn is not None:
+            try:
+                if not getattr(self._conn, "closed", False):
+                    self._conn.close()
+            finally:
+                self._conn = None
 
     # DDL Generation helpers for testing and verification
     def generate_root_schema_ddl(self, as_string: bool = False) -> List[Any]:

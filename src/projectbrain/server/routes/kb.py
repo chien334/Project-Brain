@@ -126,18 +126,20 @@ async def build_kb(req: KBBuildRequest):
 
     store = _get_store()
     db_path = _get_db_path()
-
-    builder = UnifiedKBBuilder(workspace_path=resolved_workspace)
-    res = await builder.build_unified_kb(
-        project_id=req.project_id,
-        branch=req.branch,
-        persist_memory=req.persist_memory,
-        output_dir=str(resolved_output) if resolved_output else None,
-        generate_office_exports=req.generate_office_exports,
-        store=store,
-        db_path=db_path,
-    )
-    return res
+    try:
+        builder = UnifiedKBBuilder(workspace_path=resolved_workspace)
+        res = await builder.build_unified_kb(
+            project_id=req.project_id,
+            branch=req.branch,
+            persist_memory=req.persist_memory,
+            output_dir=str(resolved_output) if resolved_output else None,
+            generate_office_exports=req.generate_office_exports,
+            store=store,
+            db_path=db_path,
+        )
+        return res
+    finally:
+        store.close()
 
 
 @router.get("/trace")
@@ -149,14 +151,18 @@ async def trace_code_and_docs(
 ):
     """Inspect cross-layer traceability connecting AST code nodes, documentation chunks, and verified tests."""
     resolved_workspace = _validate_safe_path(workspace_path, "workspace_path")
-    builder = UnifiedKBBuilder(workspace_path=resolved_workspace)
-    builder.store = _get_store()
-    res = builder.trace_code_and_docs(
-        project_id=project_id,
-        target=target,
-        branch=branch,
-    )
-    return res.model_dump()
+    store = _get_store()
+    try:
+        builder = UnifiedKBBuilder(workspace_path=resolved_workspace)
+        builder.store = store
+        res = builder.trace_code_and_docs(
+            project_id=project_id,
+            target=target,
+            branch=branch,
+        )
+        return res.model_dump()
+    finally:
+        store.close()
 
 
 @router.get("/coverage")
@@ -167,13 +173,17 @@ async def get_kb_coverage(
 ):
     """Fetch repository-wide documentation and test coverage metrics, gap statistics, and drift alerts."""
     resolved_workspace = _validate_safe_path(workspace_path, "workspace_path")
-    builder = UnifiedKBBuilder(workspace_path=resolved_workspace)
-    builder.store = _get_store()
-    res = builder.get_kb_coverage_report(
-        project_id=project_id,
-        branch=branch,
-    )
-    return res.model_dump()
+    store = _get_store()
+    try:
+        builder = UnifiedKBBuilder(workspace_path=resolved_workspace)
+        builder.store = store
+        res = builder.get_kb_coverage_report(
+            project_id=project_id,
+            branch=branch,
+        )
+        return res.model_dump()
+    finally:
+        store.close()
 
 
 @router.post("/export")
@@ -184,7 +194,10 @@ async def export_kb_artifacts(req: KBExportRequest):
     resolved_output = _validate_safe_path(req.output_dir, "output_dir")
 
     store = _get_store()
-    subgraph = store.get_resolved_subgraph(req.project_id, req.branch, limit=100000)
+    try:
+        subgraph = store.get_resolved_subgraph(req.project_id, req.branch, limit=100000)
+    finally:
+        store.close()
 
     synthesizer = ProjectDocSynthesizer(workspace_path=resolved_workspace)
     resolved_output.mkdir(parents=True, exist_ok=True)

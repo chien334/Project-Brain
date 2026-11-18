@@ -68,7 +68,7 @@ async def create_presentation(params: CreatePptxInput) -> str:
 @mcp.tool(
     name="pptx_extract_images",
     annotations={
-        "readOnlyHint": True,
+        "readOnlyHint": False,
     }
 )
 async def extract_images(params: ExtractImagesInput) -> str:
@@ -106,9 +106,12 @@ async def to_markdown(params: PptxFilePath) -> str:
     try:
         import sys
         from pathlib import Path
-        project_root = str(Path(__file__).resolve().parents[2])
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
+        repo_root = Path(__file__).resolve().parents[2]
+        src_root = str(repo_root / "src")
+        if src_root not in sys.path:
+            sys.path.insert(0, src_root)
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
             
         from projectbrain.utils.doc_parser import pptx_to_markdown
         
