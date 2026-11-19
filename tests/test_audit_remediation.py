@@ -212,9 +212,11 @@ def test_sources_ingest_unknown_and_webhooks_clean_imports():
 def test_sources_upload_reports_graphify_synced_false_on_extractor_failure(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    from projectbrain.memory import hsg as hsg_mod
+
     monkeypatch.setattr(
-        Memory,
-        "add",
+        hsg_mod,
+        "add_hsg_memory",
         AsyncMock(return_value={"id": "mem_upload_ok", "root_memory_id": "mem_upload_ok"}),
     )
     monkeypatch.setattr(
