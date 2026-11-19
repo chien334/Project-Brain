@@ -370,6 +370,77 @@ async def calc_multi_vec_fusion_score(mid: str, qe: Dict[str, List[float]], w: D
 
     return s / tot if tot > 0 else 0.0
 
+def _maybe_record_overlay_tombstone(user_id: Optional[str], metadata: Any) -> None:
+    if not user_id or ":" not in user_id or not isinstance(metadata, dict):
+        return
+    file_path = metadata.get("file_path")
+    doc_key = metadata.get("doc_key")
+    if not file_path and not doc_key:
+        return
+    proj, br = user_id.split(":", 1)
+    if not proj or not br:
+        return
+    from ..core.db import get_memory_branch_lineage, record_memory_tombstone
+    if len(get_memory_branch_lineage(proj, br)) > 1:
+        if file_path and str(file_path).strip():
+            record_memory_tombstone(proj, br, "file", str(file_path))
+        if doc_key and str(doc_key).strip():
+            record_memory_tombstone(proj, br, "doc", str(doc_key))
+
+
+async def delete_branch_target_memories(project_id: str, branch: str, target_type: str, target_key: str) -> int:
+    from ..core.db import _normalize_overlay_key
+    uid = f"{project_id}:{branch}"
+    norm_key = _normalize_overlay_key(target_type, target_key)
+    if not norm_key:
+        return 0
+
+    rows = db.fetchall("SELECT id, meta FROM memories WHERE user_id=?", (uid,))
+    deleted = 0
+    for row in rows:
+        raw_meta = row.get("meta")
+        if isinstance(raw_meta, str):
+            try:
+                meta = json.loads(raw_meta)
+            except Exception:
+                meta = {}
+        elif isinstance(raw_meta, dict):
+            meta = raw_meta
+        else:
+            meta = {}
+        if not isinstance(meta, dict):
+            continue
+
+        matched = False
+        if target_type == "file":
+            for field in ("file_path", "filename"):
+                val = meta.get(field)
+                if val and _normalize_overlay_key("file", str(val)) == norm_key:
+                    matched = True
+                    break
+        elif target_type == "doc":
+            for field in ("doc_key", "filename"):
+                val = meta.get(field)
+                if val and _normalize_overlay_key("doc", str(val)) == norm_key:
+                    matched = True
+                    break
+        else:
+            for field in (target_type, "filename"):
+                val = meta.get(field)
+                if val and _normalize_overlay_key(target_type, str(val)) == norm_key:
+                    matched = True
+                    break
+
+        if matched:
+            mid = row["id"]
+            await store.deleteVectors(mid)
+            q.del_mem(mid)
+            deleted += 1
+
+    invalidate_query_cache()
+    return deleted
+
+
 async def add_hsg_memory(content: str, tags: Optional[str] = None, metadata: Any = None, user_id: Optional[str] = None) -> Dict[str, Any]:
     uid = user_id or "anonymous"
     simhash = compute_simhash(content)
@@ -380,6 +451,7 @@ async def add_hsg_memory(content: str, tags: Optional[str] = None, metadata: Any
         boost = min(1.0, (existing["salience"] or 0) + 0.15)
         db.execute("UPDATE memories SET last_seen_at=?, salience=?, updated_at=? WHERE id=?", (now, boost, now, existing["id"]))
         db.commit()
+        _maybe_record_overlay_tombstone(user_id, metadata)
         invalidate_query_cache()
         return {
             "id": existing["id"],
@@ -449,6 +521,7 @@ async def add_hsg_memory(content: str, tags: Optional[str] = None, metadata: Any
         await create_single_waypoint(mid, mean_vec, now, user_id)
         if user_id:
             await update_user_summary(user_id)
+        _maybe_record_overlay_tombstone(user_id, metadata)
         invalidate_query_cache()
         return {
             "id": mid,
@@ -495,7 +568,57 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
     start_q = time.time()
     inc_q()
     try:
-        cache_key = f"{qt}:{k}:{json.dumps(f, sort_keys=True, default=str)}"
+        f_dict = f or {}
+        inherit_base = bool(f_dict.get("inherit_base", True))
+        raw_uid = f_dict.get("user_id")
+
+        lineage_branches: List[str] = []
+        lineage_uids: List[str] = []
+        uid_depth: Dict[str, int] = {}
+        branch_tombstones: Dict[str, Dict[str, Set[str]]] = {}
+
+        if (
+            raw_uid
+            and isinstance(raw_uid, str)
+            and "%" not in raw_uid
+            and inherit_base
+            and ":" in raw_uid
+        ):
+            from ..core.db import get_memory_branch_lineage, get_memory_tombstones
+            proj, branch = raw_uid.split(":", 1)
+            lineage_branches = get_memory_branch_lineage(proj, branch)
+            if len(lineage_branches) > 1:
+                for idx, b_name in enumerate(lineage_branches):
+                    cand_uid = f"{proj}:{b_name}"
+                    if cand_uid not in uid_depth:
+                        uid_depth[cand_uid] = idx
+                        lineage_uids.append(cand_uid)
+                oldest_idx = len(lineage_branches) - 1
+                root_br = getattr(env, "root_branch", None) or "main"
+                if lineage_branches[-1] == root_br or lineage_branches[-1] == "main":
+                    if proj not in uid_depth:
+                        uid_depth[proj] = oldest_idx
+                        lineage_uids.append(proj)
+                branch_tombstones = {
+                    b: get_memory_tombstones(proj, b) for b in lineage_branches
+                }
+
+        tomb_sig = (
+            [
+                (
+                    b,
+                    sorted(branch_tombstones[b].get("file", set())),
+                    sorted(branch_tombstones[b].get("doc", set())),
+                )
+                for b in lineage_branches
+            ]
+            if len(lineage_branches) > 1
+            else []
+        )
+        cache_key = (
+            f"{qt}:{k}:{json.dumps(f_dict, sort_keys=True, default=str)}:"
+            f"{json.dumps(lineage_branches)}:{json.dumps(tomb_sig)}"
+        )
         if cache_key in cache:
             entry = cache[cache_key]
             if time.time()*1000 - entry["t"] < TTL:
@@ -506,7 +629,6 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
         qc = classify_content(qt)
         qtk = canonical_token_set(qt)
 
-        f_dict = f or {}
         ss = f_dict.get("sectors") or list(SECTOR_CONFIGS.keys())
         if not ss: ss = ["semantic"]
 
@@ -519,11 +641,35 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
             "temporal_dimension_weight": 1.4 if qc["primary"] == "episodic" else 0.7,
             "reflective_dimension_weight": 1.1 if qc["primary"] == "reflective" else 0.5,
         }
+
+        cum_tomb_files: Dict[int, Set[str]] = {}
+        cum_tomb_docs: Dict[int, Set[str]] = {}
+        if len(lineage_branches) > 1:
+            for d in range(1, len(lineage_branches)):
+                f_set: Set[str] = set()
+                d_set: Set[str] = set()
+                for j in range(d):
+                    b_tomb = branch_tombstones.get(lineage_branches[j], {})
+                    f_set.update(b_tomb.get("file", set()))
+                    d_set.update(b_tomb.get("doc", set()))
+                cum_tomb_files[d] = f_set
+                cum_tomb_docs[d] = d_set
+
         sr = {}
         for s in ss:
             qv = qe[s]
-            res = await store.search(qv, s, k*3, {"user_id": f_dict.get("user_id")})
-            sr[s] = res
+            if len(lineage_branches) > 1:
+                merged_by_id: Dict[str, Dict[str, Any]] = {}
+                for cand_uid in lineage_uids:
+                    cand_res = await store.search(qv, s, k*3, {"user_id": cand_uid})
+                    for r in cand_res:
+                        rid = r["id"]
+                        if rid not in merged_by_id or r["similarity"] > merged_by_id[rid]["similarity"]:
+                            merged_by_id[rid] = r
+                sr[s] = list(merged_by_id.values())
+            else:
+                res = await store.search(qv, s, k*3, {"user_id": raw_uid})
+                sr[s] = res
 
         all_sims = []
         ids = set()
@@ -545,9 +691,9 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
         res_list = []
         kw_scores = {}
         user_id_regex = None
-        if f and f.get("user_id"):
-            uid_pattern = f["user_id"]
-            if "%" in uid_pattern or "_" in uid_pattern:
+        if raw_uid and len(lineage_branches) <= 1:
+            uid_pattern = raw_uid
+            if "%" in uid_pattern:
                 import re
                 regex_pat = "^" + "".join(
                     ".*" if c == "%" else
@@ -557,21 +703,96 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
                 ) + "$"
                 user_id_regex = re.compile(regex_pat)
 
+        mem_map: Dict[str, Any] = {}
+        overridden_files_by_depth: Dict[int, Set[str]] = {}
+        overridden_docs_by_depth: Dict[int, Set[str]] = {}
+        if len(lineage_branches) > 1:
+            from ..core.db import _normalize_overlay_key
+
         for mid in ids:
             mem = q.get_mem(mid)
             if mem:
+                mem_map[mid] = mem
                 overlap = compute_keyword_overlap(qt, mem["content"])
                 kw_scores[mid] = overlap * 0.15
+                if len(lineage_branches) > 1 and mem.get("user_id") in uid_depth:
+                    d_mem = uid_depth[mem["user_id"]]
+                    raw_meta = mem.get("meta")
+                    try:
+                        m_meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
+                    except Exception:
+                        m_meta = {}
+                    if isinstance(m_meta, dict):
+                        if m_meta.get("file_path"):
+                            overridden_files_by_depth.setdefault(d_mem, set()).add(
+                                _normalize_overlay_key("file", str(m_meta["file_path"]))
+                            )
+                        elif m_meta.get("filename") and not m_meta.get("doc_key"):
+                            overridden_files_by_depth.setdefault(d_mem, set()).add(
+                                _normalize_overlay_key("file", str(m_meta["filename"]))
+                            )
+                        if m_meta.get("doc_key"):
+                            overridden_docs_by_depth.setdefault(d_mem, set()).add(
+                                _normalize_overlay_key("doc", str(m_meta["doc_key"]))
+                            )
+                        elif m_meta.get("filename") and not m_meta.get("file_path"):
+                            overridden_docs_by_depth.setdefault(d_mem, set()).add(
+                                _normalize_overlay_key("doc", str(m_meta["filename"]))
+                            )
 
         for mid in ids:
-            m = q.get_mem(mid)
+            m = mem_map.get(mid)
             if not m: continue
-            if f and f.get("minSalience") and m["salience"] < f["minSalience"]: continue
-            if f and f.get("user_id"):
-                if user_id_regex:
+            if f_dict.get("minSalience") and m["salience"] < f_dict["minSalience"]: continue
+            if raw_uid:
+                if len(lineage_branches) > 1:
+                    if m["user_id"] not in uid_depth:
+                        continue
+                    d_src = uid_depth[m["user_id"]]
+                    if d_src > 0:
+                        raw_meta = m.get("meta")
+                        try:
+                            m_meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
+                        except Exception:
+                            m_meta = {}
+                        if isinstance(m_meta, dict):
+                            f_key = (
+                                _normalize_overlay_key("file", str(m_meta["file_path"]))
+                                if m_meta.get("file_path")
+                                else (
+                                    _normalize_overlay_key("file", str(m_meta["filename"]))
+                                    if m_meta.get("filename")
+                                    else ""
+                                )
+                            )
+                            d_key = (
+                                _normalize_overlay_key("doc", str(m_meta["doc_key"]))
+                                if m_meta.get("doc_key")
+                                else (
+                                    _normalize_overlay_key("doc", str(m_meta["filename"]))
+                                    if m_meta.get("filename")
+                                    else ""
+                                )
+                            )
+                            shadowed = False
+                            if f_key and f_key in cum_tomb_files.get(d_src, set()):
+                                shadowed = True
+                            if not shadowed and d_key and d_key in cum_tomb_docs.get(d_src, set()):
+                                shadowed = True
+                            if not shadowed:
+                                for closer_d in range(d_src):
+                                    if f_key and f_key in overridden_files_by_depth.get(closer_d, set()):
+                                        shadowed = True
+                                        break
+                                    if d_key and d_key in overridden_docs_by_depth.get(closer_d, set()):
+                                        shadowed = True
+                                        break
+                            if shadowed:
+                                continue
+                elif user_id_regex:
                     if not user_id_regex.match(m["user_id"] or ""):
                         continue
-                elif m["user_id"] != f["user_id"]:
+                elif m["user_id"] != raw_uid:
                     continue
 
             mvf = await calc_multi_vec_fusion_score(mid, qe, w)

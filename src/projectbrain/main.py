@@ -451,7 +451,18 @@ def run_ingest_files(project_id: str, dir_path: str, server_url: Optional[str] =
     import asyncio
     asyncio.run(async_ingest_files(project_id, dir_path, server_url))
 
-def run_upload_file(project_id: str, file_path: str, server_url: str = None, tags: str = "", author: str = None):
+def run_upload_file(
+    project_id: str,
+    file_path: str,
+    server_url: str = None,
+    tags: str = "",
+    author: str = None,
+    branch: str = "main",
+    doc_key: Optional[str] = None,
+    doc_version: Optional[str] = None,
+    base_version: Optional[str] = None,
+    base_branch: Optional[str] = None,
+):
     import os
     import sys
     import httpx
@@ -478,9 +489,18 @@ def run_upload_file(project_id: str, file_path: str, server_url: str = None, tag
             files = {"file": (filename, f, mime_type)}
             data = {
                 "project_id": project_id,
+                "branch": branch or "main",
                 "tags": tags,
-                "author": author or "cli"
+                "author": author or "cli",
             }
+            if doc_key:
+                data["doc_key"] = doc_key
+            if doc_version:
+                data["doc_version"] = doc_version
+            if base_version:
+                data["base_version"] = base_version
+            if base_branch:
+                data["base_branch"] = base_branch
             
             headers = {}
             api_key = os.getenv("PB_API_KEY") or os.getenv("OM_API_KEY")
@@ -514,7 +534,8 @@ def run_graphify_sync(
     scoped_paths: Optional[List[str]] = None,
     git_dirty: bool = False,
     local_only: bool = False,
-    cluster: bool = True
+    cluster: bool = True,
+    base_branch: Optional[str] = None
 ):
     import os
     import sys
@@ -535,7 +556,8 @@ def run_graphify_sync(
         branch=branch,
         scoped_paths=scoped_paths,
         git_dirty_only=git_dirty,
-        include_docs=True
+        include_docs=True,
+        base_branch=base_branch
     )
     if cluster and delta.nodes:
         try:
@@ -561,6 +583,7 @@ def run_graphify_sync(
     payload = {
         "project_id": project_id,
         "branch": branch,
+        "base_branch": base_branch,
         "nodes": [n.to_dict() if hasattr(n, "to_dict") else n.model_dump() for n in delta.nodes],
         "edges": [e.to_dict() if hasattr(e, "to_dict") else e.model_dump() for e in delta.edges],
         "hyperedges": [h.to_dict() if hasattr(h, "to_dict") else h.model_dump() for h in delta.hyperedges],
@@ -568,7 +591,8 @@ def run_graphify_sync(
         "edge_tombstones": delta.edge_tombstones,
         "hyperedge_tombstones": delta.hyperedge_tombstones,
         "synced_files": delta.synced_files,
-        "partial": bool(scoped_paths or git_dirty),
+        "deleted_files": delta.deleted_files,
+        "partial": bool(scoped_paths or git_dirty or (base_branch and base_branch != branch)),
         "author": os.getenv("USER", "cli"),
         "cluster": False,
         "project_path": target_dir
@@ -649,7 +673,11 @@ def run_upload_doc(
     file_path: str,
     branch: str = "main",
     server_url: Optional[str] = None,
-    author: Optional[str] = None
+    author: Optional[str] = None,
+    doc_key: Optional[str] = None,
+    doc_version: Optional[str] = None,
+    base_version: Optional[str] = None,
+    base_branch: Optional[str] = None,
 ):
     import os
     import sys
@@ -671,7 +699,11 @@ def run_upload_doc(
         file_path=file_path,
         project_id=project_id,
         branch=branch,
-        author=author or os.getenv("USER", "cli")
+        author=author or os.getenv("USER", "cli"),
+        doc_key=doc_key,
+        doc_version=doc_version,
+        base_version=base_version,
+        base_branch=base_branch,
     ))
 
     print(f"Pushing processed document and graph delta to {server_url}/sources/push-processed...")
@@ -782,6 +814,7 @@ def run_kb_coverage(
 
 _CLI_VALUE_FLAGS = frozenset({
     "--branch",
+    "--base-branch",
     "--url",
     "--scoped",
     "--base",
@@ -790,6 +823,9 @@ _CLI_VALUE_FLAGS = frozenset({
     "--author",
     "--output",
     "--db-path",
+    "--doc-key",
+    "--doc-version",
+    "--base-version",
 })
 
 
@@ -835,17 +871,18 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "graphify-sync":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 1:
-            print("Usage: python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--url URL] [--scoped P1,P2] [--dirty] [--local-only]")
+            print("Usage: python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--base-branch BASE] [--url URL] [--scoped P1,P2] [--dirty] [--local-only]")
             sys.exit(1)
         project_id = pos_args[0]
         workspace_path = pos_args[1] if len(pos_args) > 1 else _get_flag("--path", ".")
         branch = _get_flag("--branch", "main")
+        base_branch = _get_flag("--base-branch", None)
         server_url = _get_flag("--url", None)
         scoped_raw = _get_flag("--scoped", None)
         scoped_paths = [p.strip() for p in scoped_raw.split(",") if p.strip()] if scoped_raw else None
         git_dirty = any(a in sys.argv for a in ["--dirty", "-d"])
         local_only = any(a in sys.argv for a in ["--local-only", "-l"])
-        run_graphify_sync(project_id, workspace_path, branch, server_url, scoped_paths, git_dirty, local_only)
+        run_graphify_sync(project_id, workspace_path, branch, server_url, scoped_paths, git_dirty, local_only, base_branch=base_branch)
     elif len(sys.argv) > 1 and sys.argv[1] == "graphify-diff":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 1:
@@ -861,14 +898,28 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "upload-doc":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 2:
-            print("Usage: python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--url URL] [--author A]")
+            print("Usage: python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--base-branch BASE] [--doc-key KEY] [--doc-version VER] [--base-version BASE_VER] [--url URL] [--author A]")
             sys.exit(1)
         project_id = pos_args[0]
         file_path = pos_args[1]
         branch = _get_flag("--branch", "main")
         server_url = _get_flag("--url", None)
         author = _get_flag("--author", None)
-        run_upload_doc(project_id, file_path, branch, server_url, author)
+        doc_key = _get_flag("--doc-key", None)
+        doc_version = _get_flag("--doc-version", None)
+        base_version = _get_flag("--base-version", None)
+        base_branch = _get_flag("--base-branch", None)
+        run_upload_doc(
+            project_id,
+            file_path,
+            branch,
+            server_url,
+            author,
+            doc_key=doc_key,
+            doc_version=doc_version,
+            base_version=base_version,
+            base_branch=base_branch,
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "codegraph-sync":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 1:
@@ -891,15 +942,32 @@ if __name__ == "__main__":
         dir_path = sys.argv[3]
         run_ingest_files(project_id, dir_path)
     elif len(sys.argv) > 1 and sys.argv[1] == "upload-file":
-        if len(sys.argv) < 4:
-            print("Usage: python -m projectbrain.main upload-file <project_id> <file_path> [url] [tags] [author]")
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 2:
+            print("Usage: python -m projectbrain.main upload-file <project_id> <file_path> [url] [tags] [author] [--branch main] [--base-branch BASE] [--doc-key KEY] [--doc-version VER] [--base-version BASE_VER]")
             sys.exit(1)
-        project_id = sys.argv[2]
-        file_path = sys.argv[3]
-        server_url = sys.argv[4] if len(sys.argv) > 4 else None
-        tags = sys.argv[5] if len(sys.argv) > 5 else ""
-        author = sys.argv[6] if len(sys.argv) > 6 else None
-        run_upload_file(project_id, file_path, server_url, tags, author)
+        project_id = pos_args[0]
+        file_path = pos_args[1]
+        server_url = pos_args[2] if len(pos_args) > 2 else _get_flag("--url", None)
+        tags = pos_args[3] if len(pos_args) > 3 else ""
+        author = pos_args[4] if len(pos_args) > 4 else _get_flag("--author", None)
+        branch = _get_flag("--branch", "main")
+        doc_key = _get_flag("--doc-key", None)
+        doc_version = _get_flag("--doc-version", None)
+        base_version = _get_flag("--base-version", None)
+        base_branch = _get_flag("--base-branch", None)
+        run_upload_file(
+            project_id,
+            file_path,
+            server_url,
+            tags,
+            author,
+            branch=branch,
+            doc_key=doc_key,
+            doc_version=doc_version,
+            base_version=base_version,
+            base_branch=base_branch,
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "build-kb":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         project_id = pos_args[0] if len(pos_args) > 0 else "project-brain"

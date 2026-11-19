@@ -429,7 +429,7 @@ async def projectbrain_ingest(source: str, creds: dict = None, filters: dict = N
         traceback.print_exc(file=sys.stderr)
         return f"Error: {str(e)}"
 
-async def sync_codebase_memories(project_id: str, dir_path: str) -> dict:
+async def sync_codebase_memories(project_id: str, dir_path: str, base_branch: Optional[str] = None) -> dict:
     import os
     exclude_dirs = {
         ".git", "node_modules", "dist", "build", "__pycache__", 
@@ -451,6 +451,62 @@ async def sync_codebase_memories(project_id: str, dir_path: str) -> dict:
     
     count = 0
     errors = 0
+
+    if base_branch and ":" in project_id:
+        proj, br = project_id.split(":", 1)
+        if br and br != base_branch:
+            from ..core.db import register_memory_branch, record_memory_tombstone
+            from ..memory.hsg import delete_branch_target_memories, invalidate_query_cache
+            from ..graphify_engine.extractor import GraphifyExtractor
+
+            register_memory_branch(proj, br, base_branch)
+            invalidate_query_cache()
+
+            resolved_dir = str(Path(dir_path).resolve())
+            changed_files, deleted_rel_paths = GraphifyExtractor()._discover_git_diff(
+                Path(resolved_dir), base_branch
+            )
+            for rel in deleted_rel_paths:
+                await delete_branch_target_memories(proj, br, "file", rel)
+                record_memory_tombstone(proj, br, "file", rel)
+
+            for fpath in changed_files:
+                fpath_str = str(fpath)
+                rel_path = os.path.relpath(fpath_str, resolved_dir).replace("\\", "/")
+                dir_parts = rel_path.split("/")[:-1]
+                if any(p in exclude_dirs or (p.startswith(".") and p not in (".", "..")) for p in dir_parts):
+                    continue
+                file = os.path.basename(fpath_str)
+                ext = os.path.splitext(file)[1].lower()
+                if ext in exclude_exts:
+                    continue
+
+                await delete_branch_target_memories(proj, br, "file", rel_path)
+                record_memory_tombstone(proj, br, "file", rel_path)
+                try:
+                    with open(fpath_str, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    if not content.strip():
+                        continue
+                    meta = {
+                        "source": "mcp_sync_all",
+                        "filename": file,
+                        "file_path": rel_path,
+                        "project_id": project_id
+                    }
+                    await mem.add(
+                        content=f"File: {rel_path}\n\n{content}",
+                        user_id=project_id,
+                        meta=meta,
+                        tags=["codebase", "file"]
+                    )
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Failed to ingest {rel_path} in MCP delta sync: {e}")
+                    errors += 1
+
+            invalidate_query_cache()
+            return {"total_ingested": count, "total_errors": errors}
     
     for root, dirs, files in os.walk(dir_path):
         dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")]
@@ -494,7 +550,8 @@ async def projectbrain_sync_codegraph(
     project_path: str = None, 
     branch: str = None, 
     sync_memories: bool = True,
-    author: str = None
+    author: str = None,
+    base_branch: Optional[str] = None
 ) -> str:
     """
     Synchronize the local codegraph database (.codegraph/codegraph.db in current working directory or specified project path)
@@ -506,6 +563,7 @@ async def projectbrain_sync_codegraph(
         branch: Optional branch name to associate with the synchronization. If not specified, tries to auto-detect the active git branch.
         sync_memories: If True (default), scans and ingests all text source files as memories.
         author: Optional name of the user performing the sync.
+        base_branch: Optional parent/base branch for delta-only memory sync and overlay inheritance.
     """
     import shutil
     import subprocess
@@ -746,13 +804,20 @@ async def projectbrain_sync_codegraph(
         
         mem_res = None
         if sync_memories:
-            mem_res = await sync_codebase_memories(sync_project_id, resolved_project_path)
+            mem_res = await sync_codebase_memories(sync_project_id, resolved_project_path, base_branch=base_branch)
             res["memories"] = mem_res
             res["message"] = (
                 f"Successfully synchronized {len(nodes)} nodes, {len(edges)} edges, "
                 f"and ingested {mem_res['total_ingested']} codebase files as memories "
                 f"(with {mem_res['total_errors']} errors)!"
             )
+        elif base_branch and ":" in sync_project_id:
+            proj, br = sync_project_id.split(":", 1)
+            if br and br != base_branch:
+                from ..core.db import register_memory_branch
+                from ..memory.hsg import invalidate_query_cache
+                register_memory_branch(proj, br, base_branch)
+                invalidate_query_cache()
             
         return json.dumps(res, indent=2)
     except Exception as e:
@@ -1136,7 +1201,8 @@ async def projectbrain_sync_graphify(
     git_dirty_only: bool = False,
     local_only: bool = False,
     cluster: bool = True,
-    include_docs: bool = True
+    include_docs: bool = True,
+    base_branch: Optional[str] = None
 ) -> str:
     """
     Extract AST code graph and document entities via Graphify and synchronize to ProjectBrain.
@@ -1166,6 +1232,7 @@ async def projectbrain_sync_graphify(
             scoped_paths=scoped_paths,
             git_dirty_only=git_dirty_only,
             include_docs=include_docs,
+            base_branch=base_branch,
         )
 
         if cluster and delta.nodes:
@@ -1180,19 +1247,21 @@ async def projectbrain_sync_graphify(
             output_dir=os.path.join(workspace_path, ".projectbrain", "local_graph")
         )
 
+        is_partial = bool(scoped_paths or git_dirty_only or (base_branch and base_branch != target_branch))
+
         if local_only:
             return json.dumps({
                 "status": "cached_local",
                 "project_id": target_proj,
                 "branch": target_branch,
+                "base_branch": base_branch,
                 "local_path": local_file,
                 "nodes_count": len(delta.nodes),
                 "edges_count": len(delta.edges),
                 "hyperedges_count": len(delta.hyperedges),
-                "partial": bool(scoped_paths or git_dirty_only),
+                "partial": is_partial,
             }, indent=2)
 
-        is_partial = bool(scoped_paths or git_dirty_only)
         synced_files_list = [sf["file_path"] if isinstance(sf, dict) else str(sf) for sf in delta.synced_files]
 
         if is_pb_remote_mode():
@@ -1203,6 +1272,7 @@ async def projectbrain_sync_graphify(
             payload = {
                 "project_id": target_proj,
                 "branch": target_branch,
+                "base_branch": base_branch,
                 "nodes": [n.to_dict() if hasattr(n, "to_dict") else n.model_dump() for n in delta.nodes],
                 "edges": [e.to_dict() if hasattr(e, "to_dict") else e.model_dump() for e in delta.edges],
                 "hyperedges": [h.to_dict() if hasattr(h, "to_dict") else h.model_dump() for h in delta.hyperedges],
@@ -1210,6 +1280,7 @@ async def projectbrain_sync_graphify(
                 "edge_tombstones": delta.edge_tombstones,
                 "hyperedge_tombstones": delta.hyperedge_tombstones,
                 "synced_files": delta.synced_files,
+                "deleted_files": delta.deleted_files,
                 "partial": is_partial,
                 "author": os.getenv("USER", "system"),
                 "cluster": False,
@@ -1227,8 +1298,18 @@ async def projectbrain_sync_graphify(
                     delta=delta,
                     partial=is_partial,
                     synced_files=synced_files_list,
+                    deleted_files=delta.deleted_files,
                     author=os.getenv("USER", "system"),
+                    base_branch=base_branch,
                 )
+                if base_branch and base_branch != target_branch:
+                    try:
+                        from ..core.db import register_memory_branch
+                        from ..memory.hsg import invalidate_query_cache
+                        register_memory_branch(target_proj, target_branch, base_branch)
+                        invalidate_query_cache()
+                    except Exception as me:
+                        logger.debug(f"Memory branch registration skipped for {target_proj}:{target_branch}: {me}")
                 return json.dumps(res, indent=2)
             finally:
                 store.close()
@@ -1459,7 +1540,7 @@ async def projectbrain_hybrid_query(
 
 @mcp_server.tool(
     name="projectbrain_upload_document",
-    description="Process and ingest multimodal document (.pdf, .docx, .xlsx, .pptx, .csv, .md, images) into Graphify and ProjectBrain memory."
+    description="Process and ingest multimodal document (.pdf, .docx, .xlsx, .pptx, .csv, .md, images) into Graphify and ProjectBrain memory with versioned pre-OCR delta reuse."
 )
 async def projectbrain_upload_document(
     file_path: str,
@@ -1467,7 +1548,11 @@ async def projectbrain_upload_document(
     branch: str = "main",
     author: Optional[str] = None,
     tags: Optional[List[str]] = None,
-    push_to_server: Optional[bool] = None
+    push_to_server: Optional[bool] = None,
+    doc_key: Optional[str] = None,
+    doc_version: Optional[str] = None,
+    base_version: Optional[str] = None,
+    base_branch: Optional[str] = None,
 ) -> str:
     """
     Process and ingest multimodal document into Graphify and ProjectBrain memory.
@@ -1477,9 +1562,8 @@ async def projectbrain_upload_document(
             return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
 
         from ..graphify_engine.doc_pipeline import DocumentPipeline
+        from ..graphify_engine.doc_versioning import ingest_document_versioned
         from ..graphify_engine.models import GraphDelta
-        from ..graphify_engine.store import get_graph_store
-        from ..memory.hsg import add_hsg_memory
 
         resolved_proj = resolve_mcp_user_id(project_id)
         if ":" in resolved_proj:
@@ -1497,10 +1581,18 @@ async def projectbrain_upload_document(
             branch=target_branch,
             author=author,
             tags=tags,
+            doc_key=doc_key,
+            doc_version=doc_version,
+            base_version=base_version,
+            base_branch=base_branch,
         )
 
         should_push = push_to_server if push_to_server is not None else is_pb_remote_mode()
         if should_push:
+            payload["doc_key"] = doc_key or payload["document"].get("doc_key")
+            payload["doc_version"] = doc_version or payload["document"].get("doc_version")
+            payload["base_version"] = base_version
+            payload["base_branch"] = base_branch or payload["document"].get("base_branch")
             res = await pipeline.push_processed_to_server(
                 server_url=get_pb_server_url(),
                 payload=payload,
@@ -1509,21 +1601,19 @@ async def projectbrain_upload_document(
             return json.dumps(res, indent=2)
         else:
             doc = payload["document"]
-            effective_user = f"{target_proj}:{target_branch}" if target_branch and target_branch != "main" and ":" not in target_proj else target_proj
-            memories_created = 0
-            for ch in doc.get("chunks", []):
-                content = ch.get("content") or ch.get("text") or ""
-                if not content.strip():
-                    continue
-                chunk_tags = ch.get("tags") or ["document"]
-                tag_str = ",".join(chunk_tags) if isinstance(chunk_tags, list) else str(chunk_tags)
-                await add_hsg_memory(
-                    content=content,
-                    tags=tag_str,
-                    metadata={"filename": doc.get("filename"), "sha256": doc.get("sha256"), "author": author},
-                    user_id=effective_user,
-                )
-                memories_created += 1
+            ver_res = await ingest_document_versioned(
+                filename=doc.get("filename") or str(file_path),
+                markdown_content=doc.get("markdown_content", ""),
+                precomputed_units=doc.get("units") or None,
+                project_id=target_proj,
+                branch=target_branch,
+                author=author,
+                tags=tags or ["document"],
+                doc_key=doc_key or doc.get("doc_key"),
+                doc_version=doc_version or doc.get("doc_version"),
+                base_version=base_version,
+                base_branch=base_branch or doc.get("base_branch"),
+            )
 
             delta_dict = payload["graph_delta"]
             delta = GraphDelta(
@@ -1546,6 +1636,7 @@ async def projectbrain_upload_document(
                     partial=True,
                     synced_files=[str(file_path)],
                     author=author or "system",
+                    base_branch=ver_res.get("base_branch") or base_branch,
                 )
             finally:
                 store.close()
@@ -1554,9 +1645,17 @@ async def projectbrain_upload_document(
                 "mode": "local",
                 "project_id": target_proj,
                 "branch": target_branch,
-                "memories_created": memories_created,
+                "memories_created": ver_res["memories_created"],
                 "nodes_upserted": sync_res.get("nodes_upserted", len(delta.nodes)),
                 "edges_upserted": sync_res.get("edges_upserted", len(delta.edges)),
+                "doc_key": ver_res["doc_key"],
+                "doc_version": ver_res["doc_version"],
+                "parent_version": ver_res["parent_version"],
+                "base_branch": ver_res["base_branch"],
+                "total_units": ver_res["total_units"],
+                "reused_units": ver_res["reused_units"],
+                "new_units": ver_res["new_units"],
+                "deleted_units": ver_res["deleted_units"],
             }, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
@@ -1564,7 +1663,7 @@ async def projectbrain_upload_document(
 
 @mcp_server.tool(
     name="projectbrain_push_processed_document",
-    description="Directly push pre-extracted document Markdown and Graphify entities to ProjectBrain server or local memory."
+    description="Directly push pre-extracted document Markdown and Graphify entities to ProjectBrain server or local memory with versioning."
 )
 async def projectbrain_push_processed_document(
     filename: str,
@@ -1573,7 +1672,11 @@ async def projectbrain_push_processed_document(
     branch: str = "main",
     author: Optional[str] = None,
     tags: Optional[List[str]] = None,
-    server_url: Optional[str] = None
+    server_url: Optional[str] = None,
+    doc_key: Optional[str] = None,
+    doc_version: Optional[str] = None,
+    base_version: Optional[str] = None,
+    base_branch: Optional[str] = None,
 ) -> str:
     """
     Directly push pre-extracted document Markdown and Graphify entities to ProjectBrain server or local memory.
@@ -1583,9 +1686,7 @@ async def projectbrain_push_processed_document(
             return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
 
         from ..graphify_engine.extractor import GraphifyExtractor
-        from ..graphify_engine.models import GraphDelta
-        from ..graphify_engine.store import get_graph_store
-        from ..memory.hsg import add_hsg_memory
+        from ..graphify_engine.doc_versioning import ingest_document_versioned
         from ..utils.chunking import chunk_text
 
         resolved_proj = resolve_mcp_user_id(project_id)
@@ -1615,6 +1716,10 @@ async def projectbrain_push_processed_document(
         payload = {
             "project_id": target_proj,
             "branch": target_branch,
+            "doc_key": doc_key,
+            "doc_version": doc_version,
+            "base_version": base_version,
+            "base_branch": base_branch,
             "document": {
                 "filename": filename,
                 "sha256": sha256,
@@ -1622,6 +1727,10 @@ async def projectbrain_push_processed_document(
                 "file_type": "document",
                 "markdown_content": markdown_content,
                 "chunks": chunks,
+                "doc_key": doc_key,
+                "doc_version": doc_version,
+                "base_version": base_version,
+                "base_branch": base_branch,
             },
             "graph_delta": delta.to_dict() if hasattr(delta, "to_dict") else delta.model_dump(),
         }
@@ -1635,16 +1744,18 @@ async def projectbrain_push_processed_document(
                 resp.raise_for_status()
                 return json.dumps(resp.json(), indent=2)
         else:
-            effective_user = f"{target_proj}:{target_branch}" if target_branch and target_branch != "main" and ":" not in target_proj else target_proj
-            memories_created = 0
-            for ch in chunks:
-                await add_hsg_memory(
-                    content=ch["content"],
-                    tags=",".join(ch["tags"]),
-                    metadata={"filename": filename, "sha256": sha256, "author": author},
-                    user_id=effective_user,
-                )
-                memories_created += 1
+            ver_res = await ingest_document_versioned(
+                filename=filename,
+                markdown_content=markdown_content,
+                project_id=target_proj,
+                branch=target_branch,
+                author=author,
+                tags=tags or ["document"],
+                doc_key=doc_key,
+                doc_version=doc_version,
+                base_version=base_version,
+                base_branch=base_branch,
+            )
 
             store = _get_mcp_graph_store()
             try:
@@ -1655,6 +1766,7 @@ async def projectbrain_push_processed_document(
                     partial=True,
                     synced_files=[filename],
                     author=author or "system",
+                    base_branch=ver_res.get("base_branch") or base_branch,
                 )
             finally:
                 store.close()
@@ -1663,13 +1775,151 @@ async def projectbrain_push_processed_document(
                 "mode": "local",
                 "project_id": target_proj,
                 "branch": target_branch,
-                "memories_created": memories_created,
+                "memories_created": ver_res["memories_created"],
                 "nodes_upserted": sync_res.get("nodes_upserted", len(delta.nodes)),
                 "edges_upserted": sync_res.get("edges_upserted", len(delta.edges)),
+                "doc_key": ver_res["doc_key"],
+                "doc_version": ver_res["doc_version"],
+                "parent_version": ver_res["parent_version"],
+                "base_branch": ver_res["base_branch"],
+                "total_units": ver_res["total_units"],
+                "reused_units": ver_res["reused_units"],
+                "new_units": ver_res["new_units"],
+                "deleted_units": ver_res["deleted_units"],
             }, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_push_processed_document: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_list_document_versions",
+    description="List version history for a versioned document (doc_key) in a ProjectBrain project and optional branch."
+)
+async def projectbrain_list_document_versions(
+    doc_key: str,
+    project_id: Optional[str] = None,
+    branch: Optional[str] = None,
+) -> str:
+    """List version history for a specific doc_key."""
+    try:
+        if project_id and project_id.strip():
+            raw_proj = project_id.strip()
+            if ":" in raw_proj:
+                target_proj, proj_br = raw_proj.split(":", 1)
+                target_branch = branch if branch is not None else proj_br
+            else:
+                target_proj = raw_proj
+                target_branch = branch
+        else:
+            resolved_proj = resolve_mcp_user_id(project_id)
+            if ":" in resolved_proj:
+                target_proj, proj_br = resolved_proj.split(":", 1)
+                target_branch = branch if branch is not None else proj_br
+            else:
+                target_proj = resolved_proj
+                target_branch = branch
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            headers = {"Authorization": f"Bearer {get_pb_api_key()}"} if get_pb_api_key() else {}
+            params: Dict[str, Any] = {"project_id": target_proj}
+            if target_branch:
+                params["branch"] = target_branch
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{server_url}/sources/documents/{doc_key}/versions",
+                    params=params,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            from ..graphify_engine.doc_versioning import list_document_versions
+            versions = list_document_versions(
+                project_id=target_proj,
+                doc_key=doc_key,
+                branch=target_branch,
+            )
+            return json.dumps({
+                "project_id": target_proj,
+                "doc_key": doc_key,
+                "branch": target_branch,
+                "versions": versions,
+            }, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_list_document_versions: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_diff_document_versions",
+    description="Compute unit-level diff (unchanged, modified, added, removed pages/sections/slides/sheets) between two versions of a document."
+)
+async def projectbrain_diff_document_versions(
+    doc_key: str,
+    from_version: str,
+    to_version: str,
+    project_id: Optional[str] = None,
+    branch: Optional[str] = None,
+    from_branch: Optional[str] = None,
+    to_branch: Optional[str] = None,
+) -> str:
+    """Compute unit-level diff between two versions of a document."""
+    try:
+        if project_id and project_id.strip():
+            raw_proj = project_id.strip()
+            if ":" in raw_proj:
+                target_proj, proj_br = raw_proj.split(":", 1)
+                target_branch = branch or proj_br or "main"
+            else:
+                target_proj = raw_proj
+                target_branch = branch or "main"
+        else:
+            resolved_proj = resolve_mcp_user_id(project_id)
+            if ":" in resolved_proj:
+                target_proj, proj_br = resolved_proj.split(":", 1)
+                target_branch = branch or proj_br or "main"
+            else:
+                target_proj = resolved_proj
+                target_branch = branch or "main"
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            headers = {"Authorization": f"Bearer {get_pb_api_key()}"} if get_pb_api_key() else {}
+            params: Dict[str, Any] = {
+                "project_id": target_proj,
+                "from_version": from_version,
+                "to_version": to_version,
+                "branch": target_branch,
+            }
+            if from_branch:
+                params["from_branch"] = from_branch
+            if to_branch:
+                params["to_branch"] = to_branch
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{server_url}/sources/documents/{doc_key}/diff",
+                    params=params,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            from ..graphify_engine.doc_versioning import diff_document_versions
+            diff_res = diff_document_versions(
+                project_id=target_proj,
+                doc_key=doc_key,
+                from_version=from_version,
+                to_version=to_version,
+                branch=target_branch,
+                from_branch=from_branch,
+                to_branch=to_branch,
+            )
+            return json.dumps(diff_res, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_diff_document_versions: {str(e)}"
 
 @mcp_server.tool(
     name="projectbrain_promote_branch_graph",
@@ -1677,10 +1927,11 @@ async def projectbrain_push_processed_document(
 )
 async def projectbrain_promote_branch_graph(
     project_id: str,
-    branch: str
+    branch: str,
+    target_branch: Optional[str] = None
 ) -> str:
     """
-    Atomically promote branch overlay schema mutations into canonical root schema.
+    Atomically promote branch overlay schema mutations into canonical root or target parent branch schema.
     """
     try:
         if check_read_only():
@@ -1691,10 +1942,10 @@ async def projectbrain_promote_branch_graph(
         if ":" in resolved_proj:
             p_parts = resolved_proj.split(":", 1)
             target_proj = p_parts[0]
-            target_branch = branch if branch else (p_parts[1] or "main")
+            source_branch = branch if branch else (p_parts[1] or "main")
         else:
             target_proj = resolved_proj
-            target_branch = branch
+            source_branch = branch
 
         if is_pb_remote_mode():
             import httpx
@@ -1703,7 +1954,11 @@ async def projectbrain_promote_branch_graph(
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
                     f"{server_url}/graphify/promote",
-                    json={"project_id": target_proj, "branch": target_branch},
+                    json={
+                        "project_id": target_proj,
+                        "branch": source_branch,
+                        "target_branch": target_branch,
+                    },
                     headers=headers,
                 )
                 resp.raise_for_status()
@@ -1711,7 +1966,11 @@ async def projectbrain_promote_branch_graph(
         else:
             store = _get_mcp_graph_store()
             try:
-                res = store.promote_branch_to_root(project_id=target_proj, branch_name=target_branch)
+                res = store.promote_branch_to_root(
+                    project_id=target_proj,
+                    branch_name=source_branch,
+                    target_branch=target_branch,
+                )
                 return json.dumps(res, indent=2)
             finally:
                 store.close()

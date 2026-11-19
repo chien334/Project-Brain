@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -366,6 +367,312 @@ async def pptx_to_markdown(file_bytes: bytes) -> str:
         return "\n".join(markdown_text).strip()
     except Exception as e:
         raise ValueError(f"Failed to parse PPTX: {str(e)}")
+
+
+def inspect_pdf_pages_pre_ocr(file_bytes: bytes) -> List[Dict[str, Any]]:
+    """Inspect PDF pages without rendering PNGs, cropping images, or running OCR."""
+    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+    pages: List[Dict[str, Any]] = []
+    for i, page in enumerate(reader.pages):
+        try:
+            raw_text = (page.extract_text() or "").strip()
+        except Exception:
+            raw_text = ""
+        img_hashes: List[str] = []
+        try:
+            for im in getattr(page, "images", []):
+                data = getattr(im, "data", None)
+                if data:
+                    img_hashes.append(hashlib.sha256(data).hexdigest())
+        except Exception:
+            pass
+
+        raw_stream_hash = ""
+        if raw_text == "" and not img_hashes:
+            try:
+                contents = page.get_contents()
+                if contents is not None:
+                    stream_data = contents.get_data()
+                    if stream_data:
+                        raw_stream_hash = hashlib.sha256(stream_data).hexdigest()
+            except Exception:
+                raw_stream_hash = ""
+
+        digest_input = f"{raw_text}|{','.join(img_hashes)}|{raw_stream_hash}"
+        unit_sha256 = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+        pages.append({
+            "page_index": i,
+            "page_num": i + 1,
+            "unit_title": f"Page {i + 1}",
+            "unit_sha256": unit_sha256,
+        })
+    return pages
+
+
+def _extract_pdfplumber_single_page_sync(file_bytes: bytes, page_index: int) -> Optional[Dict[str, Any]]:
+    import pdfplumber
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        if page_index < 0 or page_index >= len(pdf.pages):
+            return None
+        page = pdf.pages[page_index]
+        page_num = page_index + 1
+        base_parts: List[str] = [f"## Page {page_num}\n"]
+
+        text = page.extract_text(x_tolerance=2)
+        page_has_text = bool(text and len(text.strip()) >= 15)
+        if text:
+            base_parts.append(text + "\n")
+
+        tables = page.extract_tables()
+        if tables:
+            for table in tables:
+                if table and len(table) > 0:
+                    col_count = max((len(row) for row in table), default=0)
+                    if col_count > 0:
+                        def normalize_row(row):
+                            cells = [
+                                str(row[i] if i < len(row) and row[i] is not None else "")
+                                .replace("|", "\\|")
+                                .replace("\n", " ")
+                                for i in range(col_count)
+                            ]
+                            return "| " + " | ".join(cells) + " |"
+
+                        header = normalize_row(table[0])
+                        separator = "| " + " | ".join(["---"] * col_count) + " |"
+                        body_rows = [normalize_row(row) for row in table[1:]]
+                        body = "\n".join(body_rows) if body_rows else ""
+                        base_parts.append(f"\n{header}\n{separator}\n{body}\n")
+
+        has_images = bool(hasattr(page, "images") and page.images)
+        cropped_images = (
+            _crop_page_images_from_pdfplumber_page(page)
+            if (page_has_text and has_images)
+            else None
+        )
+        return {
+            "page_index": page_index,
+            "base_parts": base_parts,
+            "page_has_text": page_has_text,
+            "has_images": has_images,
+            "cropped_images": cropped_images,
+        }
+
+
+def _extract_pypdf_single_page_sync(file_bytes: bytes, page_index: int) -> Optional[Dict[str, Any]]:
+    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+    if page_index < 0 or page_index >= len(reader.pages):
+        return None
+    page = reader.pages[page_index]
+    text = page.extract_text()
+    images: List[Optional[Tuple[bytes, str]]] = []
+    if hasattr(page, "images") and page.images:
+        for img_file in page.images:
+            try:
+                img_bytes = getattr(img_file, "data", None)
+                if img_bytes:
+                    name = getattr(img_file, "name", "image.png")
+                    mime_type = (
+                        "image/jpeg"
+                        if name.lower().endswith((".jpg", ".jpeg"))
+                        else "image/png"
+                    )
+                    images.append((img_bytes, mime_type))
+            except Exception:
+                images.append(None)
+    return {
+        "page_num": page_index + 1,
+        "text": text,
+        "images": images,
+    }
+
+
+async def parse_pdf_page_markdown(file_bytes: bytes, page_index: int) -> str:
+    """Extract Markdown for a single PDF page without touching/rendering/OCR-ing other pages."""
+    try:
+        import pdfplumber  # noqa: F401
+        pdata = await asyncio.to_thread(_extract_pdfplumber_single_page_sync, file_bytes, page_index)
+        if pdata is None:
+            return ""
+        text_parts: List[str] = list(pdata["base_parts"])
+        full_page_ocred = False
+
+        if not pdata["page_has_text"]:
+            page_ocr = await _ocr_full_pdf_page(file_bytes, pdata["page_index"])
+            if page_ocr and page_ocr.strip():
+                text_parts.append(
+                    "\n<!-- Start Page OCR -->\n"
+                    + page_ocr.strip()
+                    + "\n<!-- End Page OCR -->\n"
+                )
+                full_page_ocred = True
+
+        if not full_page_ocred and pdata["has_images"]:
+            cropped_images = pdata["cropped_images"]
+            if cropped_images is None:
+                cropped_images = await asyncio.to_thread(
+                    _crop_pdf_page_images_sync, file_bytes, pdata["page_index"]
+                )
+            for img_bytes in cropped_images:
+                if img_bytes is None:
+                    text_parts.append("![Image]\n")
+                else:
+                    ocr_result = await call_ocr_if_available(img_bytes, "image/png")
+                    text_parts.append(ocr_result + "\n")
+
+        return "\n".join(text_parts).strip()
+    except ImportError:
+        try:
+            pdata = await asyncio.to_thread(_extract_pypdf_single_page_sync, file_bytes, page_index)
+            if pdata is None:
+                return ""
+            page_text: List[str] = []
+            if pdata["text"]:
+                page_text.append(pdata["text"])
+            for img_item in pdata["images"]:
+                if img_item is None:
+                    page_text.append("![Image]\n")
+                else:
+                    img_bytes, mime_type = img_item
+                    ocr_result = await call_ocr_if_available(img_bytes, mime_type)
+                    page_text.append(ocr_result)
+            if page_text:
+                return f"## Page {pdata['page_num']}\n\n" + "\n".join(page_text)
+            return ""
+        except Exception as e:
+            raise ValueError(f"Failed to parse PDF page {page_index}: {str(e)}")
+    except Exception as e:
+        raise ValueError(f"Failed to parse PDF page {page_index}: {str(e)}")
+
+
+def inspect_pptx_slides_pre_ocr(file_bytes: bytes) -> List[Dict[str, Any]]:
+    """Inspect PPTX slides and hash text + raw image blobs BEFORE calling OCR."""
+    from pptx import Presentation
+    prs = Presentation(io.BytesIO(file_bytes))
+    slides: List[Dict[str, Any]] = []
+    for i, slide in enumerate(prs.slides):
+        items: List[Tuple[str, Any]] = [("text", f"\n## Slide {i + 1}\n")]
+        text_parts_for_hash: List[str] = []
+        img_hashes: List[str] = []
+        slide_title = f"Slide {i + 1}"
+        title_found = False
+
+        shapes = sorted(slide.shapes, key=lambda x: x.top)
+        for shape in shapes:
+            if shape.has_text_frame:
+                if shape.is_placeholder and shape.placeholder_format.type in [1, 13, 14, 15, 16]:
+                    if shape.text and shape.text.strip():
+                        clean_t = shape.text.strip()
+                        if not title_found:
+                            slide_title = clean_t
+                            title_found = True
+                        items.append(("text", f"# {clean_t}\n"))
+                        text_parts_for_hash.append(f"# {clean_t}")
+                else:
+                    for paragraph in shape.text_frame.paragraphs:
+                        para_text = "".join(run.text for run in paragraph.runs).strip()
+                        if not para_text:
+                            continue
+                        prefix = ""
+                        if paragraph.level > 0:
+                            prefix = "  " * paragraph.level + "* "
+                        elif para_text.startswith(("•", "–", "-")):
+                            prefix = "* "
+                            para_text = para_text[1:].lstrip()
+                        line = f"{prefix}{para_text}"
+                        items.append(("text", line))
+                        text_parts_for_hash.append(line)
+                    items.append(("text", ""))
+            elif hasattr(shape, "image"):
+                try:
+                    img_bytes = shape.image.blob
+                    mime_type = shape.image.content_type
+                    items.append(("image", (img_bytes, mime_type)))
+                    if img_bytes:
+                        img_hashes.append(hashlib.sha256(img_bytes).hexdigest())
+                except Exception:
+                    items.append(("text", "![Image]\n"))
+
+        digest_input = "\n".join(text_parts_for_hash) + "|" + ",".join(img_hashes)
+        unit_sha256 = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+        slides.append({
+            "unit_index": i,
+            "unit_title": slide_title,
+            "unit_sha256": unit_sha256,
+            "items": items,
+        })
+    return slides
+
+
+async def parse_pptx_slide_markdown(slide_info: Dict[str, Any]) -> str:
+    """Run OCR only on a single slide's images and return Markdown."""
+    markdown_text: List[str] = []
+    for kind, payload in slide_info.get("items", []):
+        if kind == "text":
+            markdown_text.append(payload)
+        elif kind == "image":
+            img_bytes, mime_type = payload
+            ocr_result = await call_ocr_if_available(img_bytes, mime_type)
+            markdown_text.append(ocr_result)
+    return "\n".join(markdown_text).strip()
+
+
+def format_excel_sheet_markdown(sheet_name: str, raw_rows: List[Tuple[Any, ...]]) -> str:
+    """Format raw openpyxl row tuples for a single sheet into Markdown."""
+    lines: List[str] = [f"## Sheet: {sheet_name}\n"]
+    max_cols = 0
+    for row in raw_rows:
+        if row and any(row[i] is not None for i in range(len(row))):
+            max_cols = max(max_cols, len(row))
+
+    if max_cols == 0:
+        lines.append("_Empty sheet_\n")
+        return "\n".join(lines)
+
+    first_row = True
+    for row in raw_rows:
+        if not row or not any(row[i] is not None for i in range(len(row))):
+            continue
+        padded_row = [str(row[i]) if i < len(row) and row[i] is not None else "" for i in range(max_cols)]
+        cleaned_row = [val.replace("|", "\\|").replace("\n", " ") for val in padded_row]
+        row_str = "| " + " | ".join(cleaned_row) + " |"
+
+        if first_row:
+            lines.append(row_str)
+            separator = "| " + " | ".join(["---"] * max_cols) + " |"
+            lines.append(separator)
+            first_row = False
+        else:
+            lines.append(row_str)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def inspect_excel_sheets_raw(file_bytes: bytes) -> List[Dict[str, Any]]:
+    """Inspect Excel sheets via openpyxl and hash raw cell tuples before Markdown formatting."""
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    sheets: List[Dict[str, Any]] = []
+    try:
+        for idx, name in enumerate(wb.sheetnames):
+            ws = wb[name]
+            raw_rows = [tuple(row) for row in ws.iter_rows(values_only=True)]
+            normalized_rows = [
+                tuple("" if cell is None else str(cell) for cell in row)
+                for row in raw_rows
+                if row and any(cell is not None for cell in row)
+            ]
+            digest_payload = f"{name}|" + repr(normalized_rows)
+            unit_sha256 = hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
+            sheets.append({
+                "unit_index": idx,
+                "unit_title": name,
+                "unit_sha256": unit_sha256,
+                "raw_rows": raw_rows,
+            })
+    finally:
+        wb.close()
+    return sheets
 
 
 async def parse_document(filename: str, file_bytes: bytes) -> str:
