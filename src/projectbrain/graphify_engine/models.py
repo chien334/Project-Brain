@@ -75,6 +75,8 @@ class GraphDelta(BaseGraphModel):
     edge_tombstones: List[Dict[str, Any]] = Field(default_factory=list)  # [{"source": ..., "target": ..., "relation": ...}]
     hyperedge_tombstones: List[str] = Field(default_factory=list)
     synced_files: List[Dict[str, Any]] = Field(default_factory=list)  # [{"file_path": ..., "sha256": ...}]
+    deleted_files: List[str] = Field(default_factory=list)
+    base_branch: Optional[str] = None
 
 
 class BranchDiffSummary(BaseGraphModel):

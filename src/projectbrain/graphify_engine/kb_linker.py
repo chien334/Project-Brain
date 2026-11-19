@@ -1265,7 +1265,7 @@ class UnifiedKBBuilder:
         if store is not None:
             self.store = store
         else:
-            self.store = get_graph_store(db_path=db_path, root_branch="main")
+            self.store = get_graph_store(db_path=db_path)
 
         self.store.ensure_root_schema()
         if not self.store.is_root_branch(branch):
@@ -1618,7 +1618,7 @@ class UnifiedKBBuilder:
                     if (self.workspace_path / ".projectbrain" / "kb" / "projectbrain_kb.db").exists()
                     else None)
             )
-            self.store = get_graph_store(db_path=db_path, root_branch="main")
+            self.store = get_graph_store(db_path=db_path)
 
         subgraph = self.store.get_resolved_subgraph(project_id, branch, limit=100000)
         nodes = subgraph.get("nodes", [])
@@ -1775,7 +1775,7 @@ class UnifiedKBBuilder:
                     if (self.workspace_path / ".projectbrain" / "kb" / "projectbrain_kb.db").exists()
                     else None)
             )
-            self.store = get_graph_store(db_path=db_path, root_branch="main")
+            self.store = get_graph_store(db_path=db_path)
 
         subgraph = self.store.get_resolved_subgraph(project_id, branch, limit=100000)
         nodes = subgraph.get("nodes", [])

@@ -483,6 +483,12 @@ class HybridResolver:
 
         # 3. Add server nodes, suppressing tombstones & stale symbols in locally edited files
         suppressed_nodes: Set[str] = set()
+        is_root = (
+            self.store.is_root_branch(branch)
+            if (self.store is not None and hasattr(self.store, "is_root_branch"))
+            else (branch == "main")
+        )
+        default_server_tier = "root" if is_root else "branch"
 
         for sn in server_nodes:
             sid = str(sn.get("id", ""))
@@ -505,7 +511,7 @@ class HybridResolver:
             # Node accepted from server
             tier = sn.get("tier")
             if not tier:
-                tier = "branch" if branch != "main" else "root"
+                tier = default_server_tier
             attrs = dict(sn)
             attrs["tier"] = tier
             g.add_node(sid, **attrs)
@@ -534,7 +540,7 @@ class HybridResolver:
 
             tier = se.get("tier")
             if not tier:
-                tier = "branch" if branch != "main" else "root"
+                tier = default_server_tier
             attrs = dict(se)
             attrs["tier"] = tier
 

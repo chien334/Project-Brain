@@ -185,6 +185,7 @@ class EnvConfig:
         self.ollama_embedding_model = pb_getenv("OM_OLLAMA_EMBEDDING_MODEL")
         self.gemini_embedding_model = pb_getenv("OM_GEMINI_EMBEDDING_MODEL")
         self.aws_embedding_model = pb_getenv("OM_AWS_EMBEDDING_MODEL")
+        self.root_branch = get("graph", "root_branch", "PB_ROOT_BRANCH", "") or pb_getenv("OM_ROOT_BRANCH") or "main"
         self.active_project = None
         
     @property

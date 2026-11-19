@@ -127,6 +127,7 @@ def _upsert_project_metadata(
 class SyncBranchRequest(BaseModel):
     project_id: str
     branch: str = "main"
+    base_branch: Optional[str] = None
     nodes: List[GraphNode] = Field(default_factory=list)
     edges: List[GraphEdge] = Field(default_factory=list)
     hyperedges: List[GraphHyperedge] = Field(default_factory=list)
@@ -147,6 +148,7 @@ class SyncBranchRequest(BaseModel):
 class PromoteRequest(BaseModel):
     project_id: str
     branch: str
+    target_branch: Optional[str] = None
 
 
 class QueryRequest(BaseModel):
@@ -211,9 +213,19 @@ async def sync_graph(req: SyncBranchRequest, request: Request = None):
                 synced_files=synced_files,
                 deleted_files=req.deleted_files,
                 author=req.author,
+                base_branch=req.base_branch,
             )
         finally:
             store.close()
+
+        if req.base_branch and req.base_branch != req.branch:
+            try:
+                from ...core.db import register_memory_branch
+                from ...memory.hsg import invalidate_query_cache
+                register_memory_branch(req.project_id, req.branch, req.base_branch)
+                invalidate_query_cache()
+            except Exception as me:
+                logger.debug(f"Memory branch registration skipped for {req.project_id}:{req.branch}: {me}")
 
         # Ensure project exists in legacy projects catalog
         client_ip = request.client.host if request and request.client else "127.0.0.1"
@@ -259,7 +271,7 @@ async def get_subgraph(
 async def diff_graph(
     project_id: str,
     branch: Optional[str] = None,
-    base_branch: str = "main",
+    base_branch: Optional[str] = None,
     target_branch: Optional[str] = None,
     file_filter: Optional[str] = None,
     community: Optional[int] = None,
@@ -267,16 +279,17 @@ async def diff_graph(
     try:
         store = _get_store()
         try:
+            effective_base = base_branch or store.root_branch
             if target_branch:
                 res = store.diff_branches(
                     project_id=project_id,
-                    base_branch=base_branch,
+                    base_branch=effective_base,
                     target_branch=target_branch,
                     file_filter=file_filter,
                     community=community,
                 )
             else:
-                diff_target = branch or target_branch or "main"
+                diff_target = branch or target_branch or store.root_branch
                 res = store.diff_branch_vs_root(
                     project_id=project_id,
                     branch_name=diff_target,
@@ -305,6 +318,7 @@ async def promote_branch(req: PromoteRequest):
             res = store.promote_branch_to_root(
                 project_id=req.project_id,
                 branch_name=req.branch,
+                target_branch=req.target_branch,
             )
             return res
         finally:
