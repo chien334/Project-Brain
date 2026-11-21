@@ -45,13 +45,6 @@ CodeGraph is a tree-sitter-parsed knowledge graph of every symbol, edge, and fil
 
 ---
 
-## ⚡ RTK Token Optimizer
-
-To minimize token usage, prefix terminal commands with `rtk` (or `/Users/macbbook/.local/bin/rtk`).
-- Example: `rtk git status`, `rtk cargo test`, `rtk pip list`.
-
----
-
 ## 🧩 Custom MCP Extensions (`extensions_mcp/`)
 
 ProjectBrain supports custom MCP extensions dynamically loaded from the `extensions_mcp/` directory.
