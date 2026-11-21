@@ -1,19 +1,25 @@
 {
-  "report_id": "TEST-REPORT-V3-PLUGIN-MICROKERNEL-02",
-  "generated_at": "2026-11-21T12:41:39Z",
+  "report_id": "TEST-REPORT-GPU-CPU-LOCAL-AI-03",
+  "generated_at": "2026-11-21T14:25:17Z",
   "test_framework": "pytest-9.0.3",
   "python_version": "3.14.4",
   "platform": "darwin",
-  "command": "pytest -v",
-  "command_summary": "275 passed, 5 skipped, 79 warnings in 27.64s",
+  "command": "pytest -q",
+  "command_summary": "302 passed, 5 skipped, 81 warnings in 39.27s",
   "summary": {
-    "total_tests": 280,
-    "passed": 275,
+    "total_tests": 307,
+    "passed": 302,
     "failed": 0,
     "skipped": 5,
     "pass_rate_percentage": 100.0,
-    "duration_seconds": 27.64
+    "duration_seconds": 39.27
   },
+  "rtk_audit": {
+    "command": "rg -i '\\brtk\\b' --hidden -g '!.git' /Users/macbbook/SourceCodes/Project-Brain",
+    "matches": 0,
+    "status": "PASSED"
+  },
+  "open_defects_escalated": [],
   "contract_fixes_applied": [
     {
       "files": [
@@ -124,9 +130,9 @@
       "passed": 9,
       "failed": 0,
       "skipped": 0,
-      "description": "Canonical Legacy Testcase, Hardware Datasheet, OpenAPI 3.1, C++/Qt/ELF ETL, and State/Screen Flow Graph tests",
+      "description": "Canonical Legacy Testcase, Hardware Datasheet, OpenAPI 3.1, C++/Qt/ELF ETL, State/Screen Flow Graph, and LocalAIOCRParserPlugin tests",
       "tests": [
-        "test_get_and_register_all_12_plugins",
+        "test_get_and_register_all_13_plugins",
         "test_graphify_ast_and_multimodal_doc_wrappers",
         "test_code_doc_linker_and_exporters_wrappers",
         "test_legacy_testcase_csv_and_xlsx",
@@ -142,6 +148,42 @@
       "passed": 16,
       "failed": 0,
       "skipped": 0
+    },
+    "tests/test_gpu_cpu_and_local_ai.py": {
+      "total": 27,
+      "passed": 27,
+      "failed": 0,
+      "skipped": 0,
+      "description": "GPU/CPU ComputeDeviceManager, Local AI Vision/OCR, GraphGPUAccelerator, /graphify/hardware REST, projectbrain_hardware_status FastMCP & RBAC, hardware-status CLI, and strict GPU/MPS guards",
+      "tests": [
+        "TestComputeDeviceManager::test_detect_hardware_structure",
+        "TestComputeDeviceManager::test_resolve_device_cpu_and_gpu_fallback",
+        "TestComputeDeviceManager::test_smart_enable_mkldnn_by_architecture",
+        "TestComputeDeviceManager::test_probe_local_ai_endpoints_handles_unreachable_and_parses_models",
+        "TestOCRAndLocalVision::test_paddle_gpu_oom_falls_back_to_cpu_when_enabled",
+        "TestOCRAndLocalVision::test_ollama_adapter_vision_chat_formats_base64_images",
+        "TestOCRAndLocalVision::test_keyless_local_vision_parser_openai_compatible[vllm-http://localhost:8000/v1/chat/completions]",
+        "TestOCRAndLocalVision::test_keyless_local_vision_parser_openai_compatible[lmstudio-http://localhost:1234/v1/chat/completions]",
+        "TestOCRAndLocalVision::test_keyless_local_vision_parser_openai_compatible[llamacpp-http://localhost:8081/v1/chat/completions]",
+        "TestOCRAndLocalVision::test_hybrid_local_combines_fast_ocr_and_local_llm_refinement",
+        "TestOCRAndLocalVision::test_extract_batch_preserves_exact_order_under_out_of_order_delays",
+        "TestOCRAndLocalVision::test_docx_embedded_media_image_ocr_integration",
+        "TestOCRAndLocalVision::test_local_ai_ocr_parser_plugin_registration_and_execution",
+        "TestGraphAcceleratorAndSemanticLinking::test_resolve_compute_backend_modes_and_fallbacks",
+        "TestGraphAcceleratorAndSemanticLinking::test_cosine_similarity_topk_accuracy_and_gpu_oom_fallback",
+        "TestGraphAcceleratorAndSemanticLinking::test_embed_texts_tfidf_and_mocked_local_and_st_backends",
+        "TestGraphAcceleratorAndSemanticLinking::test_accelerated_pagerank_and_clustering_on_networkx_graph",
+        "TestGraphAcceleratorAndSemanticLinking::test_parallel_graphify_extractor_cache_and_semantic_edges",
+        "TestGraphAcceleratorAndSemanticLinking::test_code_doc_linker_accelerated_semantic_cross_links",
+        "TestGraphAcceleratorAndSemanticLinking::test_memory_embed_dispatch_supports_local_ai_and_local_gpu[vllm]",
+        "TestGraphAcceleratorAndSemanticLinking::test_memory_embed_dispatch_supports_local_ai_and_local_gpu[lmstudio]",
+        "TestGraphAcceleratorAndSemanticLinking::test_memory_embed_dispatch_supports_local_ai_and_local_gpu[llamacpp]",
+        "TestGraphAcceleratorAndSemanticLinking::test_memory_embed_dispatch_supports_local_ai_and_local_gpu[local_gpu]",
+        "TestHardwareStatusAndGPURemediation::test_graphify_hardware_rest_endpoint",
+        "TestHardwareStatusAndGPURemediation::test_mcp_projectbrain_hardware_status_and_rbac",
+        "TestHardwareStatusAndGPURemediation::test_cli_hardware_status_run_and_subprocess",
+        "TestHardwareStatusAndGPURemediation::test_gpu_strict_fallback_disabled_raises_and_mps_skips_sparse_coo"
+      ]
     },
     "tests/test_graphify_extractor.py": {
       "total": 12,

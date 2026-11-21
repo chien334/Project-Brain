@@ -1,7 +1,7 @@
 """End-to-End Integration Test Suite for Project-Brain v3.0 Plugin Microkernel & Testing KB.
 
 Covers AC-PLG-01 through AC-PLG-12:
-1. /plugins/* REST routes: list 25 built-ins, per-project enable/disable/config,
+1. /plugins/* REST routes: list 26 built-ins, per-project enable/disable/config,
    hot-reload external plugin directory, path traversal HTTP 400 rejection,
    PB_REQUIRE_REST_AUTH=true RBAC (401 anon, 403 reader, 200 collaborator/admin),
    and PB_READ_ONLY=true enforcement.
@@ -141,14 +141,14 @@ def test_plugins_rest_list_toggle_config_and_hot_reload(
 ) -> None:
     ws: Path = isolated_v3_env["workspace"]
 
-    # 1. List all 25 built-in plugins
+    # 1. List all 26 built-in plugins
     res = client.get("/plugins")
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["status"] == "healthy"
-    assert body["total_plugins"] == 25
-    assert body["enabled_plugins"] == 25
-    assert len(body["plugins"]) == 25
+    assert body["total_plugins"] == 26
+    assert body["enabled_plugins"] == 26
+    assert len(body["plugins"]) == 26
     assert len(body["by_category"]) == 9
 
     # Filter by category
@@ -244,7 +244,7 @@ def test_plugins_rest_list_toggle_config_and_hot_reload(
     assert "exporter.custom_e2e" in rel_res.json()["reloaded_plugins"]
 
     after_list = client.get("/plugins")
-    assert after_list.json()["total_plugins"] == 26
+    assert after_list.json()["total_plugins"] == 27
     assert any(p["plugin_id"] == "exporter.custom_e2e" for p in after_list.json()["plugins"])
 
     # Update plugin version and hot-reload again without server restart
@@ -1086,7 +1086,7 @@ async def test_fastmcp_v3_tools_rbac_and_execution(isolated_v3_env: Dict[str, An
     # 5. Direct Python invocation of all 10 FastMCP tools
     list_res = json.loads(await projectbrain_list_plugins())
     assert list_res["status"] == "ok"
-    assert list_res["count"] == 25
+    assert list_res["count"] == 26
 
     toggle_res = json.loads(
         await projectbrain_toggle_plugin(
