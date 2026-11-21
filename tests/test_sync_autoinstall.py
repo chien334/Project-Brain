@@ -96,7 +96,7 @@ async def test_sync_db_missing_cli_exists(mock_sync, mock_connect, mock_run, moc
     assert mock_which.call_count == 2
     mock_which.assert_any_call("codegraph")
     mock_which.assert_any_call("git")
-    mock_run.assert_called_once_with(["/mock/bin/codegraph", "init"], cwd=os.getcwd(), capture_output=True, text=True)
+    mock_run.assert_called_once_with(["/mock/bin/codegraph", "init"], cwd=os.getcwd(), capture_output=True, text=True, timeout=120)
     mock_connect.assert_called_once()
     assert "success" in res
 
@@ -153,8 +153,8 @@ async def test_sync_db_missing_cli_missing_install_success(mock_py_main, mock_sy
     # Assertions
     assert mock_which.call_count == 3
     assert mock_run.call_count == 2
-    mock_run.assert_any_call(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
-    mock_run.assert_any_call(["/mock/bin/codegraph", "init"], cwd=os.getcwd(), capture_output=True, text=True)
+    mock_run.assert_any_call(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True, timeout=120)
+    mock_run.assert_any_call(["/mock/bin/codegraph", "init"], cwd=os.getcwd(), capture_output=True, text=True, timeout=120)
     assert "success" in res
 
 
@@ -182,7 +182,7 @@ async def test_sync_db_missing_cli_missing_install_fails(mock_py_main, mock_run,
     
     # Assertions
     mock_which.assert_called_once_with("codegraph")
-    mock_run.assert_called_once_with(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
+    mock_run.assert_called_once_with(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True, timeout=120)
     mock_py_main.assert_called_once()
     assert "Error: Finished running 'codegraph init'" in res
 

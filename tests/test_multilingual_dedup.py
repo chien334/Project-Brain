@@ -6,7 +6,7 @@ import types
 from pathlib import Path
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2] / "src" / "projectbrain"
+ROOT = Path(__file__).resolve().parents[1] / "src" / "projectbrain"
 
 _modified_keys = [
     "projectbrain",

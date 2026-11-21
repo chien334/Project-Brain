@@ -23,12 +23,13 @@ class PostgresVectorStore(VectorStore):
                 
                 await conn.execute(f"""
                     CREATE TABLE IF NOT EXISTS {self.table} (
-                        id TEXT PRIMARY KEY,
+                        id TEXT NOT NULL,
                         sector TEXT NOT NULL,
                         user_id TEXT,
                         v vector,
                         dim INTEGER,
-                        created_at TIMESTAMPTZ DEFAULT NOW()
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        PRIMARY KEY (id, sector)
                     )
                 """)
                 
@@ -46,10 +47,10 @@ class PostgresVectorStore(VectorStore):
         sql = f"""
             INSERT INTO {self.table} (id, sector, user_id, v, dim)
             VALUES ($1, $2, $3, $4::vector, $5)
-            ON CONFLICT (id) DO UPDATE SET
-                sector = EXCLUDED.sector,
+            ON CONFLICT (id, sector) DO UPDATE SET
                 user_id = EXCLUDED.user_id,
-                v = EXCLUDED.v
+                v = EXCLUDED.v,
+                dim = EXCLUDED.dim
         """
         async with pool.acquire() as conn:
             await conn.execute(sql, id, sector, user_id, vec_str, dim)
@@ -75,6 +76,18 @@ class PostgresVectorStore(VectorStore):
         if not r: return None
         vec = json.loads(r["v_txt"])
         return VectorRow(r["id"], r["sector"], vec, r["dim"])
+
+    async def getVectorsBySector(self, sector: str) -> List[VectorRow]:
+        pool = await self._get_pool()
+        sql = f"SELECT id, sector, v::text as v_txt, dim FROM {self.table} WHERE sector=$1"
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, sector)
+
+        res = []
+        for r in rows:
+            vec = json.loads(r["v_txt"])
+            res.append(VectorRow(r["id"], r["sector"], vec, r["dim"]))
+        return res
 
     async def deleteVectors(self, id: str):
         pool = await self._get_pool()

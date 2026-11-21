@@ -272,7 +272,7 @@ async def pdf_extract_tables(file_path: FilePath) -> str:
     name="pdf_extract_images",
     annotations={
         "title": "Extract Images from PDF",
-        "readOnlyHint": True,
+        "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
@@ -347,22 +347,19 @@ async def pdf_convert_to_markdown(
     """
     try:
         import sys
-        from pathlib import Path
-        project_root = str(Path(__file__).resolve().parents[2])
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-            
-        from projectbrain.utils.doc_parser import pdf_to_markdown
-        
-        path = Path(file_path).resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-            
-        with open(path, "rb") as f:
-            file_bytes = f.read()
-            
-        markdown = await pdf_to_markdown(file_bytes)
-        return markdown
+        src_root = str(Path(__file__).resolve().parents[2] / "src")
+        if src_root not in sys.path:
+            sys.path.insert(0, src_root)
+
+        if include_images and not images_dir:
+            raise ValueError("images_dir must be provided when include_images is True")
+
+        return _pdf_to_markdown(
+            file_path,
+            include_tables=include_tables,
+            include_images=include_images,
+            images_dir=images_dir,
+        )
     except (FileNotFoundError, ValueError) as e:
         return f"Error: {e}"
     except Exception as e:

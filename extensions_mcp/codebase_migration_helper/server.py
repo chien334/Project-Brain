@@ -67,15 +67,22 @@ async def translate_code_comments(
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             code_content = f.read()
             
-        system_prompt = (
-            "You are an expert software engineer specialized in Japanese legacy systems migration. "
-            "Your task is to take the provided source code, identify all comments, docstrings, and "
-            "embedded documentation in Japanese, and translate them to clear developer-friendly English. "
-            "Keep the program logic, variables, syntax, and functionality EXACTLY the same. "
-            "Return ONLY the updated source code. Do not wrap in markdown quotes, and do not explain."
-        )
         if direction == "en2ja":
-            system_prompt = system_prompt.replace("Japanese", "English").replace("English", "Japanese")
+            system_prompt = (
+                "You are an expert software engineer specialized in cross-language codebase localization and migration. "
+                "Your task is to take the provided source code, identify all comments, docstrings, and "
+                "embedded documentation in English, and translate them to clear developer-friendly Japanese. "
+                "Keep the program logic, variables, syntax, and functionality EXACTLY the same. "
+                "Return ONLY the updated source code. Do not wrap in markdown quotes, and do not explain."
+            )
+        else:
+            system_prompt = (
+                "You are an expert software engineer specialized in Japanese legacy systems migration. "
+                "Your task is to take the provided source code, identify all comments, docstrings, and "
+                "embedded documentation in Japanese, and translate them to clear developer-friendly English. "
+                "Keep the program logic, variables, syntax, and functionality EXACTLY the same. "
+                "Return ONLY the updated source code. Do not wrap in markdown quotes, and do not explain."
+            )
             
         translated_code = await call_gemini(code_content, system_prompt)
         

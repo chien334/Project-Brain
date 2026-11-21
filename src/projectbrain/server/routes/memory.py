@@ -1,11 +1,23 @@
 import json
+import os
 from fastapi import APIRouter, HTTPException, Body
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 from ...main import Memory
+from ...memory.hsg import invalidate_query_cache
+
 mem = Memory()
 
 router = APIRouter()
+
+
+def _check_read_only() -> None:
+    if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
+        raise HTTPException(
+            status_code=403,
+            detail="Operation not permitted: Server is running in Read-Only mode."
+        )
+
 
 class AddMemoryRequest(BaseModel):
     content: str
@@ -14,6 +26,7 @@ class AddMemoryRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = {}
     author: Optional[str] = None
 
+
 class SearchMemoryRequest(BaseModel):
     query: str
     user_id: Optional[str] = None
@@ -21,20 +34,29 @@ class SearchMemoryRequest(BaseModel):
     filters: Optional[Dict[str, Any]] = {}
     author: Optional[str] = None
 
+
 class DeleteAllRequest(BaseModel):
     user_id: Optional[str] = None
 
+
 @router.post("/add")
 async def add_memory(req: AddMemoryRequest):
+    _check_read_only()
     try:
         meta = req.metadata or {}
-        if req.tags: meta["tags"] = req.tags
-        if req.author: meta["author"] = req.author
+        if req.tags:
+            meta["tags"] = req.tags
+        if req.author:
+            meta["author"] = req.author
 
         result = await mem.add(req.content, user_id=req.user_id, meta=meta, tags=req.tags)
+        invalidate_query_cache()
         return {"success": True, "data": result}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/search")
 async def search_memory(req: SearchMemoryRequest):
@@ -42,12 +64,13 @@ async def search_memory(req: SearchMemoryRequest):
         import logging
         logger = logging.getLogger("server")
         logger.info(f"User '{req.author or 'anonymous'}' searched: '{req.query}' on project '{req.user_id or 'all'}'")
-        
+
         filters = req.filters or {}
         results = await mem.search(req.query, user_id=req.user_id, limit=req.limit, **filters)
         return {"results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/history")
 async def get_history(user_id: Optional[str] = None, limit: int = 20, offset: int = 0):
@@ -62,6 +85,7 @@ async def get_history(user_id: Optional[str] = None, limit: int = 20, offset: in
         import logging
         logging.getLogger("server").error(f"[get_history] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/stats")
 async def get_stats(user_id: Optional[str] = None):
@@ -87,11 +111,11 @@ async def get_stats(user_id: Optional[str] = None):
             sector_res = db.fetchall("SELECT primary_sector, count(*) as c FROM memories GROUP BY primary_sector")
             facts_res = db.fetchone("SELECT count(*) as c FROM temporal_facts")
             tags_res = db.fetchall("SELECT tags FROM memories")
-            
+
         total_mems = total_res["c"] if total_res else 0
         total_facts = facts_res["c"] if facts_res else 0
         sectors = {r["primary_sector"]: r["c"] for r in sector_res}
-        
+
         all_tags = set()
         for r in tags_res:
             if r.get("tags"):
@@ -100,9 +124,9 @@ async def get_stats(user_id: Optional[str] = None):
                     if isinstance(t_list, list):
                         for t in t_list:
                             all_tags.add(t)
-                except:
+                except Exception:
                     pass
-                    
+
         return {
             "total_memories": total_mems,
             "total_temporal_facts": total_facts,
@@ -113,21 +137,27 @@ async def get_stats(user_id: Optional[str] = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/delete_all")
 async def delete_all_memories(req: Optional[DeleteAllRequest] = None):
+    _check_read_only()
     try:
         uid = req.user_id if req else None
         await mem.delete_all(user_id=uid)
+        invalidate_query_cache()
         return {"success": True, "message": f"Deleted all memories for user {uid or 'all'}"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/diff")
 async def diff_memories(base_project_id: str, target_project_id: str):
     try:
         from ...core.db import db
         db.connect()
-        
+
         # Fetch base memories
         base_rows = db.fetchall(
             "SELECT id, content, primary_sector, tags, meta, created_at FROM memories WHERE user_id = ?",
@@ -138,7 +168,7 @@ async def diff_memories(base_project_id: str, target_project_id: str):
             "SELECT id, content, primary_sector, tags, meta, created_at FROM memories WHERE user_id = ?",
             (target_project_id,)
         )
-        
+
         # Helper to parse meta
         def parse_meta(row):
             meta_str = row.get("meta") or "{}"
@@ -148,7 +178,7 @@ async def diff_memories(base_project_id: str, target_project_id: str):
                 return json.loads(meta_str)
             except Exception:
                 return {}
-        
+
         base_map = {}
         for r in base_rows:
             meta = parse_meta(r)
@@ -159,7 +189,7 @@ async def diff_memories(base_project_id: str, target_project_id: str):
             else:
                 key = r["id"]
             base_map[key] = (r, meta)
-            
+
         target_map = {}
         for r in target_rows:
             meta = parse_meta(r)
@@ -170,11 +200,11 @@ async def diff_memories(base_project_id: str, target_project_id: str):
             else:
                 key = r["id"]
             target_map[key] = (r, meta)
-            
+
         added = []
         deleted = []
         modified = []
-        
+
         for key, (r_target, meta_target) in target_map.items():
             if key not in base_map:
                 added.append(r_target)
@@ -187,11 +217,11 @@ async def diff_memories(base_project_id: str, target_project_id: str):
                         "file_path": meta_target.get("file_path"),
                         "section_index": meta_target.get("section_index")
                     })
-                    
+
         for key, (r_base, meta_base) in base_map.items():
             if key not in target_map:
                 deleted.append(r_base)
-                
+
         return {
             "base_project_id": base_project_id,
             "target_project_id": target_project_id,
@@ -204,6 +234,7 @@ async def diff_memories(base_project_id: str, target_project_id: str):
         logging.getLogger("server").error(f"[diff_memories] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.get("/{memory_id}")
 async def get_single_memory(memory_id: str):
     try:
@@ -211,19 +242,28 @@ async def get_single_memory(memory_id: str):
         if not m:
             raise HTTPException(status_code=404, detail="Memory not found")
         return {"success": True, "data": m}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.delete("/{memory_id}")
 async def delete_single_memory(memory_id: str):
+    _check_read_only()
     try:
         await mem.delete(memory_id)
+        invalidate_query_cache()
         return {"success": True, "message": f"Memory {memory_id} deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/{memory_id}/reinforce")
 async def reinforce_memory(memory_id: str):
+    _check_read_only()
     try:
         m = await mem.get(memory_id)
         if not m:
@@ -232,23 +272,32 @@ async def reinforce_memory(memory_id: str):
         import time
         from ...core.db import db
         new_sal = await applyRetrievalTraceReinforcementToMemory(memory_id, m.get("salience", 0) or 0)
-        db.execute("UPDATE memories SET salience=?, last_seen_at=? WHERE id=?", (new_sal, int(time.time()*1000), memory_id))
+        db.execute("UPDATE memories SET salience=?, last_seen_at=? WHERE id=?", (new_sal, int(time.time() * 1000), memory_id))
         db.commit()
+        invalidate_query_cache()
         return {"success": True, "new_salience": new_sal}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 class ActiveProjectRequest(BaseModel):
     project_id: str
 
+
 @router.post("/active-project")
 def set_active_project(req: ActiveProjectRequest):
+    _check_read_only()
     try:
         from ...core.config import env
         env.active_project = req.project_id
         return {"success": True, "active_project": env.active_project}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/active-project")
 def get_active_project():
@@ -257,4 +306,3 @@ def get_active_project():
         return {"active_project": env.active_project or "default"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-

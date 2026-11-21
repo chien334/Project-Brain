@@ -27,6 +27,9 @@ class VectorStore(ABC):
     async def getVector(self, id: str, sector: str) -> Optional[VectorRow]: pass
 
     @abstractmethod
+    async def getVectorsBySector(self, sector: str) -> List[VectorRow]: pass
+
+    @abstractmethod
     async def deleteVectors(self, id: str): pass
 
     @abstractmethod
@@ -59,6 +62,17 @@ class SQLiteVectorStore(VectorStore):
         cnt = len(r["v"]) // 4
         vec = list(struct.unpack(f"{cnt}f", r["v"]))
         return VectorRow(r["id"], r["sector"], vec, r["dim"])
+
+    async def getVectorsBySector(self, sector: str) -> List[VectorRow]:
+        sql = f"SELECT * FROM {self.table} WHERE sector=?"
+        rows = db.fetchall(sql, (sector,))
+        res = []
+        for r in rows:
+            raw_v = bytes(r["v"])
+            cnt = len(raw_v) // 4
+            vec = list(struct.unpack(f"{cnt}f", raw_v))
+            res.append(VectorRow(r["id"], r["sector"], vec, r["dim"]))
+        return res
 
     async def deleteVectors(self, id: str):
         db.execute(f"DELETE FROM {self.table} WHERE id=?", (id,))

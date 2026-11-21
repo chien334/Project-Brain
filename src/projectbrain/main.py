@@ -3,7 +3,8 @@ import os
 import sys
 from typing import List, Dict, Optional, Any
 from .core.db import db, q
-from .memory.hsg import hsg_query, add_hsg_memory
+from .core.vector_store import vector_store
+from .memory.hsg import hsg_query, add_hsg_memory, invalidate_query_cache
 from .ops.ingest import ingest_document
 from .openai_handler import OpenAIRegistrar
 
@@ -99,8 +100,11 @@ class Memory:
             async with httpx.AsyncClient() as client:
                 resp = await client.delete(f"{self.url}/memory/{memory_id}", headers=headers)
                 resp.raise_for_status()
+            invalidate_query_cache()
         else:
+            await vector_store.deleteVectors(memory_id)
             q.del_mem(memory_id)
+            invalidate_query_cache()
 
     async def delete_all(self, user_id: str = None):
         uid = user_id or self.default_user
@@ -114,9 +118,17 @@ class Memory:
                     headers=headers
                 )
                 resp.raise_for_status()
+            invalidate_query_cache()
         else:
             if uid:
+                if "%" in uid or "_" in uid:
+                    rows = db.fetchall("SELECT id FROM memories WHERE user_id LIKE ?", (uid,))
+                else:
+                    rows = db.fetchall("SELECT id FROM memories WHERE user_id=?", (uid,))
+                for r in rows:
+                    await vector_store.deleteVectors(r["id"])
                 q.del_mem_by_user(uid)
+            invalidate_query_cache()
 
     def history(self, user_id: str = None, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
         uid = user_id or self.default_user
@@ -216,73 +228,51 @@ def run_codegraph_sync(project_id: str, server_url: str = None, project_path: st
         else:
             import shutil
             import subprocess
-            print(f"Codegraph database not found at {db_path}. Checking for 'codegraph' CLI...")
             codegraph_bin = shutil.which("codegraph")
-        if not codegraph_bin:
-            # Check if automatic installation is allowed
-            allow_auto = os.getenv("PB_ALLOW_AUTO_INSTALL", "false").lower() in ("true", "1", "yes")
-            if not allow_auto:
-                print("Automatic installation of dependencies is disabled. Falling back to pure-Python codebase parser...")
-                try:
-                    from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                    run_python_parser(target_dir)
-                    print(f"Successfully generated database fallback using pure-Python parser at {db_path}.")
-                except Exception as py_err:
-                    print(f"Error: Codegraph database not found at {db_path} and 'codegraph' CLI is not installed.")
-                    print(f"Attempted to fallback to the pure-Python codebase parser but failed: {str(py_err)}")
-                    print("Please install the dependency manually:")
-                    print("  npm install -g @colbymchenry/codegraph")
-                    sys.exit(1)
+            if not codegraph_bin:
+                print(f"Notice: .codegraph/codegraph.db not found. Synchronizing seamlessly via GraphifyExtractor...")
+                run_graphify_sync(
+                    project_id=project_id,
+                    workspace_path=target_dir,
+                    branch=branch or "main",
+                    server_url=server_url,
+                )
+                return
             else:
-                print("'codegraph' CLI not found. Attempting to install it globally via npm...")
+                print(f"Initializing codegraph database in directory '{target_dir}' using '{codegraph_bin} init'...")
                 try:
-                    res = subprocess.run(["npm", "install", "-g", "@colbymchenry/codegraph"], capture_output=True, text=True)
-                    if res.returncode != 0:
-                        print(f"Warning: Automatic global installation of 'codegraph' CLI failed with exit code {res.returncode}. Falling back to Python parser...")
-                        try:
-                            from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                            run_python_parser(target_dir)
-                            print(f"Successfully generated database fallback using pure-Python parser at {db_path}.")
-                        except Exception as py_err:
-                            print(f"Error: Python fallback failed: {str(py_err)}")
-                            print("Please install it manually: npm install -g @colbymchenry/codegraph (or with sudo)")
-                            sys.exit(1)
-                    else:
-                        codegraph_bin = shutil.which("codegraph")
-                        if not codegraph_bin:
-                            print("Warning: Installed 'codegraph' successfully, but not found in PATH. Falling back to Python parser...")
-                            try:
-                                from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                                run_python_parser(target_dir)
-                            except Exception as py_err:
-                                print(f"Error: Python fallback failed: {str(py_err)}")
-                                sys.exit(1)
-                except Exception as inst_err:
-                    print(f"Warning: Failed to install 'codegraph' CLI: {str(inst_err)}. Falling back to Python parser...")
-                    try:
-                        from extensions_mcp.codebase_migration_helper.python_codegraph import main as run_python_parser
-                        run_python_parser(target_dir)
-                    except Exception as py_err:
-                        print(f"Error: Python fallback failed: {str(py_err)}")
-                        sys.exit(1)
+                    res_init = subprocess.run([codegraph_bin, "init"], cwd=target_dir, capture_output=True, text=True)
+                    if res_init.returncode != 0:
+                        print(f"Warning: 'codegraph init' failed with exit code {res_init.returncode}. Falling back to GraphifyExtractor...")
+                        run_graphify_sync(
+                            project_id=project_id,
+                            workspace_path=target_dir,
+                            branch=branch or "main",
+                            server_url=server_url,
+                        )
+                        return
+                except Exception as init_err:
+                    print(f"Warning: Executing 'codegraph init' failed: {str(init_err)}. Falling back to GraphifyExtractor...")
+                    run_graphify_sync(
+                        project_id=project_id,
+                        workspace_path=target_dir,
+                        branch=branch or "main",
+                        server_url=server_url,
+                    )
+                    return
         
-        # Now run 'codegraph init' in the project directory if we have codegraph_bin and database is still missing
-        if not force_python and codegraph_bin and not os.path.exists(db_path):
-            print(f"Initializing codegraph database in directory '{target_dir}' using '{codegraph_bin} init'...")
-            try:
-                res_init = subprocess.run([codegraph_bin, "init"], cwd=target_dir, capture_output=True, text=True)
-                if res_init.returncode != 0:
-                    print(f"Error running 'codegraph init' (exit code {res_init.returncode}):")
-                    print(f"Stdout: {res_init.stdout}")
-                    print(f"Stderr: {res_init.stderr}")
-                    sys.exit(1)
-            except Exception as init_err:
-                print(f"Error executing 'codegraph init' in directory {target_dir}: {str(init_err)}")
-                sys.exit(1)
-            
         if not os.path.exists(db_path):
-            print(f"Error: 'codegraph init' completed but database file was still not found at {db_path}.")
-            sys.exit(1)
+            print(f"Notice: .codegraph/codegraph.db absent. Synchronizing seamlessly via GraphifyExtractor...")
+            run_graphify_sync(
+                project_id=project_id,
+                workspace_path=target_dir,
+                branch=branch or "main",
+                server_url=server_url,
+                scoped_paths=None,
+                git_dirty=False,
+                local_only=False,
+            )
+            return
         
     server_url = server_url or os.getenv("PB_URL") or os.getenv("PB_API_URL") or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
     
@@ -516,31 +506,382 @@ def run_upload_file(project_id: str, file_path: str, server_url: str = None, tag
         print(f"Error uploading file: {e}")
         sys.exit(1)
 
+def run_graphify_sync(
+    project_id: str,
+    workspace_path: str = ".",
+    branch: str = "main",
+    server_url: Optional[str] = None,
+    scoped_paths: Optional[List[str]] = None,
+    git_dirty: bool = False,
+    local_only: bool = False,
+    cluster: bool = True
+):
+    import os
+    import sys
+    import json
+    import httpx
+    from .graphify_engine.extractor import GraphifyExtractor
+
+    target_dir = os.path.abspath(workspace_path)
+    if not os.path.isdir(target_dir):
+        print(f"Error: Target directory '{target_dir}' does not exist.")
+        sys.exit(1)
+
+    print(f"Scanning codebase at '{target_dir}' via GraphifyExtractor (branch: {branch})...")
+    extractor = GraphifyExtractor()
+    delta = extractor.extract_workspace(
+        workspace_path=target_dir,
+        project_id=project_id,
+        branch=branch,
+        scoped_paths=scoped_paths,
+        git_dirty_only=git_dirty,
+        include_docs=True
+    )
+    if cluster and delta.nodes:
+        try:
+            delta = extractor.cluster_graph(delta)
+        except Exception as ce:
+            print(f"Clustering warning: {ce}")
+
+    local_path = extractor.save_local_partial_graph(
+        delta,
+        output_dir=os.path.join(target_dir, ".projectbrain", "local_graph")
+    )
+    print(f"Cached partial graph at {local_path} ({len(delta.nodes)} nodes, {len(delta.edges)} edges).")
+
+    if local_only:
+        print("Completed local-only Graphify sync.")
+        return
+
+    server_url = server_url or os.getenv("PB_URL") or os.getenv("PB_API_URL") or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
+    server_url = server_url.rstrip("/")
+    api_key = os.getenv("PB_API_KEY") or os.getenv("OM_API_KEY")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    payload = {
+        "project_id": project_id,
+        "branch": branch,
+        "nodes": [n.to_dict() if hasattr(n, "to_dict") else n.model_dump() for n in delta.nodes],
+        "edges": [e.to_dict() if hasattr(e, "to_dict") else e.model_dump() for e in delta.edges],
+        "hyperedges": [h.to_dict() if hasattr(h, "to_dict") else h.model_dump() for h in delta.hyperedges],
+        "node_tombstones": delta.node_tombstones,
+        "edge_tombstones": delta.edge_tombstones,
+        "hyperedge_tombstones": delta.hyperedge_tombstones,
+        "synced_files": delta.synced_files,
+        "partial": bool(scoped_paths or git_dirty),
+        "author": os.getenv("USER", "cli"),
+        "cluster": False,
+        "project_path": target_dir
+    }
+
+    print(f"Synchronizing graph delta to {server_url}/graphify/sync...")
+    try:
+        resp = httpx.post(f"{server_url}/graphify/sync", json=payload, headers=headers, timeout=120.0)
+        if resp.status_code == 200:
+            print("Successfully synchronized Graphify graph to server!")
+            print(json.dumps(resp.json(), indent=2))
+        else:
+            print(f"Sync failed (Status {resp.status_code}): {resp.text}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error during graphify-sync: {e}")
+        sys.exit(1)
+
+
+def run_graphify_diff(
+    project_id: str,
+    base_branch: str = "main",
+    target_branch: Optional[str] = None,
+    local: bool = False,
+    workspace_path: str = ".",
+    server_url: Optional[str] = None
+):
+    import os
+    import sys
+    import json
+    import httpx
+
+    server_url = server_url or os.getenv("PB_URL") or os.getenv("PB_API_URL") or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
+    server_url = server_url.rstrip("/")
+    api_key = os.getenv("PB_API_KEY") or os.getenv("OM_API_KEY")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    if local:
+        from .graphify_engine.hybrid_resolver import HybridResolver
+        from .graphify_engine.store import get_graph_store
+        target_dir = os.path.abspath(workspace_path)
+        local_path = os.path.join(target_dir, ".projectbrain", "local_graph", "partial_graph.json")
+        if server_url and (os.getenv("PB_MODE") == "remote" or server_url != "http://localhost:8080"):
+            resolver = HybridResolver(remote_url=server_url, api_token=api_key)
+        else:
+            store = get_graph_store()
+            resolver = HybridResolver(store=store)
+        res = resolver.diff_local_vs_remote(
+            project_id=project_id,
+            branch=base_branch,
+            local_path=local_path if os.path.exists(local_path) else None,
+        )
+        print("Local vs Remote Graph Diff:")
+        print(json.dumps(res, indent=2))
+        return
+
+    params = {"project_id": project_id, "base_branch": base_branch}
+    if target_branch:
+        params["target_branch"] = target_branch
+    else:
+        params["branch"] = base_branch
+
+    try:
+        resp = httpx.get(f"{server_url}/graphify/diff", params=params, headers=headers, timeout=30.0)
+        if resp.status_code == 200:
+            print("Graph Diff Result:")
+            print(json.dumps(resp.json(), indent=2))
+        else:
+            print(f"Diff failed (Status {resp.status_code}): {resp.text}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error during graphify-diff: {e}")
+        sys.exit(1)
+
+
+def run_upload_doc(
+    project_id: str,
+    file_path: str,
+    branch: str = "main",
+    server_url: Optional[str] = None,
+    author: Optional[str] = None
+):
+    import os
+    import sys
+    import asyncio
+    import json
+    from .graphify_engine.doc_pipeline import DocumentPipeline
+
+    if not os.path.isfile(file_path):
+        print(f"Error: File '{file_path}' does not exist or is not a file.")
+        sys.exit(1)
+
+    server_url = server_url or os.getenv("PB_URL") or os.getenv("PB_API_URL") or os.getenv("OM_URL") or os.getenv("OM_API_URL") or "http://localhost:8080"
+    server_url = server_url.rstrip("/")
+    api_key = os.getenv("PB_API_KEY") or os.getenv("OM_API_KEY")
+
+    print(f"Processing document '{file_path}' via DocumentPipeline (branch: {branch})...")
+    pipeline = DocumentPipeline()
+    payload = asyncio.run(pipeline.process_file(
+        file_path=file_path,
+        project_id=project_id,
+        branch=branch,
+        author=author or os.getenv("USER", "cli")
+    ))
+
+    print(f"Pushing processed document and graph delta to {server_url}/sources/push-processed...")
+    res = asyncio.run(pipeline.push_processed_to_server(
+        server_url=server_url,
+        payload=payload,
+        token=api_key
+    ))
+    print("Successfully ingested document and synchronized graph delta!")
+    print(json.dumps(res, indent=2))
+
+
+def run_build_kb(
+    project_id: str = "project-brain",
+    workspace_path: str = ".",
+    branch: str = "main",
+    persist_memory: bool = True,
+    generate_office_exports: bool = True,
+    output_dir: Optional[str] = None,
+    db_path: Optional[str] = None,
+):
+    import os
+    import sys
+    import asyncio
+    import json
+    from .graphify_engine.kb_linker import UnifiedKBBuilder
+
+    target_dir = os.path.abspath(workspace_path)
+    if not os.path.isdir(target_dir):
+        print(f"Error: Target directory '{target_dir}' does not exist.")
+        sys.exit(1)
+
+    print(f"Building unified knowledge base for '{project_id}' at '{target_dir}' (branch: {branch})...")
+    builder = UnifiedKBBuilder(workspace_path=target_dir)
+    res = asyncio.run(builder.build_unified_kb(
+        project_id=project_id,
+        branch=branch,
+        persist_memory=persist_memory,
+        output_dir=output_dir,
+        generate_office_exports=generate_office_exports,
+        db_path=db_path,
+    ))
+    print("Successfully built Unified Knowledge Base!")
+    print(json.dumps(res, indent=2))
+
+
+def run_kb_trace(
+    project_id: str,
+    target: str,
+    branch: str = "main",
+    workspace_path: str = ".",
+    db_path: Optional[str] = None,
+):
+    import os
+    import json
+    from .graphify_engine.kb_linker import UnifiedKBBuilder
+
+    target_dir = os.path.abspath(workspace_path)
+    builder = UnifiedKBBuilder(workspace_path=target_dir)
+    effective_db = (
+        db_path
+        or os.getenv("OM_DB_PATH")
+        or os.getenv("PB_DB_PATH")
+        or (os.path.join(target_dir, ".projectbrain", "kb", "projectbrain_kb.db")
+            if os.path.exists(os.path.join(target_dir, ".projectbrain", "kb", "projectbrain_kb.db"))
+            else None)
+    )
+    if effective_db:
+        from .graphify_engine.store import get_graph_store
+        builder.store = get_graph_store(db_path=effective_db)
+    res = builder.trace_code_and_docs(
+        project_id=project_id,
+        target=target,
+        branch=branch,
+    )
+    print(json.dumps(res.model_dump(), indent=2))
+
+
+def run_kb_coverage(
+    project_id: str = "project-brain",
+    branch: str = "main",
+    workspace_path: str = ".",
+    db_path: Optional[str] = None,
+):
+    import os
+    import json
+    from .graphify_engine.kb_linker import UnifiedKBBuilder
+
+    target_dir = os.path.abspath(workspace_path)
+    builder = UnifiedKBBuilder(workspace_path=target_dir)
+    effective_db = (
+        db_path
+        or os.getenv("OM_DB_PATH")
+        or os.getenv("PB_DB_PATH")
+        or (os.path.join(target_dir, ".projectbrain", "kb", "projectbrain_kb.db")
+            if os.path.exists(os.path.join(target_dir, ".projectbrain", "kb", "projectbrain_kb.db"))
+            else None)
+    )
+    if effective_db:
+        from .graphify_engine.store import get_graph_store
+        builder.store = get_graph_store(db_path=effective_db)
+    res = builder.get_kb_coverage_report(
+        project_id=project_id,
+        branch=branch,
+    )
+    print(json.dumps(res.model_dump(), indent=2))
+
+
+_CLI_VALUE_FLAGS = frozenset({
+    "--branch",
+    "--url",
+    "--scoped",
+    "--base",
+    "--target",
+    "--path",
+    "--author",
+    "--output",
+    "--db-path",
+})
+
+
+def _get_positional_args(argv_slice: List[str], value_flags: Optional[Any] = None) -> List[str]:
+    flags_with_values = set(value_flags) if value_flags is not None else _CLI_VALUE_FLAGS
+    pos: List[str] = []
+    i = 0
+    n = len(argv_slice)
+    while i < n:
+        arg = argv_slice[i]
+        if arg in flags_with_values:
+            if i + 1 < n and not argv_slice[i + 1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        pos.append(arg)
+        i += 1
+    return pos
+
+
 if __name__ == "__main__":
     import sys
     import os
+
+    def _get_flag(flag_name: str, default: Any = None) -> Any:
+        for i, a in enumerate(sys.argv):
+            if a == flag_name:
+                if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                    return sys.argv[i + 1]
+                return True
+            if a.startswith(f"{flag_name}="):
+                return a.split("=", 1)[1]
+        return default
+
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         run_server()
     elif len(sys.argv) > 1 and sys.argv[1] == "mcp":
         run_mcp()
+    elif len(sys.argv) > 1 and sys.argv[1] == "graphify-sync":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
+            print("Usage: python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--url URL] [--scoped P1,P2] [--dirty] [--local-only]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        workspace_path = pos_args[1] if len(pos_args) > 1 else _get_flag("--path", ".")
+        branch = _get_flag("--branch", "main")
+        server_url = _get_flag("--url", None)
+        scoped_raw = _get_flag("--scoped", None)
+        scoped_paths = [p.strip() for p in scoped_raw.split(",") if p.strip()] if scoped_raw else None
+        git_dirty = any(a in sys.argv for a in ["--dirty", "-d"])
+        local_only = any(a in sys.argv for a in ["--local-only", "-l"])
+        run_graphify_sync(project_id, workspace_path, branch, server_url, scoped_paths, git_dirty, local_only)
+    elif len(sys.argv) > 1 and sys.argv[1] == "graphify-diff":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
+            print("Usage: python -m projectbrain.main graphify-diff <project_id> [--base main] [--target branch] [--local] [--path .] [--url URL]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        base_branch = _get_flag("--base", "main")
+        target_branch = _get_flag("--target", None)
+        local = any(a in sys.argv for a in ["--local", "-l"])
+        workspace_path = _get_flag("--path", ".")
+        server_url = _get_flag("--url", None)
+        run_graphify_diff(project_id, base_branch, target_branch, local, workspace_path, server_url)
+    elif len(sys.argv) > 1 and sys.argv[1] == "upload-doc":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 2:
+            print("Usage: python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--url URL] [--author A]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        file_path = pos_args[1]
+        branch = _get_flag("--branch", "main")
+        server_url = _get_flag("--url", None)
+        author = _get_flag("--author", None)
+        run_upload_doc(project_id, file_path, branch, server_url, author)
     elif len(sys.argv) > 1 and sys.argv[1] == "codegraph-sync":
-        if len(sys.argv) < 3:
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
             print("Usage: python -m projectbrain.main codegraph-sync <project_id> [server_url] [project_path] [branch]")
             sys.exit(1)
-        project_id = sys.argv[2]
-        server_url = sys.argv[3] if len(sys.argv) > 3 else None
-        project_path = sys.argv[4] if len(sys.argv) > 4 else None
-        branch = sys.argv[5] if len(sys.argv) > 5 else None
-        
+        project_id = pos_args[0]
+        server_url = pos_args[1] if len(pos_args) > 1 else _get_flag("--url", None)
+        project_path = pos_args[2] if len(pos_args) > 2 else _get_flag("--path", None)
+        branch = pos_args[3] if len(pos_args) > 3 else _get_flag("--branch", None)
+
         sync_memories = any(arg in sys.argv for arg in ["--sync-memories", "-m"])
         upload_db = any(arg in sys.argv for arg in ["--upload-db", "-u"])
-        
-        # Filter out flags from positional arguments
-        flags = ["--sync-memories", "-m", "--upload-db", "-u"]
-        if server_url in flags: server_url = None
-        if project_path in flags: project_path = None
-        if branch in flags: branch = None
-        
+
         run_codegraph_sync(project_id, server_url, project_path, branch, sync_memories, upload_db)
     elif len(sys.argv) > 1 and sys.argv[1] == "ingest-files":
         if len(sys.argv) < 4:
@@ -559,11 +900,48 @@ if __name__ == "__main__":
         tags = sys.argv[5] if len(sys.argv) > 5 else ""
         author = sys.argv[6] if len(sys.argv) > 6 else None
         run_upload_file(project_id, file_path, server_url, tags, author)
+    elif len(sys.argv) > 1 and sys.argv[1] == "build-kb":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        project_id = pos_args[0] if len(pos_args) > 0 else "project-brain"
+        workspace_path = pos_args[1] if len(pos_args) > 1 else _get_flag("--path", ".")
+        branch = _get_flag("--branch", "main")
+        persist_memory = not any(a in sys.argv for a in ["--no-memory"])
+        generate_office = not any(a in sys.argv for a in ["--no-office"])
+        output_dir = _get_flag("--output", None)
+        db_path = _get_flag("--db-path", None)
+        run_build_kb(project_id, workspace_path, branch, persist_memory, generate_office, output_dir, db_path)
+    elif len(sys.argv) > 1 and sys.argv[1] == "kb-trace":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 2:
+            print("Usage: python -m projectbrain.main kb-trace <project_id> <target> [--branch B] [--path PATH] [--db-path DB]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        target = pos_args[1]
+        branch = _get_flag("--branch", "main")
+        workspace_path = _get_flag("--path", ".")
+        db_path = _get_flag("--db-path", None)
+        run_kb_trace(project_id, target, branch, workspace_path, db_path)
+    elif len(sys.argv) > 1 and sys.argv[1] == "kb-coverage":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
+            print("Usage: python -m projectbrain.main kb-coverage <project_id> [--branch B] [--path PATH] [--db-path DB]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        branch = _get_flag("--branch", "main")
+        workspace_path = _get_flag("--path", ".")
+        db_path = _get_flag("--db-path", None)
+        run_kb_coverage(project_id, branch, workspace_path, db_path)
     else:
         print("ProjectBrain Python SDK / Server")
         print("Usage:")
         print("  python -m projectbrain.main serve                                         # Start REST API & Dashboard")
         print("  python -m projectbrain.main mcp                                           # Start stdio MCP server")
+        print("  python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--url URL] [--scoped P1,P2] [--dirty] [--local-only]")
+        print("  python -m projectbrain.main graphify-diff <project_id> [--base main] [--target branch] [--local] [--path .] [--url URL]")
+        print("  python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--url URL] [--author A]")
         print("  python -m projectbrain.main codegraph-sync <project_id> [url] [path] [branch] [-m] [-u] # Sync local codegraph and memories to server (use -u to upload sqlite db file)")
         print("  python -m projectbrain.main ingest-files <project_id> <dir_path>           # Ingest codebase files into memories")
         print("  python -m projectbrain.main upload-file <project_id> <file_path> [url] [tags] [author] # Upload a document to RAG server")
+        print("  python -m projectbrain.main build-kb [project_id] [path] [--branch B] [--no-memory] [--no-office] [--output DIR] [--db-path DB]")
+        print("  python -m projectbrain.main kb-trace <project_id> <target> [--branch B] [--path PATH] [--db-path DB]")
+        print("  python -m projectbrain.main kb-coverage <project_id> [--branch B] [--path PATH] [--db-path DB]")

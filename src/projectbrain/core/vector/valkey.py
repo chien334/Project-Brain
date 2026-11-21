@@ -20,12 +20,35 @@ class ValkeyVectorStore(VectorStore):
             self.client = redis.from_url(self.url)
         return self.client
 
-    def _key(self, id: str) -> str:
+    def _key(self, id: str, sector: Optional[str] = None) -> str:
+        if sector:
+            return f"{self.prefix}{id}:{sector}"
         return f"{self.prefix}{id}"
+
+    @staticmethod
+    def _parse_row(data: Dict[Any, Any]) -> Optional[VectorRow]:
+        if not data:
+            return None
+
+        def dec(x):
+            return x.decode("utf-8") if isinstance(x, bytes) else str(x)
+
+        vec_bytes = data.get(b"v") or data.get("v")
+        if vec_bytes is None:
+            return None
+        vec = [float(x) for x in np.frombuffer(vec_bytes, dtype=np.float32)]
+        dim_raw = data.get(b"dim") or data.get("dim")
+        dim = int(dec(dim_raw)) if dim_raw is not None else len(vec)
+        return VectorRow(
+            dec(data.get(b"id") or data.get("id")),
+            dec(data.get(b"sector") or data.get("sector")),
+            vec,
+            dim,
+        )
 
     async def storeVector(self, id: str, sector: str, vector: List[float], dim: int, user_id: Optional[str] = None):
         client = await self._get_client()
-        key = self._key(id)
+        key = self._key(id, sector)
         vec_bytes = np.array(vector, dtype=np.float32).tobytes()
 
         mapping = {
@@ -39,31 +62,94 @@ class ValkeyVectorStore(VectorStore):
 
     async def getVectorsById(self, id: str) -> List[VectorRow]:
         client = await self._get_client()
-        key = self._key(id)
-        data = await client.hgetall(key)
-        if not data: return []
-        def dec(x): return x.decode('utf-8') if isinstance(x, bytes) else str(x)
+        cursor = 0
+        rows_by_sector: Dict[str, VectorRow] = {}
 
-        vec_bytes = data.get(b'v') or data.get('v')
-        vec = list(np.frombuffer(vec_bytes, dtype=np.float32))
+        while True:
+            cursor, keys = await client.scan(cursor, match=f"{self.prefix}{id}:*", count=100)
+            if keys:
+                pipe = client.pipeline()
+                for key in keys:
+                    pipe.hgetall(key)
+                items = await pipe.execute()
+                for item in items:
+                    row = self._parse_row(item)
+                    if row is not None and (not row.id or row.id == id):
+                        rows_by_sector[row.sector] = row
+            if cursor == 0:
+                break
 
-        return [VectorRow(
-            dec(data.get(b'id') or data.get('id')),
-            dec(data.get(b'sector') or data.get('sector')),
-            vec,
-            int(dec(data.get(b'dim') or data.get('dim')))
-        )]
+        legacy_data = await client.hgetall(self._key(id))
+        legacy_row = self._parse_row(legacy_data)
+        if legacy_row is not None and legacy_row.sector not in rows_by_sector:
+            rows_by_sector[legacy_row.sector] = legacy_row
+
+        return list(rows_by_sector.values())
 
     async def getVector(self, id: str, sector: str) -> Optional[VectorRow]:
-        rows = await self.getVectorsById(id)
-        for r in rows:
-            if r.sector == sector:
-                return r
+        client = await self._get_client()
+        data = await client.hgetall(self._key(id, sector))
+        row = self._parse_row(data)
+        if row is not None:
+            return row
+
+        legacy_data = await client.hgetall(self._key(id))
+        legacy_row = self._parse_row(legacy_data)
+        if legacy_row is not None and legacy_row.sector == sector:
+            return legacy_row
         return None
+
+    async def getVectorsBySector(self, sector: str) -> List[VectorRow]:
+        client = await self._get_client()
+        cursor = 0
+        res: List[VectorRow] = []
+
+        def dec(x):
+            return x.decode('utf-8') if isinstance(x, bytes) else str(x)
+
+        while True:
+            cursor, keys = await client.scan(cursor, match=f"{self.prefix}*", count=100)
+            if keys:
+                pipe = client.pipeline()
+                for key in keys:
+                    pipe.hgetall(key)
+                items = await pipe.execute()
+
+                for item in items:
+                    if not item:
+                        continue
+                    i_sector = dec(item.get(b'sector') or item.get('sector'))
+                    if i_sector != sector:
+                        continue
+                    vec_bytes = item.get(b'v') or item.get('v')
+                    if vec_bytes is None:
+                        continue
+                    vec = [float(x) for x in np.frombuffer(vec_bytes, dtype=np.float32)]
+                    dim_raw = item.get(b'dim') or item.get('dim')
+                    dim = int(dec(dim_raw)) if dim_raw is not None else len(vec)
+                    res.append(VectorRow(
+                        dec(item.get(b'id') or item.get('id')),
+                        i_sector,
+                        vec,
+                        dim
+                    ))
+            if cursor == 0:
+                break
+
+        return res
 
     async def deleteVectors(self, id: str):
         client = await self._get_client()
-        await client.delete(self._key(id))
+        keys_to_delete = [self._key(id)]
+        cursor = 0
+        while True:
+            cursor, keys = await client.scan(cursor, match=f"{self.prefix}{id}:*", count=100)
+            if keys:
+                keys_to_delete.extend(keys)
+            if cursor == 0:
+                break
+        if keys_to_delete:
+            await client.delete(*keys_to_delete)
 
     async def search(self, vector: List[float], sector: str, k: int, filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
 

@@ -1,0 +1,46 @@
+# Community 17: Init
+
+> **Leiden Community Cluster 17**  
+> Contains 1 member symbols with high intra-cluster cohesive density.
+
+## 1. Community Member Symbols
+
+| Symbol Name | Type | Source File | Location | Community ID |
+| :--- | :--- | :--- | :--- | :--- |
+| `__init__.py` | code | `src/projectbrain/migrations/__init__.py` | `L1` | Community 17 |
+
+## 2. Internal Call & Import Relations
+
+| Source Symbol | Relation | Target Symbol | Confidence | Score |
+| :--- | :--- | :--- | :--- | :--- |
+| None | - | None | - | - |
+
+## 3. Cross-Community Bridge Connections
+
+| Source Symbol | Target External Symbol | Relation | Confidence |
+| :--- | :--- | :--- | :--- |
+| `init` | `base` | `imports_from` | EXTRACTED |
+| `init` | `python` | `imports_from` | EXTRACTED |
+| `init` | `cobol` | `imports_from` | EXTRACTED |
+| `init` | `vb6` | `imports_from` | EXTRACTED |
+| `init` | `pascal` | `imports_from` | EXTRACTED |
+| `init` | `fortran` | `imports_from` | EXTRACTED |
+| `init` | `st_xml` | `imports_from` | EXTRACTED |
+| `init` | `generic` | `imports_from` | EXTRACTED |
+| `init` | `main` | `imports_from` | EXTRACTED |
+| `init` | `trace` | `imports_from` | EXTRACTED |
+| `init` | `base` | `imports_from` | EXTRACTED |
+| `init` | `langchain` | `imports_from` | EXTRACTED |
+| `init` | `agents` | `imports_from` | EXTRACTED |
+| `init` | `google_drive` | `imports_from` | EXTRACTED |
+| `init` | `google_sheets` | `imports_from` | EXTRACTED |
+| `init` | `google_slides` | `imports_from` | EXTRACTED |
+| `init` | `notion` | `imports_from` | EXTRACTED |
+| `init` | `onedrive` | `imports_from` | EXTRACTED |
+| `init` | `github` | `imports_from` | EXTRACTED |
+| `init` | `web_crawler` | `imports_from` | EXTRACTED |
+| `init` | `postgres` | `imports_from` | EXTRACTED |
+| `init` | `valkey` | `imports_from` | EXTRACTED |
+| `init` | `store` | `imports_from` | EXTRACTED |
+| `init` | `query` | `imports_from` | EXTRACTED |
+| `init` | `timeline` | `imports_from` | EXTRACTED |

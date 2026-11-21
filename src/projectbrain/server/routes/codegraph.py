@@ -1,13 +1,46 @@
 from fastapi import APIRouter, HTTPException, Query, Request, File, UploadFile, Form
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import sqlite3
 import time
 import json
+import logging
 from pathlib import Path
 from ...core.db import db
 
+logger = logging.getLogger("server.routes.codegraph")
+
 router = APIRouter(tags=["codegraph"])
+
+
+def parse_project_and_branch(project_id: str, default_branch: str = "main") -> Tuple[str, str]:
+    """Parse composite project identifier (e.g. 'ecommerce:feature-x') into (project, branch)."""
+    if not project_id:
+        return ("default", default_branch)
+    if ":" in project_id:
+        parts = project_id.split(":", 1)
+        return (parts[0], parts[1] or default_branch)
+    return (project_id, default_branch)
+
+
+def _get_store():
+    import os
+    from ...graphify_engine.store import get_graph_store
+    db_path = (
+        os.getenv("PB_GRAPH_DB_PATH")
+        or os.getenv("OM_GRAPH_DB_PATH")
+        or os.getenv("PB_DB_PATH")
+        or os.getenv("OM_DB_PATH")
+    )
+    if not db_path:
+        try:
+            from ...core.config import env
+            db_url = getattr(env, "database_url", "")
+            if db_url.startswith("sqlite:///"):
+                db_path = db_url.replace("sqlite:///", "")
+        except Exception:
+            pass
+    return get_graph_store(db_path=db_path)
 
 class SyncRequest(BaseModel):
     project_id: str
@@ -34,9 +67,10 @@ async def get_projects():
         rows = cursor.fetchall()
         
         projects = []
+        seen_ids = set()
         for r in rows:
             if db.is_postgres:
-                projects.append({
+                p = {
                     "id": r[0],
                     "name": r[1],
                     "description": r[2],
@@ -45,11 +79,39 @@ async def get_projects():
                     "sync_ip": r[5],
                     "sync_author": r[6],
                     "project_path": r[7]
-                })
+                }
             else:
-                projects.append(dict(r))
+                p = dict(r)
+            projects.append(p)
+            seen_ids.add(p["id"])
                 
         cursor.close()
+
+        # Merge with GraphStore projects
+        try:
+            from ...graphify_engine.store import get_graph_store
+            store = _get_store()
+            try:
+                store_projects = store.list_projects()
+            finally:
+                store.close()
+            now_ts = int(time.time())
+            for sp in store_projects:
+                if sp not in seen_ids:
+                    projects.append({
+                        "id": sp,
+                        "name": sp,
+                        "description": f"Graphify project {sp}",
+                        "created_at": now_ts,
+                        "updated_at": now_ts,
+                        "sync_ip": "127.0.0.1",
+                        "sync_author": "system",
+                        "project_path": None
+                    })
+                    seen_ids.add(sp)
+        except Exception as ge:
+            logger.debug(f"GraphStore project merge skipped: {ge}")
+
         return {"projects": projects}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load projects: {str(e)}")
@@ -87,6 +149,21 @@ async def delete_project(project_id: str):
     import os
     if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
         raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
+    # Also clean up GraphStore
+    try:
+        from ...graphify_engine.store import get_graph_store
+        store = _get_store()
+        try:
+            proj, branch = parse_project_and_branch(project_id)
+            if branch != "main":
+                store.delete_branch(proj, branch)
+            else:
+                store.delete_project(proj)
+        finally:
+            store.close()
+    except Exception as ge:
+        logger.debug(f"GraphStore delete project cleanup: {ge}")
+
     db.connect()
     try:
         cursor = db.conn.cursor()
@@ -109,6 +186,39 @@ async def delete_project(project_id: str):
 
 @router.get("/diff")
 async def diff_projects(base_project_id: str, target_project_id: str):
+    # Try GraphStore diff first
+    try:
+        from ...graphify_engine.store import get_graph_store
+        store = _get_store()
+        try:
+            base_proj, base_br = parse_project_and_branch(base_project_id)
+            target_proj, target_br = parse_project_and_branch(target_project_id)
+            if base_proj == target_proj:
+                base_stats = store.get_stats(base_proj, base_br)
+                target_stats = store.get_stats(target_proj, target_br)
+                base_node_cnt = base_stats.get("node_count", 0) or base_stats.get("nodes_count", 0)
+                target_node_cnt = target_stats.get("node_count", 0) or target_stats.get("nodes_count", 0)
+                if base_node_cnt > 0 or target_node_cnt > 0:
+                    diff_res = store.diff_branches(
+                        project_id=base_proj,
+                        base_branch=base_br,
+                        target_branch=target_br
+                    )
+                    added = diff_res.new_nodes
+                    modified = diff_res.modified_nodes
+                    deleted = [{"id": did} for did in diff_res.deleted_node_ids]
+                    return {
+                        "base_project_id": base_project_id,
+                        "target_project_id": target_project_id,
+                        "added": added,
+                        "deleted": deleted,
+                        "modified": modified
+                    }
+        finally:
+            store.close()
+    except Exception as ge:
+        logger.debug(f"GraphStore diff fallback: {ge}")
+
     db.connect()
     try:
         cursor = db.conn.cursor()
@@ -203,6 +313,29 @@ async def diff_projects(base_project_id: str, target_project_id: str):
 @router.get("/status")
 async def get_codegraph_status(project_id: Optional[str] = None):
     if project_id:
+        proj_id, branch = parse_project_and_branch(project_id)
+        # Try GraphStore first
+        try:
+            store = _get_store()
+            try:
+                stats = store.get_stats(proj_id, branch)
+            finally:
+                store.close()
+            node_cnt = stats.get("node_count", 0) or stats.get("nodes_count", 0)
+            edge_cnt = stats.get("edge_count", 0) or stats.get("edges_count", 0)
+            if node_cnt > 0 or edge_cnt > 0:
+                return {
+                    "status": "ready",
+                    "source": "server",
+                    "project_id": project_id,
+                    "branch": branch,
+                    "nodes_count": node_cnt,
+                    "edges_count": edge_cnt,
+                    "hyperedges_count": stats.get("hyperedge_count", 0) or stats.get("hyperedges_count", 0),
+                }
+        except Exception as ge:
+            logger.debug(f"GraphStore status fallback: {ge}")
+
         db.connect()
         try:
             cursor = db.conn.cursor()
@@ -274,6 +407,26 @@ async def get_codegraph_data(
     limit: int = Query(default=300, le=1000)
 ):
     if project_id:
+        proj_id, branch = parse_project_and_branch(project_id)
+        # Try GraphStore first
+        try:
+            from ...graphify_engine.store import get_graph_store
+            store = _get_store()
+            try:
+                visjs = store.to_legacy_visjs(
+                    project_id=proj_id,
+                    branch_name=branch,
+                    query=query,
+                    kinds=kinds,
+                    limit=limit,
+                )
+            finally:
+                store.close()
+            if visjs.get("nodes"):
+                return visjs
+        except Exception as ge:
+            logger.debug(f"GraphStore to_legacy_visjs fallback: {ge}")
+
         db.connect()
         try:
             cursor = db.conn.cursor()
@@ -621,6 +774,57 @@ async def sync_codegraph_data(req: SyncRequest, request: Request = None):
                 
         db.conn.commit()
         cursor.close()
+
+        # Bridge into GraphStore
+        try:
+            from ...graphify_engine.store import get_graph_store
+            from ...graphify_engine.models import GraphDelta, GraphNode, GraphEdge
+            proj, branch = parse_project_and_branch(req.project_id)
+            g_nodes = [
+                GraphNode(
+                    id=n.get("id"),
+                    project_id=proj,
+                    label=n.get("name") or n.get("qualified_name") or n.get("id"),
+                    file_type="code",
+                    source_file=n.get("file_path") or "unknown",
+                    source_location=f"{n.get('start_line', 0)}:{n.get('end_line', 0)}",
+                    metadata={
+                        "kind": n.get("kind"),
+                        "name": n.get("name"),
+                        "qualified_name": n.get("qualified_name"),
+                        "signature": n.get("signature"),
+                        "docstring": n.get("docstring"),
+                        "language": n.get("language")
+                    }
+                )
+                for n in req.nodes
+            ]
+            g_edges = [
+                GraphEdge(
+                    project_id=proj,
+                    source=e.get("source"),
+                    target=e.get("target"),
+                    relation=e.get("kind") or "calls",
+                    confidence="EXTRACTED",
+                    source_file=e.get("source_file"),
+                    metadata=e.get("metadata") if isinstance(e.get("metadata"), dict) else {}
+                )
+                for e in req.edges
+            ]
+            delta = GraphDelta(project_id=proj, branch=branch, nodes=g_nodes, edges=g_edges)
+            store = _get_store()
+            try:
+                store.sync_branch_delta(
+                    project_id=proj,
+                    branch_name=branch,
+                    delta=delta,
+                    partial=False,
+                    author=req.author or "anonymous"
+                )
+            finally:
+                store.close()
+        except Exception as ge:
+            logger.debug(f"GraphStore bridge sync failed: {ge}")
         
         return {
             "status": "success",
@@ -655,11 +859,27 @@ async def upload_codegraph_db(
     import os
     import shutil
 
+    safe_name = Path(file.filename or "uploaded_file.db").name
+    max_mb = float(os.getenv("PB_MAX_UPLOAD_MB", "50"))
+    max_bytes = int(max_mb * 1024 * 1024)
+
+    content_len = request.headers.get("content-length") if request else None
+    if content_len and int(content_len) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"Payload Too Large: Maximum allowed upload is {max_mb}MB")
+
     # Create a temporary file to save the uploaded SQLite database
     fd, temp_path = tempfile.mkstemp(suffix=".db")
     try:
+        total_read = 0
         with os.fdopen(fd, "wb") as tmp:
-            shutil.copyfileobj(file.file, tmp)
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_read += len(chunk)
+                if total_read > max_bytes:
+                    raise HTTPException(status_code=413, detail=f"Payload Too Large: Maximum allowed upload is {max_mb}MB")
+                tmp.write(chunk)
 
         # Connect to the uploaded SQLite file
         conn = sqlite3.connect(temp_path)
@@ -675,6 +895,8 @@ async def upload_codegraph_db(
         edges = [dict(row) for row in cursor.fetchall()]
 
         conn.close()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=400,
@@ -796,6 +1018,57 @@ async def upload_codegraph_db(
                 
         db.conn.commit()
         db_cursor.close()
+
+        # Bridge into GraphStore
+        try:
+            from ...graphify_engine.store import get_graph_store
+            from ...graphify_engine.models import GraphDelta, GraphNode, GraphEdge
+            proj, branch = parse_project_and_branch(project_id)
+            g_nodes = [
+                GraphNode(
+                    id=n.get("id"),
+                    project_id=proj,
+                    label=n.get("name") or n.get("qualified_name") or n.get("id"),
+                    file_type="code",
+                    source_file=n.get("file_path") or "unknown",
+                    source_location=f"{n.get('start_line', 0)}:{n.get('end_line', 0)}",
+                    metadata={
+                        "kind": n.get("kind"),
+                        "name": n.get("name"),
+                        "qualified_name": n.get("qualified_name"),
+                        "signature": n.get("signature"),
+                        "docstring": n.get("docstring"),
+                        "language": n.get("language")
+                    }
+                )
+                for n in nodes
+            ]
+            g_edges = [
+                GraphEdge(
+                    project_id=proj,
+                    source=e.get("source"),
+                    target=e.get("target"),
+                    relation=e.get("kind") or "calls",
+                    confidence="EXTRACTED",
+                    source_file=e.get("source_file"),
+                    metadata=e.get("metadata") if isinstance(e.get("metadata"), dict) else {}
+                )
+                for e in edges
+            ]
+            delta = GraphDelta(project_id=proj, branch=branch, nodes=g_nodes, edges=g_edges)
+            store = _get_store()
+            try:
+                store.sync_branch_delta(
+                    project_id=proj,
+                    branch_name=branch,
+                    delta=delta,
+                    partial=False,
+                    author=author or "anonymous"
+                )
+            finally:
+                store.close()
+        except Exception as ge:
+            logger.debug(f"GraphStore bridge upload failed: {ge}")
         
         return {
             "status": "success",

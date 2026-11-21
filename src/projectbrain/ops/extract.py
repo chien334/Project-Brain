@@ -72,7 +72,7 @@ async def extract_url(url: str) -> Dict[str, Any]:
     return await extract_html(html)
 
 async def extract_audio(data: bytes, mime_type: str) -> Dict[str, Any]:
-    api_key = env.openai_api_key or os.getenv("OPENAI_API_KEY")
+    api_key = env.openai_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OpenAI API key required for audio transcription")
 
@@ -133,7 +133,8 @@ async def extract_video(data: bytes) -> Dict[str, Any]:
             ["ffmpeg", "-y", "-i", vid_path, "-vn", "-acodec", "libmp3lame", audio_path],
             check=True,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            timeout=120
         )
 
         with open(audio_path, "rb") as f:
