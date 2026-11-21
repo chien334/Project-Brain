@@ -7,6 +7,7 @@ subgraph retrieval, and branch lifecycle management.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -141,6 +142,9 @@ class SyncBranchRequest(BaseModel):
     author: str = "system"
     cluster: bool = False
     project_path: Optional[str] = None
+    device: Optional[str] = None
+    workers: Optional[int] = None
+    semantic_engine: Optional[str] = None
 
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
@@ -188,10 +192,19 @@ async def sync_graph(req: SyncBranchRequest, request: Request = None):
         )
 
         # Optional community clustering via GraphifyExtractor
-        if req.cluster and delta.nodes:
+        if (req.cluster or bool(getattr(req, "recluster", False))) and delta.nodes:
             try:
-                extractor = GraphifyExtractor()
-                delta = extractor.cluster_graph(delta)
+                extractor = GraphifyExtractor(
+                    device=req.device or "auto",
+                    workers=req.workers,
+                    semantic_engine=req.semantic_engine or "auto",
+                )
+                delta = extractor.cluster_graph(
+                    delta,
+                    device=req.device or "auto",
+                    workers=req.workers,
+                    semantic_engine=req.semantic_engine or "auto",
+                )
             except Exception as ce:
                 logger.warning(f"Community clustering failed or skipped: {ce}")
 
@@ -447,3 +460,72 @@ async def get_stats(project_id: str, branch: str = "main"):
     except Exception as e:
         logger.error(f"Failed to get stats for {project_id}:{branch}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
+
+async def collect_hardware_status(
+    ocr_device: Optional[str] = None,
+    graphify_device: Optional[str] = None,
+    semantic_engine: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Collect unified hardware, OCR, Graphify GPU/CPU, and Local AI readiness status."""
+    from ...graphify_engine.gpu_accelerator import GraphGPUAccelerator
+    from ...ocr_runtime import ComputeDeviceManager, UnifiedOCREngine
+
+    ocr_engine = UnifiedOCREngine()
+    ocr_status = ocr_engine.get_full_status()
+    if inspect.isawaitable(ocr_status):
+        ocr_status = await ocr_status
+
+    if ocr_device is not None and isinstance(ocr_status, dict):
+        cfg = ocr_status.get("config")
+        selected_ocr_engine = str((cfg or {}).get("ocr_engine") or "auto")
+        ocr_status = dict(ocr_status)
+        ocr_status["resolved_device"] = ComputeDeviceManager.resolve_device(
+            requested=ocr_device,
+            engine=selected_ocr_engine,
+            hardware=ocr_status.get("hardware"),
+        )
+        if isinstance(cfg, dict):
+            ocr_status["config"] = {**cfg, "ocr_device": ocr_device}
+
+    graphify_status = GraphGPUAccelerator.get_status()
+    if inspect.isawaitable(graphify_status):
+        graphify_status = await graphify_status
+
+    if isinstance(graphify_status, dict) and (
+        graphify_device is not None or semantic_engine is not None
+    ):
+        graphify_status = dict(graphify_status)
+        cfg = dict(graphify_status.get("config") or {})
+        if graphify_device is not None:
+            graphify_status["resolved_backend"] = GraphGPUAccelerator.resolve_compute_backend(
+                device=graphify_device
+            )
+            cfg["graphify_device"] = graphify_device
+        if semantic_engine is not None:
+            cfg["graphify_semantic_engine"] = semantic_engine
+        graphify_status["config"] = cfg
+
+    return {
+        "status": "ok",
+        "ocr": ocr_status,
+        "graphify": graphify_status,
+    }
+
+
+@router.get("/hardware")
+async def get_graphify_hardware(
+    ocr_device: Optional[str] = Query(default=None),
+    graphify_device: Optional[str] = Query(default=None),
+    semantic_engine: Optional[str] = Query(default=None),
+):
+    """Report OCR and Graphify GPU/MPS/CUDA/CPU hardware and Local AI readiness."""
+    try:
+        return await collect_hardware_status(
+            ocr_device=ocr_device,
+            graphify_device=graphify_device,
+            semantic_engine=semantic_engine,
+        )
+    except Exception as e:
+        logger.error(f"Failed to inspect hardware status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to inspect hardware status: {str(e)}")

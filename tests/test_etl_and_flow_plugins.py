@@ -38,9 +38,9 @@ class _DummyRegistry:
 # ---------------------------------------------------------------------------
 # 1. Discovery & Registration Tests
 # ---------------------------------------------------------------------------
-def test_get_and_register_all_12_plugins() -> None:
+def test_get_and_register_all_13_plugins() -> None:
     plugins = get_plugins()
-    assert len(plugins) == 12
+    assert len(plugins) == 13
     ids = {p.metadata.plugin_id for p in plugins}
     assert ids == {
         "etl.graphify_ast",
@@ -55,11 +55,12 @@ def test_get_and_register_all_12_plugins() -> None:
         "etl.openapi31",
         "etl.cpp_embedded",
         "linker.state_flow",
+        "etl.local_ai_ocr",
     }
 
     reg = _DummyRegistry()
     registered_ids = register_plugins(reg)
-    assert len(registered_ids) == 12
+    assert len(registered_ids) == 13
     assert set(reg.plugins.keys()) == ids
 
 

@@ -47,6 +47,41 @@ ocr = [
     "pymupdf>=1.23",
     "numpy",
 ]
+ocr-cpu = [
+    "paddleocr>=2.7",
+    "paddlepaddle>=2.6",
+    "pymupdf>=1.23",
+    "numpy",
+]
+ocr-gpu = [
+    "paddleocr>=2.7",
+    "paddlepaddle-gpu>=2.6",
+    "pymupdf>=1.23",
+    "numpy",
+]
+ocr-onnx = [
+    "rapidocr-onnxruntime>=1.3",
+    "onnxruntime>=1.17",
+    "pymupdf>=1.23",
+    "numpy",
+]
+ocr-onnx-gpu = [
+    "rapidocr-onnxruntime>=1.3",
+    "onnxruntime-gpu>=1.17",
+    "pymupdf>=1.23",
+    "numpy",
+]
+graphify-gpu = [
+    "torch>=2.2",
+    "sentence-transformers>=2.6",
+    "scipy>=1.11",
+]
+graphify-cuda = [
+    "torch>=2.2",
+    "sentence-transformers>=2.6",
+    "cugraph-cu12>=24.0",
+    "cudf-cu12>=24.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/projectbrain", "extensions_mcp"]

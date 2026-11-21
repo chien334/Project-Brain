@@ -33,15 +33,15 @@ from projectbrain.plugins.builtins.storage_plugins import (
 
 
 # ---------------------------------------------------------------------------
-# 1. Built-in Discovery Across All 9 Categories (25 Plugins Total)
+# 1. Built-in Discovery Across All 9 Categories (26 Plugins Total)
 # ---------------------------------------------------------------------------
-def test_discover_all_25_builtins_across_all_categories() -> None:
+def test_discover_all_26_builtins_across_all_categories() -> None:
     all_instances = get_all_builtin_plugins()
-    assert len(all_instances) == 25
+    assert len(all_instances) == 26
 
     reg = PluginRegistry()
     loaded_count = reg.discover_builtins()
-    assert loaded_count == 25
+    assert loaded_count == 26
 
     expected_by_category = {
         PluginCategory.GRAPH_BACKEND.value: {
@@ -56,6 +56,7 @@ def test_discover_all_25_builtins_across_all_categories() -> None:
         PluginCategory.ETL_PARSER.value: {
             "etl.graphify_ast",
             "etl.multimodal_doc",
+            "etl.local_ai_ocr",
             "etl.legacy_testcase",
             "etl.hardware_datasheet",
             "etl.openapi31",
@@ -90,16 +91,16 @@ def test_discover_all_25_builtins_across_all_categories() -> None:
     }
 
     listed = reg.list_plugins()
-    assert len(listed) == 25
+    assert len(listed) == 26
 
     for category, expected_ids in expected_by_category.items():
         cat_plugins = reg.list_plugins(category=category)
         assert {p["plugin_id"] for p in cat_plugins} == expected_ids
 
-    # Re-running discover_builtins with override=True cleanly replaces all 25
+    # Re-running discover_builtins with override=True cleanly replaces all 26
     reloaded_count = reg.discover_builtins(override=True)
-    assert reloaded_count == 25
-    assert len(reg.list_plugins()) == 25
+    assert reloaded_count == 26
+    assert len(reg.list_plugins()) == 26
 
 
 def test_default_registry_singleton_lifecycle() -> None:
@@ -108,7 +109,7 @@ def test_default_registry_singleton_lifecycle() -> None:
         reg1 = get_default_registry()
         reg2 = get_default_registry()
         assert reg1 is reg2
-        assert len(reg1.list_plugins()) == 25
+        assert len(reg1.list_plugins()) == 26
     finally:
         reset_default_registry()
 
@@ -364,7 +365,7 @@ def test_per_project_overrides_persistence_and_health_report(
     reg_reloaded.register(_FlakyPlugin())
     hr_global = reg_reloaded.health_report()
     assert hr_global["status"] == "degraded"
-    assert hr_global["total_plugins"] == 26
+    assert hr_global["total_plugins"] == 27
     assert hr_global["plugins"]["custom.flaky"]["status"] == "unhealthy"
 
     # Disabling the flaky plugin for proj-clean keeps proj-clean healthy

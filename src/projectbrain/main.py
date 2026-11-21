@@ -535,7 +535,10 @@ def run_graphify_sync(
     git_dirty: bool = False,
     local_only: bool = False,
     cluster: bool = True,
-    base_branch: Optional[str] = None
+    base_branch: Optional[str] = None,
+    device: str = "auto",
+    workers: Optional[int] = None,
+    semantic_engine: str = "auto",
 ):
     import os
     import sys
@@ -549,7 +552,11 @@ def run_graphify_sync(
         sys.exit(1)
 
     print(f"Scanning codebase at '{target_dir}' via GraphifyExtractor (branch: {branch})...")
-    extractor = GraphifyExtractor()
+    extractor = GraphifyExtractor(
+        device=device or "auto",
+        workers=workers,
+        semantic_engine=semantic_engine or "auto",
+    )
     delta = extractor.extract_workspace(
         workspace_path=target_dir,
         project_id=project_id,
@@ -557,11 +564,19 @@ def run_graphify_sync(
         scoped_paths=scoped_paths,
         git_dirty_only=git_dirty,
         include_docs=True,
-        base_branch=base_branch
+        base_branch=base_branch,
+        device=device or "auto",
+        workers=workers,
+        semantic_engine=semantic_engine or "auto",
     )
     if cluster and delta.nodes:
         try:
-            delta = extractor.cluster_graph(delta)
+            delta = extractor.cluster_graph(
+                delta,
+                device=device or "auto",
+                workers=workers,
+                semantic_engine=semantic_engine or "auto",
+            )
         except Exception as ce:
             print(f"Clustering warning: {ce}")
 
@@ -595,7 +610,10 @@ def run_graphify_sync(
         "partial": bool(scoped_paths or git_dirty or (base_branch and base_branch != branch)),
         "author": os.getenv("USER", "cli"),
         "cluster": False,
-        "project_path": target_dir
+        "project_path": target_dir,
+        "device": device,
+        "workers": workers,
+        "semantic_engine": semantic_engine,
     }
 
     print(f"Synchronizing graph delta to {server_url}/graphify/sync...")
@@ -678,6 +696,10 @@ def run_upload_doc(
     doc_version: Optional[str] = None,
     base_version: Optional[str] = None,
     base_branch: Optional[str] = None,
+    ocr_engine: Optional[str] = None,
+    ocr_device: Optional[str] = None,
+    local_ai_model: Optional[str] = None,
+    local_ai_url: Optional[str] = None,
 ):
     import os
     import sys
@@ -695,7 +717,7 @@ def run_upload_doc(
 
     print(f"Processing document '{file_path}' via DocumentPipeline (branch: {branch})...")
     pipeline = DocumentPipeline()
-    payload = asyncio.run(pipeline.process_file(
+    process_kwargs: Dict[str, Any] = dict(
         file_path=file_path,
         project_id=project_id,
         branch=branch,
@@ -704,7 +726,16 @@ def run_upload_doc(
         doc_version=doc_version,
         base_version=base_version,
         base_branch=base_branch,
-    ))
+    )
+    if ocr_engine is not None:
+        process_kwargs["ocr_engine"] = ocr_engine
+    if ocr_device is not None:
+        process_kwargs["ocr_device"] = ocr_device
+    if local_ai_model is not None:
+        process_kwargs["local_ai_model"] = local_ai_model
+    if local_ai_url is not None:
+        process_kwargs["local_ai_url"] = local_ai_url
+    payload = asyncio.run(pipeline.process_file(**process_kwargs))
 
     print(f"Pushing processed document and graph delta to {server_url}/sources/push-processed...")
     res = asyncio.run(pipeline.push_processed_to_server(
@@ -724,6 +755,11 @@ def run_build_kb(
     generate_office_exports: bool = True,
     output_dir: Optional[str] = None,
     db_path: Optional[str] = None,
+    device: str = "auto",
+    workers: Optional[int] = None,
+    semantic_engine: str = "auto",
+    ocr_engine: str = "auto",
+    ocr_device: str = "auto",
 ):
     import os
     import sys
@@ -737,7 +773,16 @@ def run_build_kb(
         sys.exit(1)
 
     print(f"Building unified knowledge base for '{project_id}' at '{target_dir}' (branch: {branch})...")
-    builder = UnifiedKBBuilder(workspace_path=target_dir)
+    eff_device = device or "auto"
+    eff_ocr_device = ocr_device or "auto"
+    eff_ocr_engine = ocr_engine or "auto"
+    eff_semantic_engine = semantic_engine or "auto"
+    builder = UnifiedKBBuilder(
+        workspace_path=target_dir,
+        device=eff_device,
+        ocr_device=eff_ocr_device,
+        ocr_engine=eff_ocr_engine,
+    )
     res = asyncio.run(builder.build_unified_kb(
         project_id=project_id,
         branch=branch,
@@ -745,9 +790,43 @@ def run_build_kb(
         output_dir=output_dir,
         generate_office_exports=generate_office_exports,
         db_path=db_path,
+        device=eff_device,
+        ocr_device=eff_ocr_device,
+        ocr_engine=eff_ocr_engine,
+        workers=workers,
+        semantic_engine=eff_semantic_engine,
     ))
     print("Successfully built Unified Knowledge Base!")
     print(json.dumps(res, indent=2))
+
+
+def run_hardware_status(
+    device: Optional[str] = None,
+    ocr_device: Optional[str] = None,
+    semantic_engine: Optional[str] = None,
+) -> Dict[str, Any]:
+    import asyncio
+    import concurrent.futures
+    import json
+    from .server.routes.graphify import collect_hardware_status
+
+    async def _collect() -> Dict[str, Any]:
+        return await collect_hardware_status(
+            ocr_device=ocr_device,
+            graphify_device=device,
+            semantic_engine=semantic_engine,
+        )
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        res = asyncio.run(_collect())
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            res = pool.submit(asyncio.run, _collect()).result()
+
+    print(json.dumps(res, default=str, indent=2))
+    return res
 
 
 def run_kb_trace(
@@ -1297,6 +1376,13 @@ _CLI_VALUE_FLAGS = frozenset({
     "--uart-log",
     "--screen-id",
     "--cache-id",
+    "--device",
+    "--workers",
+    "--semantic-engine",
+    "--ocr-engine",
+    "--ocr-device",
+    "--local-ai-model",
+    "--local-ai-url",
 })
 
 
@@ -1335,14 +1421,30 @@ if __name__ == "__main__":
                 return a.split("=", 1)[1]
         return default
 
+    def _get_int_flag(flag_name: str) -> Optional[int]:
+        raw = _get_flag(flag_name, None)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            return int(str(raw).strip())
+        except ValueError:
+            print(f"Error: Invalid integer value for {flag_name}: {raw}")
+            sys.exit(1)
+
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         run_server()
     elif len(sys.argv) > 1 and sys.argv[1] == "mcp":
         run_mcp()
+    elif len(sys.argv) > 1 and sys.argv[1] == "hardware-status":
+        run_hardware_status(
+            device=_get_flag("--device", None),
+            ocr_device=_get_flag("--ocr-device", None),
+            semantic_engine=_get_flag("--semantic-engine", None),
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "graphify-sync":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 1:
-            print("Usage: python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--base-branch BASE] [--url URL] [--scoped P1,P2] [--dirty] [--local-only]")
+            print("Usage: python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--base-branch BASE] [--url URL] [--scoped P1,P2] [--dirty] [--local-only] [--device auto|gpu|cuda|mps|cpu] [--workers N] [--semantic-engine auto|st|ollama|openai|tfidf]")
             sys.exit(1)
         project_id = pos_args[0]
         workspace_path = pos_args[1] if len(pos_args) > 1 else _get_flag("--path", ".")
@@ -1353,7 +1455,22 @@ if __name__ == "__main__":
         scoped_paths = [p.strip() for p in scoped_raw.split(",") if p.strip()] if scoped_raw else None
         git_dirty = any(a in sys.argv for a in ["--dirty", "-d"])
         local_only = any(a in sys.argv for a in ["--local-only", "-l"])
-        run_graphify_sync(project_id, workspace_path, branch, server_url, scoped_paths, git_dirty, local_only, base_branch=base_branch)
+        device = _get_flag("--device", "auto")
+        workers = _get_int_flag("--workers")
+        semantic_engine = _get_flag("--semantic-engine", "auto")
+        run_graphify_sync(
+            project_id,
+            workspace_path,
+            branch,
+            server_url,
+            scoped_paths,
+            git_dirty,
+            local_only,
+            base_branch=base_branch,
+            device=device,
+            workers=workers,
+            semantic_engine=semantic_engine,
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "graphify-diff":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 1:
@@ -1369,7 +1486,7 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "upload-doc":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 2:
-            print("Usage: python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--base-branch BASE] [--doc-key KEY] [--doc-version VER] [--base-version BASE_VER] [--url URL] [--author A]")
+            print("Usage: python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--base-branch BASE] [--doc-key KEY] [--doc-version VER] [--base-version BASE_VER] [--url URL] [--author A] [--ocr-engine E] [--ocr-device D] [--local-ai-model M] [--local-ai-url U]")
             sys.exit(1)
         project_id = pos_args[0]
         file_path = pos_args[1]
@@ -1380,6 +1497,10 @@ if __name__ == "__main__":
         doc_version = _get_flag("--doc-version", None)
         base_version = _get_flag("--base-version", None)
         base_branch = _get_flag("--base-branch", None)
+        ocr_engine = _get_flag("--ocr-engine", None)
+        ocr_device = _get_flag("--ocr-device", None)
+        local_ai_model = _get_flag("--local-ai-model", None)
+        local_ai_url = _get_flag("--local-ai-url", None)
         run_upload_doc(
             project_id,
             file_path,
@@ -1390,6 +1511,10 @@ if __name__ == "__main__":
             doc_version=doc_version,
             base_version=base_version,
             base_branch=base_branch,
+            ocr_engine=ocr_engine,
+            ocr_device=ocr_device,
+            local_ai_model=local_ai_model,
+            local_ai_url=local_ai_url,
         )
     elif len(sys.argv) > 1 and sys.argv[1] == "codegraph-sync":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
@@ -1448,7 +1573,25 @@ if __name__ == "__main__":
         generate_office = not any(a in sys.argv for a in ["--no-office"])
         output_dir = _get_flag("--output", None)
         db_path = _get_flag("--db-path", None)
-        run_build_kb(project_id, workspace_path, branch, persist_memory, generate_office, output_dir, db_path)
+        device = _get_flag("--device", "auto")
+        workers = _get_int_flag("--workers")
+        semantic_engine = _get_flag("--semantic-engine", "auto")
+        ocr_engine = _get_flag("--ocr-engine", "auto")
+        ocr_device = _get_flag("--ocr-device", "auto")
+        run_build_kb(
+            project_id,
+            workspace_path,
+            branch,
+            persist_memory,
+            generate_office,
+            output_dir,
+            db_path,
+            device=device,
+            workers=workers,
+            semantic_engine=semantic_engine,
+            ocr_engine=ocr_engine,
+            ocr_device=ocr_device,
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "kb-trace":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 2:
@@ -1607,13 +1750,14 @@ if __name__ == "__main__":
         print("Usage:")
         print("  python -m projectbrain.main serve                                         # Start REST API & Dashboard")
         print("  python -m projectbrain.main mcp                                           # Start stdio MCP server")
-        print("  python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--url URL] [--scoped P1,P2] [--dirty] [--local-only]")
+        print("  python -m projectbrain.main hardware-status [--device auto|gpu|cuda|mps|cpu] [--ocr-device D] [--semantic-engine E]")
+        print("  python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--url URL] [--scoped P1,P2] [--dirty] [--local-only] [--device D] [--workers N] [--semantic-engine E]")
         print("  python -m projectbrain.main graphify-diff <project_id> [--base main] [--target branch] [--local] [--path .] [--url URL]")
-        print("  python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--url URL] [--author A]")
+        print("  python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--url URL] [--author A] [--ocr-engine E] [--ocr-device D] [--local-ai-model M] [--local-ai-url U]")
         print("  python -m projectbrain.main codegraph-sync <project_id> [url] [path] [branch] [-m] [-u] # Sync local codegraph and memories to server (use -u to upload sqlite db file)")
         print("  python -m projectbrain.main ingest-files <project_id> <dir_path>           # Ingest codebase files into memories")
         print("  python -m projectbrain.main upload-file <project_id> <file_path> [url] [tags] [author] # Upload a document to RAG server")
-        print("  python -m projectbrain.main build-kb [project_id] [path] [--branch B] [--no-memory] [--no-office] [--output DIR] [--db-path DB]")
+        print("  python -m projectbrain.main build-kb [project_id] [path] [--branch B] [--no-memory] [--no-office] [--output DIR] [--db-path DB] [--device D] [--workers N] [--semantic-engine E] [--ocr-engine OE] [--ocr-device OD]")
         print("  python -m projectbrain.main kb-trace <project_id> <target> [--branch B] [--path PATH] [--db-path DB]")
         print("  python -m projectbrain.main kb-coverage <project_id> [--branch B] [--path PATH] [--db-path DB]")
         print("  python -m projectbrain.main plugins [list|enable|disable|reload] [target] [--project P] [--category C]")

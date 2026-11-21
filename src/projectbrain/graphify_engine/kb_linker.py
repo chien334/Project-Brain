@@ -150,8 +150,19 @@ class CodeDocLinker:
     Hierarchical document chunker, symbol indexer, and multi-signal linking engine.
     """
 
-    def __init__(self, workspace_path: Union[str, Path] = "."):
+    def __init__(
+        self,
+        workspace_path: Union[str, Path] = ".",
+        device: str = "auto",
+        ocr_device: str = "auto",
+        ocr_engine: str = "auto",
+        semantic_engine: str = "auto",
+    ):
         self.workspace_path = Path(workspace_path).resolve()
+        self.device = device
+        self.ocr_device = ocr_device
+        self.ocr_engine = ocr_engine
+        self.semantic_engine = semantic_engine
 
     def chunk_markdown_document(
         self,
@@ -673,6 +684,10 @@ class CodeDocLinker:
         chunks: List[DocChunk],
         symbol_index: Dict[str, List[CodeSymbolRef]],
         graph_data: Union[GraphDelta, Dict[str, Any]],
+        device: Optional[str] = None,
+        semantic_engine: Optional[str] = None,
+        semantic_top_k: int = 5,
+        min_similarity: float = 0.60,
     ) -> Tuple[List[CrossLinkEdge], List[CodeDocDrift]]:
         """
         Emit EXTRACTED (1.0) and INFERRED (0.60-0.90) edges connecting doc chunks to code symbols.
@@ -961,7 +976,7 @@ class CodeDocLinker:
                             )
                         )
 
-            # 4. High-precision INFERRED links (conceptually_related_to, 0.60-0.90)
+            # 4. High-precision INFERRED lexical token links (conceptually_related_to, 0.60-0.90)
             prose_text = re.sub(r"```[\s\S]*?```", "", chunk.content)
             prose_words = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", prose_text))
 
@@ -984,6 +999,24 @@ class CodeDocLinker:
                                 metadata={"doc_path": chunk.doc_path, "symbol_name": sym.symbol_name},
                             )
                         )
+
+        # 4b. GPU / Vectorized BLAS semantic similarity pass for INFERRED conceptually_related_to links
+        eff_device = device if device is not None else self.device
+        eff_semantic_engine = (
+            semantic_engine
+            if semantic_engine is not None
+            else getattr(self, "semantic_engine", "auto")
+        )
+        self._link_semantic_similarity(
+            chunks=chunks,
+            symbol_index=symbol_index,
+            add_edge=add_edge,
+            seen_edges=seen_edges,
+            device=eff_device,
+            semantic_engine=eff_semantic_engine,
+            top_k=semantic_top_k,
+            min_similarity=min_similarity,
+        )
 
         # 5. Hierarchical Class-to-Method and Enclosing Scope Inferred Linkage
         class_syms_by_nid = {s.node_id: s for s in getattr(self, "last_symbols", []) if s.symbol_type in ("class", "test")}
@@ -1034,6 +1067,256 @@ class CodeDocLinker:
                         )
 
         return edges, drift_items
+
+    @staticmethod
+    def _normalize_bipartite_topk(raw_matches: Any, n_queries: int) -> List[List[Tuple[int, float]]]:
+        if raw_matches is None:
+            return [[] for _ in range(n_queries)]
+        if isinstance(raw_matches, tuple) and len(raw_matches) == 2:
+            indices, scores = raw_matches
+            return [
+                [(int(ti), float(sc)) for ti, sc in zip(row_i, row_s) if int(ti) >= 0]
+                for row_i, row_s in zip(indices, scores)
+            ]
+        if isinstance(raw_matches, list):
+            if not raw_matches:
+                return [[] for _ in range(n_queries)]
+            first = raw_matches[0]
+            if isinstance(first, list):
+                return [[(int(ti), float(sc)) for ti, sc in row] for row in raw_matches]
+            if isinstance(first, tuple) and len(first) == 3:
+                grouped: List[List[Tuple[int, float]]] = [[] for _ in range(n_queries)]
+                for qi, ti, sc in raw_matches:
+                    if 0 <= int(qi) < n_queries:
+                        grouped[int(qi)].append((int(ti), float(sc)))
+                return grouped
+        return [[] for _ in range(n_queries)]
+
+    @staticmethod
+    def _vectorized_bipartite_tfidf_topk(
+        query_texts: List[str],
+        target_texts: List[str],
+        top_k: int = 5,
+        min_similarity: float = 0.62,
+    ) -> List[List[Tuple[int, float]]]:
+        """Fast vectorized NumPy BLAS TF-IDF cosine similarity between doc chunks and code symbols."""
+        nq, nt = len(query_texts), len(target_texts)
+        if nq == 0 or nt == 0:
+            return [[] for _ in range(nq)]
+        try:
+            import numpy as np
+        except ImportError:
+            return [[] for _ in range(nq)]
+
+        token_re = re.compile(r"[a-zA-Z0-9_]{3,}")
+        all_docs = query_texts + target_texts
+        doc_tokens: List[List[str]] = []
+        df: Dict[str, int] = {}
+        for txt in all_docs:
+            toks = [
+                t.lower()
+                for t in token_re.findall(txt)
+                if t.lower() not in GENERIC_STOP_WORDS
+            ]
+            doc_tokens.append(toks)
+            for t in set(toks):
+                df[t] = df.get(t, 0) + 1
+
+        if not df:
+            return [[] for _ in range(nq)]
+
+        sorted_terms = sorted(df.keys())
+        vocab = {tok: idx for idx, tok in enumerate(sorted_terms)}
+        total_docs = float(len(all_docs))
+        idf = np.array(
+            [np.log((1.0 + total_docs) / (1.0 + df[tok])) + 1.0 for tok in sorted_terms],
+            dtype=np.float32,
+        )
+
+        def _encode(start: int, count: int) -> Any:
+            mat = np.zeros((count, len(vocab)), dtype=np.float32)
+            for row_i in range(count):
+                for tok in doc_tokens[start + row_i]:
+                    mat[row_i, vocab[tok]] += 1.0
+            mat *= idf[None, :]
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms = np.where(norms > 0, norms, 1.0)
+            mat /= norms
+            return mat
+
+        q_mat = _encode(0, nq)
+        t_mat = _encode(nq, nt)
+        sim = q_mat @ t_mat.T
+
+        k_lim = min(top_k, nt)
+        results: List[List[Tuple[int, float]]] = []
+        for i in range(nq):
+            row = sim[i]
+            if k_lim <= 0:
+                results.append([])
+                continue
+            cand_idx = np.argpartition(row, -k_lim)[-k_lim:]
+            cand_idx = cand_idx[np.argsort(row[cand_idx])[::-1]]
+            results.append(
+                [(int(j), float(row[j])) for j in cand_idx if float(row[j]) >= min_similarity]
+            )
+        return results
+
+    def _link_semantic_similarity(
+        self,
+        chunks: List[DocChunk],
+        symbol_index: Dict[str, List[CodeSymbolRef]],
+        add_edge: Any,
+        seen_edges: Set[Tuple[str, str, str]],
+        device: str = "auto",
+        semantic_engine: str = "auto",
+        top_k: int = 5,
+        min_similarity: float = 0.60,
+    ) -> None:
+        """
+        Accelerate INFERRED `conceptually_related_to` linking across large chunk/symbol sets
+        using GraphGPUAccelerator (`embed_texts` + `cosine_similarity_topk`) with fast
+        vectorized NumPy BLAS TF-IDF fallback.
+        """
+        if not chunks or not symbol_index:
+            return
+
+        eff_engine = (semantic_engine or "auto").strip().lower()
+        if eff_engine == "off":
+            return
+
+        unique_symbols: List[CodeSymbolRef] = []
+        seen_sym_ids: Set[str] = set()
+        for sym_list in symbol_index.values():
+            for sym in sym_list:
+                if sym.node_id not in seen_sym_ids:
+                    seen_sym_ids.add(sym.node_id)
+                    unique_symbols.append(sym)
+
+        if not unique_symbols:
+            return
+
+        chunk_texts = [f"{c.heading_breadcrumb} {c.content[:400]}".strip() for c in chunks]
+        sym_texts = [
+            " ".join(
+                p
+                for p in (
+                    s.symbol_name,
+                    s.symbol_type,
+                    s.file_path,
+                    s.signature or "",
+                    s.docstring or "",
+                )
+                if p
+            )
+            for s in unique_symbols
+        ]
+
+        matches: Optional[List[List[Tuple[int, float]]]] = None
+        used_gpu_embeddings = False
+        backend_tag = "numpy-blas-tfidf"
+        if device != "cpu" or eff_engine not in ("auto", "tfidf", "numpy", "blas"):
+            try:
+                from projectbrain.graphify_engine.gpu_accelerator import GraphGPUAccelerator  # type: ignore
+
+                if hasattr(GraphGPUAccelerator, "embed_texts") and hasattr(GraphGPUAccelerator, "cosine_similarity_topk"):
+                    n_chunks = len(chunk_texts)
+                    joint_texts = chunk_texts + sym_texts
+                    try:
+                        joint_res = GraphGPUAccelerator.embed_texts(
+                            joint_texts,
+                            engine=semantic_engine,
+                            device=device,
+                        )
+                    except TypeError:
+                        joint_res = GraphGPUAccelerator.embed_texts(joint_texts)
+
+                    emb_meta: Dict[str, Any] = {}
+                    if isinstance(joint_res, tuple) and len(joint_res) == 2 and isinstance(joint_res[1], dict):
+                        joint_vecs, emb_meta = joint_res
+                    else:
+                        joint_vecs = joint_res
+
+                    if emb_meta.get("disabled"):
+                        return
+
+                    q_vecs = joint_vecs[:n_chunks]
+                    t_vecs = joint_vecs[n_chunks:]
+
+                    try:
+                        raw_sim = GraphGPUAccelerator.cosine_similarity_topk(
+                            q_vecs,
+                            t_vecs,
+                            top_k=min(top_k, len(unique_symbols)),
+                            min_score=min_similarity,
+                            device=device,
+                        )
+                    except TypeError:
+                        try:
+                            raw_sim = GraphGPUAccelerator.cosine_similarity_topk(
+                                q_vecs,
+                                t_vecs,
+                                top_k=min(top_k, len(unique_symbols)),
+                                threshold=min_similarity,
+                            )
+                        except TypeError:
+                            raw_sim = GraphGPUAccelerator.cosine_similarity_topk(
+                                q_vecs,
+                                t_vecs,
+                                top_k=min(top_k, len(unique_symbols)),
+                            )
+
+                    sim_meta: Dict[str, Any] = {}
+                    if isinstance(raw_sim, tuple) and len(raw_sim) == 2 and isinstance(raw_sim[1], dict):
+                        raw_pairs, sim_meta = raw_sim
+                    else:
+                        raw_pairs = raw_sim
+                    matches = self._normalize_bipartite_topk(raw_pairs, len(chunks))
+                    used_gpu_embeddings = True
+                    backend_tag = str(sim_meta.get("backend_used") or emb_meta.get("engine_used") or "gpu-embeddings")
+            except ImportError as exc:
+                logger.debug("GraphGPUAccelerator unavailable (%s); using BLAS TF-IDF linker.", exc)
+            except Exception as exc:
+                logger.debug("GraphGPUAccelerator semantic linking failed (%s); falling back to BLAS.", exc)
+
+        if matches is None:
+            matches = self._vectorized_bipartite_tfidf_topk(
+                chunk_texts,
+                sym_texts,
+                top_k=min(top_k, len(unique_symbols)),
+                min_similarity=max(0.62, min_similarity),
+            )
+            backend_tag = "numpy-blas-tfidf"
+        for c_idx, neighs in enumerate(matches):
+            chunk = chunks[c_idx]
+            for s_idx, raw_score in neighs:
+                if not (0 <= s_idx < len(unique_symbols)):
+                    continue
+                if raw_score < min_similarity:
+                    continue
+                sym = unique_symbols[s_idx]
+                if (chunk.chunk_id, sym.node_id, "documents_symbol") in seen_edges:
+                    continue
+                if (chunk.chunk_id, sym.node_id, "conceptually_related_to") in seen_edges:
+                    continue
+                clamped_score = round(min(0.90, max(0.60, float(raw_score))), 4)
+                add_edge(
+                    CrossLinkEdge(
+                        source_id=chunk.chunk_id,
+                        target_id=sym.node_id,
+                        relation="conceptually_related_to",
+                        confidence="INFERRED",
+                        confidence_score=clamped_score,
+                        evidence=f"Semantic similarity ({backend_tag}, score={clamped_score:.2f}) in {chunk.heading_breadcrumb}",
+                        metadata={
+                            "doc_path": chunk.doc_path,
+                            "symbol_name": sym.symbol_name,
+                            "symbol_type": sym.symbol_type,
+                            "source_file": sym.file_path,
+                            "backend": backend_tag,
+                        },
+                    )
+                )
 
     def link_tests_to_code(
         self,
@@ -1240,9 +1523,23 @@ class UnifiedKBBuilder:
         self,
         workspace_path: Union[str, Path] = ".",
         registry: Optional[Any] = None,
+        device: str = "auto",
+        ocr_device: str = "auto",
+        ocr_engine: str = "auto",
+        semantic_engine: str = "auto",
     ):
         self.workspace_path = Path(workspace_path).resolve()
-        self.linker = CodeDocLinker(workspace_path=self.workspace_path)
+        self.device = device
+        self.ocr_device = ocr_device
+        self.ocr_engine = ocr_engine
+        self.semantic_engine = semantic_engine
+        self.linker = CodeDocLinker(
+            workspace_path=self.workspace_path,
+            device=device,
+            ocr_device=ocr_device,
+            ocr_engine=ocr_engine,
+            semantic_engine=semantic_engine,
+        )
         self.store: Optional[GraphStore] = None
         self.last_drift_items: List[CodeDocDrift] = []
         if registry is not None:
@@ -1299,6 +1596,11 @@ class UnifiedKBBuilder:
         store: Optional[GraphStore] = None,
         db_path: Optional[str] = None,
         registry: Optional[Any] = None,
+        device: str = "auto",
+        ocr_device: str = "auto",
+        ocr_engine: str = "auto",
+        workers: Optional[int] = None,
+        semantic_engine: str = "auto",
     ) -> Dict[str, Any]:
         """
         End-to-end execution:
@@ -1309,6 +1611,14 @@ class UnifiedKBBuilder:
         5. Persist chunks to HSG cognitive memory and create waypoints between connected chunks.
         6. Enrich GraphNode.metadata in GraphStore and persist manifest.
         """
+        eff_device = self.device if (device == "auto" and self.device != "auto") else device
+        eff_ocr_device = self.ocr_device if (ocr_device == "auto" and self.ocr_device != "auto") else ocr_device
+        eff_ocr_engine = self.ocr_engine if (ocr_engine == "auto" and self.ocr_engine != "auto") else ocr_engine
+        eff_semantic_engine = (
+            getattr(self, "semantic_engine", "auto")
+            if (semantic_engine == "auto" and getattr(self, "semantic_engine", "auto") != "auto")
+            else semantic_engine
+        )
         active_registry = registry if registry is not None else self.registry
 
         # 1. Resolve storage backends and database isolation
@@ -1354,7 +1664,10 @@ class UnifiedKBBuilder:
                 break
 
         extractor = GraphifyExtractor(
-            cache_dir=ast_plugin.config.get("cache_dir") if ast_plugin and isinstance(getattr(ast_plugin, "config", None), dict) else None
+            cache_dir=ast_plugin.config.get("cache_dir") if ast_plugin and isinstance(getattr(ast_plugin, "config", None), dict) else None,
+            device=eff_device,
+            workers=workers,
+            semantic_engine=eff_semantic_engine,
         )
         if ast_plugin is not None and (
             getattr(getattr(ast_plugin, "metadata", None), "plugin_id", "") != "etl.graphify_ast"
@@ -1366,7 +1679,7 @@ class UnifiedKBBuilder:
                 source_name=str(self.workspace_path),
                 project_id=project_id,
                 branch=branch,
-                metadata={"include_docs": False},
+                metadata={"include_docs": False, "device": eff_device, "workers": workers},
             )
             graph_delta = GraphDelta(project_id=project_id, branch=branch)
             self._merge_delta_dict(graph_delta, parsed_ast.get("graph_delta"), project_id)
@@ -1378,6 +1691,9 @@ class UnifiedKBBuilder:
                 branch=branch,
                 include_docs=False,
                 use_cache=use_cache,
+                device=eff_device,
+                workers=workers,
+                semantic_engine=eff_semantic_engine,
             )
         else:
             graph_delta = GraphDelta(project_id=project_id, branch=branch)
@@ -1433,6 +1749,10 @@ class UnifiedKBBuilder:
 
         # 4. Ingest and hierarchically chunk all project documentation + domain ETL parsers
         doc_pipeline = DocumentPipeline(extractor=extractor)
+        ocr_options = doc_pipeline._build_ocr_options(
+            ocr_engine=None if eff_ocr_engine == "auto" else eff_ocr_engine,
+            ocr_device=None if eff_ocr_device == "auto" else eff_ocr_device,
+        )
         all_chunks: List[DocChunk] = []
 
         doc_extensions = {".md", ".markdown"} | OFFICE_EXTENSIONS | PAPER_EXTENSIONS
@@ -1481,7 +1801,11 @@ class UnifiedKBBuilder:
                         content = abs_file.read_text(encoding="utf-8", errors="replace")
                     else:
                         raw_bytes = abs_file.read_bytes()
-                        content = await doc_pipeline._extract_content(abs_file, raw_bytes)
+                        content = (
+                            await doc_pipeline._extract_content(abs_file, raw_bytes, ocr_options=ocr_options)
+                            if ocr_options is not None
+                            else await doc_pipeline._extract_content(abs_file, raw_bytes)
+                        )
 
                     chunks = self.linker.chunk_markdown_document(
                         doc_path=rel_file,
@@ -1527,7 +1851,13 @@ class UnifiedKBBuilder:
                     drift_items.append(d_dict if isinstance(d_dict, CodeDocDrift) else CodeDocDrift(**d_dict))
             else:
                 symbol_index = self.linker.build_symbol_index(graph_delta)
-                cross_edges, drift_items = self.linker.link_chunks_to_code(all_chunks, symbol_index, graph_delta)
+                cross_edges, drift_items = self.linker.link_chunks_to_code(
+                    all_chunks,
+                    symbol_index,
+                    graph_delta,
+                    device=eff_device,
+                    semantic_engine=eff_semantic_engine,
+                )
                 test_edges = self.linker.link_tests_to_code(graph_delta, all_chunks)
 
         for lp in linker_plugins:

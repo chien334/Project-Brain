@@ -107,6 +107,11 @@ class KBBuildRequest(BaseModel):
     persist_memory: bool = True
     output_dir: Optional[str] = None
     generate_office_exports: bool = True
+    device: Optional[str] = None
+    workers: Optional[int] = None
+    semantic_engine: Optional[str] = None
+    ocr_engine: Optional[str] = None
+    ocr_device: Optional[str] = None
 
 
 class KBExportRequest(BaseModel):
@@ -127,7 +132,16 @@ async def build_kb(req: KBBuildRequest):
     store = _get_store()
     db_path = _get_db_path()
     try:
-        builder = UnifiedKBBuilder(workspace_path=resolved_workspace)
+        eff_device = req.device or "auto"
+        eff_ocr_device = req.ocr_device or "auto"
+        eff_ocr_engine = req.ocr_engine or "auto"
+        eff_semantic_engine = req.semantic_engine or "auto"
+        builder = UnifiedKBBuilder(
+            workspace_path=resolved_workspace,
+            device=eff_device,
+            ocr_device=eff_ocr_device,
+            ocr_engine=eff_ocr_engine,
+        )
         res = await builder.build_unified_kb(
             project_id=req.project_id,
             branch=req.branch,
@@ -136,6 +150,11 @@ async def build_kb(req: KBBuildRequest):
             generate_office_exports=req.generate_office_exports,
             store=store,
             db_path=db_path,
+            device=eff_device,
+            ocr_device=eff_ocr_device,
+            ocr_engine=eff_ocr_engine,
+            workers=req.workers,
+            semantic_engine=eff_semantic_engine,
         )
         return res
     finally:

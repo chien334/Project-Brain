@@ -21,6 +21,39 @@ from ..ai.aws import AwsAdapter
 from ..ai.synthetic import SyntheticAdapter
 from ..ai.minimax import MiniMaxAdapter
 
+async def _dispatch_gpu_or_local_embed(provider: str, texts: List[str]) -> List[List[float]]:
+    from ..graphify_engine.gpu_accelerator import GraphGPUAccelerator
+
+    embed_device = getattr(env, "embed_device", "auto") or "auto"
+    local_embed_model = getattr(env, "local_embed_model", "BAAI/bge-small-en-v1.5")
+    local_ai_model = getattr(env, "local_ai_model", "") or local_embed_model
+    local_ai_url = getattr(env, "local_ai_base_url", "") or None
+
+    if provider == "local_gpu":
+        engine = "gpu_embed"
+        model = local_embed_model
+        allow_fallback = True
+    elif provider == "sentence_transformers":
+        engine = "sentence_transformers"
+        model = local_embed_model
+        allow_fallback = bool(getattr(env, "graphify_fallback_to_cpu", True))
+    else:
+        engine = provider
+        model = local_ai_model
+        allow_fallback = False
+
+    vecs, _meta = await asyncio.to_thread(
+        GraphGPUAccelerator.embed_texts,
+        texts,
+        engine=engine,
+        device=embed_device,
+        local_ai_url=local_ai_url,
+        model=model,
+        allow_fallback=allow_fallback,
+    )
+    return vecs.astype(float).tolist()
+
+
 async def emb_dispatch(provider: str, t: str, s: str) -> List[float]:
     if provider == "synthetic":
         return await SyntheticAdapter(env.vec_dim or 768).embed(t, model=s)
@@ -34,6 +67,10 @@ async def emb_dispatch(provider: str, t: str, s: str) -> List[float]:
         return await AwsAdapter().embed(t, model=env.aws_embedding_model)
     if provider == "minimax":
         return await MiniMaxAdapter().embed(t, model=env.minimax_embedding_model)
+
+    prov_norm = (provider or "").strip().lower()
+    if prov_norm in ("local_gpu", "sentence_transformers", "vllm", "lmstudio", "llamacpp"):
+        return (await _dispatch_gpu_or_local_embed(prov_norm, [t]))[0]
 
     return await SyntheticAdapter(env.vec_dim or 768).embed(t, model=s)
 

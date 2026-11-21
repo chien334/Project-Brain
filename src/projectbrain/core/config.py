@@ -142,6 +142,26 @@ class EnvConfig:
         self.openai_model = get("ai", "openai_model", "OM_OPENAI_MODEL", None)
 
         self.ollama_url = get("ai", "ollama_url", "OLLAMA_URL", "http://localhost:11434")
+        self.ollama_model = (
+            get("ai", "ollama_model", "OM_OLLAMA_MODEL", None)
+            or os.getenv("OLLAMA_MODEL")
+            or "llama3.2"
+        )
+        self.ollama_vision_model = (
+            get("ai", "ollama_vision_model", "PB_OLLAMA_VISION_MODEL", None)
+            or os.getenv("OLLAMA_VISION_MODEL")
+            or "qwen2.5vl:7b"
+        )
+        self.local_ai_base_url = str(
+            get("ai", "local_ai_base_url", "PB_LOCAL_AI_URL", "") or ""
+        ).strip()
+        self.local_ai_model = str(
+            get("ai", "local_ai_model", "PB_LOCAL_AI_MODEL", "") or ""
+        ).strip()
+        self.local_ai_api_key = (
+            str(get("ai", "local_ai_api_key", "PB_LOCAL_AI_API_KEY", "") or "").strip()
+            or "local-no-key"
+        )
 
         self.emb_kind = get("ai", "embedding_provider", "OM_EMBED_KIND", "synthetic")
         self.gemini_key = get("ai", "gemini_key", "GEMINI_API_KEY",  pb_getenv("OM_GEMINI_KEY"))
@@ -257,6 +277,200 @@ class EnvConfig:
                     if item not in merged_disabled:
                         merged_disabled.append(item)
             self.disabled_plugins = merged_disabled
+
+        # OCR, Hardware & Local AI configuration (projectbrain.toml [ocr] & PB_OCR_* / OCR_* env vars)
+        ocr_sec = self._toml.get("ocr", {})
+        if not isinstance(ocr_sec, dict):
+            ocr_sec = {}
+
+        def _parse_bool(raw: Any, default: bool) -> bool:
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                return default
+            if isinstance(raw, bool):
+                return raw
+            s = str(raw).strip().lower()
+            if s in ("1", "true", "yes", "on"):
+                return True
+            if s in ("0", "false", "no", "off"):
+                return False
+            return default
+
+        def _parse_int(raw: Any, default: int) -> int:
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                return default
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return default
+
+        raw_ocr_engine = (
+            ocr_sec.get("engine")
+            or os.getenv("PB_OCR_ENGINE")
+            or os.getenv("OCR_ENGINE")
+            or "auto"
+        )
+        self.ocr_engine: str = str(raw_ocr_engine).strip().lower() or "auto"
+
+        raw_ocr_device = (
+            ocr_sec.get("device")
+            or os.getenv("PB_OCR_DEVICE")
+            or os.getenv("OCR_DEVICE")
+        )
+        if raw_ocr_device is not None and str(raw_ocr_device).strip():
+            self.ocr_device: str = str(raw_ocr_device).strip().lower()
+        else:
+            legacy_paddle_gpu = os.getenv("OCR_PADDLE_USE_GPU")
+            if legacy_paddle_gpu is not None and legacy_paddle_gpu.strip():
+                self.ocr_device = "gpu" if _parse_bool(legacy_paddle_gpu, False) else "cpu"
+            else:
+                self.ocr_device = "auto"
+
+        self.ocr_gpu_id: int = max(
+            0,
+            _parse_int(
+                ocr_sec.get("gpu_id")
+                if ocr_sec.get("gpu_id") is not None
+                else (os.getenv("PB_OCR_GPU_ID") or os.getenv("OCR_GPU_ID")),
+                0,
+            ),
+        )
+        self.ocr_gpu_mem_mb: int = max(
+            128,
+            _parse_int(
+                ocr_sec.get("gpu_mem_mb")
+                if ocr_sec.get("gpu_mem_mb") is not None
+                else os.getenv("PB_OCR_GPU_MEM_MB"),
+                2000,
+            ),
+        )
+        self.ocr_use_tensorrt: bool = _parse_bool(
+            ocr_sec.get("use_tensorrt")
+            if ocr_sec.get("use_tensorrt") is not None
+            else os.getenv("PB_OCR_USE_TENSORRT"),
+            False,
+        )
+        raw_precision = str(
+            ocr_sec.get("precision")
+            or os.getenv("PB_OCR_PRECISION")
+            or "fp32"
+        ).strip().lower()
+        self.ocr_precision: str = (
+            raw_precision if raw_precision in ("fp32", "fp16", "int8") else "fp32"
+        )
+        default_threads = min(8, os.cpu_count() or 4)
+        self.ocr_cpu_threads: int = max(
+            1,
+            _parse_int(
+                ocr_sec.get("cpu_threads")
+                if ocr_sec.get("cpu_threads") is not None
+                else os.getenv("PB_OCR_CPU_THREADS"),
+                default_threads,
+            ),
+        )
+        raw_mkldnn = (
+            ocr_sec.get("enable_mkldnn")
+            if ocr_sec.get("enable_mkldnn") is not None
+            else os.getenv("PB_OCR_ENABLE_MKLDNN")
+        )
+        if raw_mkldnn is None or (isinstance(raw_mkldnn, str) and not raw_mkldnn.strip()):
+            self.ocr_enable_mkldnn: str = "auto"
+        elif isinstance(raw_mkldnn, bool):
+            self.ocr_enable_mkldnn = "true" if raw_mkldnn else "false"
+        else:
+            mk_str = str(raw_mkldnn).strip().lower()
+            if mk_str in ("1", "true", "yes", "on"):
+                self.ocr_enable_mkldnn = "true"
+            elif mk_str in ("0", "false", "no", "off"):
+                self.ocr_enable_mkldnn = "false"
+            else:
+                self.ocr_enable_mkldnn = "auto"
+
+        self.ocr_batch_size: int = max(
+            1,
+            _parse_int(
+                ocr_sec.get("batch_size")
+                if ocr_sec.get("batch_size") is not None
+                else os.getenv("PB_OCR_BATCH_SIZE"),
+                4,
+            ),
+        )
+        self.ocr_fallback_to_cpu: bool = _parse_bool(
+            ocr_sec.get("fallback_to_cpu")
+            if ocr_sec.get("fallback_to_cpu") is not None
+            else os.getenv("PB_OCR_FALLBACK_TO_CPU"),
+            True,
+        )
+        self.ocr_paddle_lang: str = (
+            str(
+                ocr_sec.get("paddle_lang")
+                or os.getenv("PB_OCR_PADDLE_LANG")
+                or os.getenv("OCR_PADDLE_LANG")
+                or "ch"
+            ).strip()
+            or "ch"
+        )
+
+        # Graphify & Embedding hardware acceleration (projectbrain.toml [graphify]/[ai] & PB_GRAPHIFY_* / PB_EMBED_*)
+        graphify_sec = self._toml.get("graphify", {})
+        if not isinstance(graphify_sec, dict):
+            graphify_sec = {}
+        ai_sec = self._toml.get("ai", {})
+        if not isinstance(ai_sec, dict):
+            ai_sec = {}
+
+        raw_graphify_device = (
+            graphify_sec.get("device")
+            if graphify_sec.get("device") is not None
+            else pb_getenv("PB_GRAPHIFY_DEVICE", "auto")
+        )
+        self.graphify_device: str = (
+            str(raw_graphify_device or "auto").strip().lower() or "auto"
+        )
+
+        self.graphify_workers: int = max(
+            1,
+            _parse_int(
+                graphify_sec.get("workers")
+                if graphify_sec.get("workers") is not None
+                else pb_getenv("PB_GRAPHIFY_WORKERS"),
+                default_threads,
+            ),
+        )
+
+        raw_graphify_semantic_engine = (
+            graphify_sec.get("semantic_engine")
+            if graphify_sec.get("semantic_engine") is not None
+            else pb_getenv("PB_GRAPHIFY_SEMANTIC_ENGINE", "auto")
+        )
+        self.graphify_semantic_engine: str = (
+            str(raw_graphify_semantic_engine or "auto").strip().lower() or "auto"
+        )
+
+        self.graphify_fallback_to_cpu: bool = _parse_bool(
+            graphify_sec.get("fallback_to_cpu")
+            if graphify_sec.get("fallback_to_cpu") is not None
+            else pb_getenv("PB_GRAPHIFY_FALLBACK_TO_CPU"),
+            True,
+        )
+
+        raw_embed_device = (
+            ai_sec.get("embed_device")
+            if ai_sec.get("embed_device") is not None
+            else pb_getenv("PB_EMBED_DEVICE", "auto")
+        )
+        self.embed_device: str = (
+            str(raw_embed_device or "auto").strip().lower() or "auto"
+        )
+
+        raw_local_embed_model = (
+            ai_sec.get("local_embed_model")
+            if ai_sec.get("local_embed_model") is not None
+            else pb_getenv("PB_LOCAL_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+        )
+        self.local_embed_model: str = (
+            str(raw_local_embed_model or "BAAI/bge-small-en-v1.5").strip()
+            or "BAAI/bge-small-en-v1.5"
+        )
         
     @property
     def database_url(self) -> str:

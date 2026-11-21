@@ -1,73 +1,358 @@
 import asyncio
+import contextlib
+import contextvars
 import hashlib
+import inspect
 import io
+import mimetypes
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import zipfile
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 import pypdf
 import mammoth
 import markdownify
 
-async def _ocr_raw(image_bytes: bytes, mime_type: str) -> str:
+_OCR_OPTIONS_CTX: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "_OCR_OPTIONS_CTX", default=None
+)
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
+_LOCAL_AI_PROVIDERS = {"ollama", "vllm", "lmstudio", "llamacpp"}
+_RAPIDOCR_ENGINES: Dict[str, Any] = {}
+
+
+@contextlib.contextmanager
+def ocr_options_context(ocr_options: Optional[Dict[str, Any]]) -> Iterator[None]:
+    """Async-safe context manager to propagate ocr_options through callers like doc_versioning."""
+    if not ocr_options:
+        yield
+        return
+    token = _OCR_OPTIONS_CTX.set(dict(ocr_options))
+    try:
+        yield
+    finally:
+        _OCR_OPTIONS_CTX.reset(token)
+
+
+def _merge_ocr_options(ocr_options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    ctx_opts = _OCR_OPTIONS_CTX.get()
+    if ctx_opts:
+        merged.update({k: v for k, v in ctx_opts.items() if v is not None})
+    if ocr_options:
+        merged.update({k: v for k, v in ocr_options.items() if v is not None})
+    return merged
+
+
+def _rapidocr_blocking(image_bytes: bytes, device: str = "auto") -> str:
+    import numpy as np
+    from PIL import Image
+    from rapidocr_onnxruntime import RapidOCR
+
+    dev = (device or "auto").strip().lower()
+    use_cuda = dev in ("gpu", "cuda") or dev.startswith("cuda:")
+    if dev == "auto":
+        try:
+            import onnxruntime as ort
+
+            use_cuda = "CUDAExecutionProvider" in ort.get_available_providers()
+        except Exception:
+            use_cuda = False
+    key = "cuda" if use_cuda else "cpu"
+    eng = _RAPIDOCR_ENGINES.get(key)
+    if eng is None:
+        try:
+            eng = RapidOCR(det_use_cuda=use_cuda, cls_use_cuda=use_cuda, rec_use_cuda=use_cuda)
+        except TypeError:
+            eng = RapidOCR()
+        _RAPIDOCR_ENGINES[key] = eng
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        arr = np.asarray(im.convert("RGB"))[:, :, ::-1].copy()
+    result, _ = eng(arr)
+    if not result:
+        return ""
+    return "\n".join(str(x[1]).strip() for x in result if x and len(x) >= 2 and x[1]).strip()
+
+
+def _tesseract_blocking(image_bytes: bytes) -> str:
+    import pytesseract
+    from PIL import Image
+
+    lang = os.getenv("OCR_TESSERACT_LANG", "eng").strip() or "eng"
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        return (pytesseract.image_to_string(im, lang=lang) or "").strip()
+
+
+async def _try_runtime_ocr(
+    image_bytes: bytes,
+    engine: str,
+    opts: Dict[str, Any],
+) -> Optional[str]:
+    """Lazy-integrate UnifiedOCREngine / LocalVisionParser when TASK-23A ocr_runtime is available."""
+    if opts.get("cpu_threads") is not None:
+        return None
+    try:
+        from projectbrain.ocr_runtime import LocalVisionParser, UnifiedOCREngine  # type: ignore
+    except Exception:
+        return None
+
+    if engine in _LOCAL_AI_PROVIDERS:
+        try:
+            parser = LocalVisionParser(
+                provider=engine,
+                model=opts.get("local_ai_model"),
+                base_url=opts.get("local_ai_url"),
+            )
+            res = await parser.parse_image(
+                image_bytes=image_bytes,
+                model=opts.get("local_ai_model"),
+            )
+            if isinstance(res, str) and res.strip():
+                return res.strip()
+        except Exception:
+            return None
+
+    if engine in ("paddle", "rapidocr", "tesseract", "hybrid_local"):
+        try:
+            unified = UnifiedOCREngine()
+            res = await unified.extract_image(
+                image_bytes=image_bytes,
+                engine=engine,
+                device=opts.get("device"),
+                lang=opts.get("lang"),
+                local_ai_model=opts.get("local_ai_model"),
+                local_ai_url=opts.get("local_ai_url"),
+            )
+            if isinstance(res, dict):
+                txt = str(res.get("text") or res.get("markdown") or "").strip()
+                if txt:
+                    return txt
+        except Exception:
+            return None
+
+    return None
+
+
+async def _run_paddle_with_opts(
+    image_bytes: bytes,
+    mime_type: str,
+    opts: Dict[str, Any],
+) -> str:
+    from extensions_mcp.image_to_markdown.paddle_client import (
+        extract_text_local,
+        is_available,
+    )
+
+    if not is_available():
+        return ""
+    lang = opts.get("lang")
+    device = opts.get("device")
+    cpu_threads = opts.get("cpu_threads")
+    if lang is None and device is None and cpu_threads is None:
+        return await extract_text_local(image_bytes, mime_type)
+    return await extract_text_local(
+        image_bytes,
+        mime_type,
+        lang=lang,
+        device=device,
+        cpu_threads=cpu_threads,
+    )
+
+
+async def _ocr_raw(
+    image_bytes: bytes,
+    mime_type: str,
+    ocr_options: Optional[Dict[str, Any]] = None,
+) -> str:
     """Run OCR on raw image bytes, returning plain transcribed text ("" on failure).
 
-    Engine is chosen by the OCR_ENGINE env var (auto|paddle|vision|off):
-      - auto  : try local PaddleOCR first, fall back to cloud vision (default)
-      - paddle: local PaddleOCR only (offline, no API key)
-      - vision: cloud vision only (needs LLM_API_KEY)
-      - off   : skip OCR entirely
+    Engine is chosen by ocr_options["engine"] or OCR_ENGINE env var:
+      - auto / paddle / rapidocr / tesseract / ollama / vllm / lmstudio / llamacpp / hybrid_local / vision / off
     """
-    engine = (os.getenv("OCR_ENGINE", "auto").strip().lower() or "auto")
+    opts = _merge_ocr_options(ocr_options)
+    engine = (str(opts.get("engine") or os.getenv("OCR_ENGINE", "auto")).strip().lower() or "auto")
     if engine == "off":
         return ""
 
-    # 1) Local PaddleOCR (CPU, offline, free)
-    if engine in ("auto", "paddle"):
+    device = str(opts.get("device") or os.getenv("PB_OCR_DEVICE") or "auto").strip().lower()
+    local_ai_model = opts.get("local_ai_model")
+    local_ai_url = opts.get("local_ai_url")
+
+    # Optional UnifiedOCREngine / LocalVisionParser fast-path when explicit engine is selected
+    if engine in ("paddle", "rapidocr", "tesseract") or engine in _LOCAL_AI_PROVIDERS:
+        runtime_txt = await _try_runtime_ocr(image_bytes, engine, opts)
+        if runtime_txt:
+            return runtime_txt
+
+    # 1) RapidOCR explicit
+    if engine == "rapidocr":
         try:
-            from extensions_mcp.image_to_markdown.paddle_client import (
-                extract_text_local,
-                is_available,
-            )
-            if is_available():
-                text = await extract_text_local(image_bytes, mime_type)
-                if text and text.strip():
-                    return text
+            txt = await asyncio.to_thread(_rapidocr_blocking, image_bytes, device)
+            if txt and txt.strip():
+                return txt
         except Exception:
             pass
+        return ""
+
+    # 2) Tesseract explicit
+    if engine == "tesseract":
+        try:
+            txt = await asyncio.to_thread(_tesseract_blocking, image_bytes)
+            if txt and txt.strip():
+                return txt
+        except Exception:
+            pass
+        return ""
+
+    # 3) Local AI explicit (ollama / vllm / lmstudio / llamacpp)
+    if engine in _LOCAL_AI_PROVIDERS:
+        try:
+            from extensions_mcp.image_to_markdown.vision_client import (
+                DEFAULT_PROMPT,
+                extract_text_from_image,
+            )
+
+            eff_model = local_ai_model or os.getenv("LOCAL_AI_MODEL") or (
+                "qwen2.5vl" if engine == "ollama" else "default"
+            )
+            text = await extract_text_from_image(
+                image_bytes,
+                mime_type,
+                DEFAULT_PROMPT,
+                eff_model,
+                provider=engine,
+                base_url=local_ai_url,
+            )
+            if text and text.strip():
+                return text
+        except Exception:
+            pass
+        return ""
+
+    # 4) Local PaddleOCR (for auto, paddle, hybrid_local)
+    paddle_text = ""
+    if engine in ("auto", "paddle", "hybrid_local"):
+        try:
+            paddle_text = await _run_paddle_with_opts(image_bytes, mime_type, opts)
+            if paddle_text and paddle_text.strip() and engine != "hybrid_local":
+                return paddle_text
+        except Exception:
+            paddle_text = ""
         if engine == "paddle":
             return ""
 
-    # 2) Cloud vision fallback (Gemini / OpenAI-compatible)
+    # 5) Hybrid Local: enhance/recover using Local AI when configured
+    if engine == "hybrid_local":
+        try:
+            from extensions_mcp.image_to_markdown.config import CONFIG
+            from extensions_mcp.image_to_markdown.vision_client import (
+                DEFAULT_PROMPT,
+                extract_text_from_image,
+            )
+
+            target_provider = (
+                CONFIG.provider if CONFIG.provider in _LOCAL_AI_PROVIDERS else "ollama"
+            )
+            eff_model = local_ai_model or os.getenv("LOCAL_AI_MODEL") or (
+                CONFIG.model if CONFIG.provider == target_provider else (
+                    "qwen2.5vl" if target_provider == "ollama" else "default"
+                )
+            )
+            prompt = DEFAULT_PROMPT
+            if paddle_text and paddle_text.strip():
+                prompt = (
+                    f"{DEFAULT_PROMPT}\n\n"
+                    f"Reference raw OCR draft (fix formatting/tables):\n{paddle_text.strip()}"
+                )
+            ai_txt = await extract_text_from_image(
+                image_bytes,
+                mime_type,
+                prompt,
+                eff_model,
+                provider=target_provider,
+                base_url=local_ai_url,
+            )
+            if ai_txt and ai_txt.strip():
+                return ai_txt
+        except Exception:
+            pass
+        return paddle_text or ""
+
+    # 6) Cloud or configured Vision fallback (Gemini / OpenAI-compatible / Local AI)
     if engine in ("auto", "vision"):
         try:
+            from extensions_mcp.image_to_markdown.config import CONFIG, is_local_endpoint
             from extensions_mcp.image_to_markdown.vision_client import (
-                extract_text_from_image,
                 DEFAULT_PROMPT,
+                extract_text_from_image,
             )
-            from extensions_mcp.image_to_markdown.config import CONFIG
-            if getattr(CONFIG, "api_key", None):
-                text = await extract_text_from_image(
-                    image_bytes, mime_type, DEFAULT_PROMPT, CONFIG.model
-                )
+
+            eff_model = local_ai_model or CONFIG.model
+            has_key = bool(getattr(CONFIG, "api_key", None))
+            is_local = is_local_endpoint(
+                getattr(CONFIG, "provider", ""),
+                local_ai_url or getattr(CONFIG, "base_url", None),
+            )
+            if has_key or is_local or local_ai_url:
+                if local_ai_url or local_ai_model:
+                    text = await extract_text_from_image(
+                        image_bytes,
+                        mime_type,
+                        DEFAULT_PROMPT,
+                        eff_model,
+                        base_url=local_ai_url,
+                    )
+                else:
+                    text = await extract_text_from_image(
+                        image_bytes,
+                        mime_type,
+                        DEFAULT_PROMPT,
+                        eff_model,
+                    )
                 if text and text.strip():
                     return text
         except Exception:
             pass
+
+    # 7) Final auto fallback: RapidOCR -> Tesseract if installed
+    if engine == "auto":
+        for fn in (
+            lambda: _rapidocr_blocking(image_bytes, device),
+            lambda: _tesseract_blocking(image_bytes),
+        ):
+            try:
+                txt = await asyncio.to_thread(fn)
+                if txt and txt.strip():
+                    return txt
+            except Exception:
+                continue
+
     return ""
 
 
-async def call_ocr_if_available(image_bytes: bytes, mime_type: str) -> str:
+async def call_ocr_if_available(
+    image_bytes: bytes,
+    mime_type: str,
+    ocr_options: Optional[Dict[str, Any]] = None,
+) -> str:
     """Transcribe an embedded image to a Markdown snippet, or a placeholder.
 
-    Tries local PaddleOCR first and cloud vision second (see _ocr_raw). The result
-    is wrapped in OCR markers so downstream parsing can identify image-derived text.
+    Tries configured/local OCR first and vision fallback second (see _ocr_raw).
     """
-    text = await _ocr_raw(image_bytes, mime_type)
+    text = (
+        await _ocr_raw(image_bytes, mime_type, ocr_options=ocr_options)
+        if ocr_options is not None
+        else await _ocr_raw(image_bytes, mime_type)
+    )
     if text and text.strip():
         return f"\n\n<!-- Start Embedded Image OCR -->\n{text.strip()}\n<!-- End Embedded Image OCR -->\n\n"
     return "![Image]"
 
 
-async def _ocr_full_pdf_page(file_bytes: bytes, page_index: int) -> str:
+async def _ocr_full_pdf_page(
+    file_bytes: bytes,
+    page_index: int,
+    ocr_options: Optional[Dict[str, Any]] = None,
+) -> str:
     """Render a full PDF page to an image and OCR it (for scanned/image-only pages)."""
     try:
         from .pdf_render import render_page_png, is_available as render_ok
@@ -80,7 +365,11 @@ async def _ocr_full_pdf_page(file_bytes: bytes, page_index: int) -> str:
         png = await asyncio.to_thread(render_page_png, file_bytes, page_index, dpi)
         if not png:
             return ""
-        return await _ocr_raw(png, "image/png")
+        return (
+            await _ocr_raw(png, "image/png", ocr_options=ocr_options)
+            if ocr_options is not None
+            else await _ocr_raw(png, "image/png")
+        )
     except Exception:
         return ""
 
@@ -193,61 +482,98 @@ def _extract_pypdf_pages_sync(file_bytes: bytes) -> List[Dict[str, Any]]:
     return pages_data
 
 
-async def pdf_to_markdown(file_bytes: bytes) -> str:
+async def pdf_to_markdown(
+    file_bytes: bytes,
+    ocr_options: Optional[Dict[str, Any]] = None,
+) -> str:
+    opts = _merge_ocr_options(ocr_options)
     try:
-        import pdfplumber  # noqa: F401
-        pages_data = await asyncio.to_thread(_extract_pdfplumber_pages_sync, file_bytes)
-        text_parts: List[str] = []
-        for pdata in pages_data:
-            text_parts.extend(pdata["base_parts"])
-            full_page_ocred = False
+        batch_size = max(1, int(opts.get("batch_size") or 4))
+    except (TypeError, ValueError):
+        batch_size = 4
 
-            if not pdata["page_has_text"]:
-                page_ocr = await _ocr_full_pdf_page(file_bytes, pdata["page_index"])
-                if page_ocr and page_ocr.strip():
-                    text_parts.append(
-                        "\n<!-- Start Page OCR -->\n"
-                        + page_ocr.strip()
-                        + "\n<!-- End Page OCR -->\n"
-                    )
-                    full_page_ocred = True
-
-            if not full_page_ocred and pdata["has_images"]:
-                cropped_images = pdata["cropped_images"]
-                if cropped_images is None:
-                    cropped_images = await asyncio.to_thread(
-                        _crop_pdf_page_images_sync, file_bytes, pdata["page_index"]
-                    )
-                for img_bytes in cropped_images:
-                    if img_bytes is None:
-                        text_parts.append("![Image]\n")
-                    else:
-                        ocr_result = await call_ocr_if_available(img_bytes, "image/png")
-                        text_parts.append(ocr_result + "\n")
-
-        return "\n".join(text_parts)
-    except ImportError:
+    with ocr_options_context(ocr_options):
         try:
-            pypdf_pages = await asyncio.to_thread(_extract_pypdf_pages_sync, file_bytes)
-            text_parts = []
-            for pdata in pypdf_pages:
-                page_text: List[str] = []
-                if pdata["text"]:
-                    page_text.append(pdata["text"])
-                for img_item in pdata["images"]:
-                    if img_item is None:
-                        page_text.append("![Image]\n")
-                    else:
-                        img_bytes, mime_type = img_item
-                        ocr_result = await call_ocr_if_available(img_bytes, mime_type)
-                        page_text.append(ocr_result)
-                if page_text:
-                    text_parts.append(f"## Page {pdata['page_num']}\n\n" + "\n".join(page_text))
-            return "\n\n".join(text_parts)
+            import pdfplumber  # noqa: F401
+            pages_data = await asyncio.to_thread(_extract_pdfplumber_pages_sync, file_bytes)
+
+            async def _process_pdf_page(pdata: Dict[str, Any]) -> List[str]:
+                page_parts: List[str] = list(pdata["base_parts"])
+                full_page_ocred = False
+
+                if not pdata["page_has_text"]:
+                    page_ocr = await _ocr_full_pdf_page(file_bytes, pdata["page_index"])
+                    if page_ocr and page_ocr.strip():
+                        page_parts.append(
+                            "\n<!-- Start Page OCR -->\n"
+                            + page_ocr.strip()
+                            + "\n<!-- End Page OCR -->\n"
+                        )
+                        full_page_ocred = True
+
+                if not full_page_ocred and pdata["has_images"]:
+                    cropped_images = pdata["cropped_images"]
+                    if cropped_images is None:
+                        cropped_images = await asyncio.to_thread(
+                            _crop_pdf_page_images_sync, file_bytes, pdata["page_index"]
+                        )
+                    for img_bytes in cropped_images:
+                        if img_bytes is None:
+                            page_parts.append("![Image]\n")
+                        else:
+                            ocr_result = (
+                                await call_ocr_if_available(
+                                    img_bytes, "image/png", ocr_options=ocr_options
+                                )
+                                if ocr_options is not None
+                                else await call_ocr_if_available(img_bytes, "image/png")
+                            )
+                            page_parts.append(ocr_result + "\n")
+                return page_parts
+
+            sem = asyncio.Semaphore(batch_size)
+
+            async def _bounded_page(pdata: Dict[str, Any]) -> List[str]:
+                async with sem:
+                    return await _process_pdf_page(pdata)
+
+            if batch_size > 1 and len(pages_data) > 1:
+                per_page_parts = await asyncio.gather(*(_bounded_page(pd) for pd in pages_data))
+            else:
+                per_page_parts = [await _process_pdf_page(pd) for pd in pages_data]
+
+            text_parts: List[str] = []
+            for parts in per_page_parts:
+                text_parts.extend(parts)
+            return "\n".join(text_parts)
+        except ImportError:
+            try:
+                pypdf_pages = await asyncio.to_thread(_extract_pypdf_pages_sync, file_bytes)
+                text_parts = []
+                for pdata in pypdf_pages:
+                    page_text: List[str] = []
+                    if pdata["text"]:
+                        page_text.append(pdata["text"])
+                    for img_item in pdata["images"]:
+                        if img_item is None:
+                            page_text.append("![Image]\n")
+                        else:
+                            img_bytes, mime_type = img_item
+                            ocr_result = (
+                                await call_ocr_if_available(
+                                    img_bytes, mime_type, ocr_options=ocr_options
+                                )
+                                if ocr_options is not None
+                                else await call_ocr_if_available(img_bytes, mime_type)
+                            )
+                            page_text.append(ocr_result)
+                    if page_text:
+                        text_parts.append(f"## Page {pdata['page_num']}\n\n" + "\n".join(page_text))
+                return "\n\n".join(text_parts)
+            except Exception as e:
+                raise ValueError(f"Failed to parse PDF: {str(e)}")
         except Exception as e:
             raise ValueError(f"Failed to parse PDF: {str(e)}")
-    except Exception as e:
-        raise ValueError(f"Failed to parse PDF: {str(e)}")
 
 
 def _docx_to_markdown_sync(file_bytes: bytes) -> str:
@@ -257,9 +583,64 @@ def _docx_to_markdown_sync(file_bytes: bytes) -> str:
     return markdownify.markdownify(html)
 
 
-async def docx_to_markdown(file_bytes: bytes) -> str:
+def _extract_docx_media_sync(file_bytes: bytes) -> List[Tuple[str, bytes, str]]:
+    """Extract embedded images (word/media/*) from a DOCX zip archive cleanly."""
+    media: List[Tuple[str, bytes, str]] = []
     try:
-        return await asyncio.to_thread(_docx_to_markdown_sync, file_bytes)
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            names = sorted(
+                name for name in zf.namelist()
+                if name.lower().startswith("word/media/")
+                and os.path.splitext(name.lower())[1] in _IMAGE_EXTS
+            )
+            for name in names:
+                try:
+                    data = zf.read(name)
+                    if not data:
+                        continue
+                    mime_type, _ = mimetypes.guess_type(name)
+                    media.append((os.path.basename(name), data, mime_type or "image/png"))
+                except Exception:
+                    continue
+    except (zipfile.BadZipFile, Exception):
+        return []
+    return media
+
+
+async def docx_to_markdown(
+    file_bytes: bytes,
+    ocr_options: Optional[Dict[str, Any]] = None,
+) -> str:
+    opts = _merge_ocr_options(ocr_options)
+    eff_engine = (str(opts.get("engine") or os.getenv("OCR_ENGINE", "auto")).strip().lower() or "auto")
+    try:
+        with ocr_options_context(ocr_options):
+            base_md = await asyncio.to_thread(_docx_to_markdown_sync, file_bytes)
+            if eff_engine == "off":
+                return base_md
+
+            media_items = await asyncio.to_thread(_extract_docx_media_sync, file_bytes)
+            if not media_items:
+                return base_md
+
+            ocr_snippets: List[str] = []
+            for media_name, img_bytes, mime_type in media_items:
+                try:
+                    ocr_res = (
+                        await call_ocr_if_available(
+                            img_bytes, mime_type, ocr_options=ocr_options
+                        )
+                        if ocr_options is not None
+                        else await call_ocr_if_available(img_bytes, mime_type)
+                    )
+                    if ocr_res and ocr_res.strip() and ocr_res.strip() != "![Image]":
+                        ocr_snippets.append(f"### Embedded Media: {media_name}\n{ocr_res.strip()}")
+                except Exception:
+                    continue
+
+            if not ocr_snippets:
+                return base_md
+            return (base_md.rstrip() + "\n\n" + "\n\n".join(ocr_snippets)).strip()
     except Exception as e:
         raise ValueError(f"Failed to parse DOCX: {str(e)}")
 
@@ -349,22 +730,32 @@ def _extract_pptx_items_sync(file_bytes: bytes) -> List[Tuple[str, Any]]:
     return items
 
 
-async def pptx_to_markdown(file_bytes: bytes) -> str:
+async def pptx_to_markdown(
+    file_bytes: bytes,
+    ocr_options: Optional[Dict[str, Any]] = None,
+) -> str:
     try:
         import pptx  # noqa: F401
     except ImportError:
         return "PowerPoint parsing requires 'python-pptx'. Run: pip install python-pptx"
     try:
-        items = await asyncio.to_thread(_extract_pptx_items_sync, file_bytes)
-        markdown_text: List[str] = []
-        for kind, payload in items:
-            if kind == "text":
-                markdown_text.append(payload)
-            elif kind == "image":
-                img_bytes, mime_type = payload
-                ocr_result = await call_ocr_if_available(img_bytes, mime_type)
-                markdown_text.append(ocr_result)
-        return "\n".join(markdown_text).strip()
+        with ocr_options_context(ocr_options):
+            items = await asyncio.to_thread(_extract_pptx_items_sync, file_bytes)
+            markdown_text: List[str] = []
+            for kind, payload in items:
+                if kind == "text":
+                    markdown_text.append(payload)
+                elif kind == "image":
+                    img_bytes, mime_type = payload
+                    ocr_result = (
+                        await call_ocr_if_available(
+                            img_bytes, mime_type, ocr_options=ocr_options
+                        )
+                        if ocr_options is not None
+                        else await call_ocr_if_available(img_bytes, mime_type)
+                    )
+                    markdown_text.append(ocr_result)
+            return "\n".join(markdown_text).strip()
     except Exception as e:
         raise ValueError(f"Failed to parse PPTX: {str(e)}")
 
@@ -487,62 +878,79 @@ def _extract_pypdf_single_page_sync(file_bytes: bytes, page_index: int) -> Optio
     }
 
 
-async def parse_pdf_page_markdown(file_bytes: bytes, page_index: int) -> str:
+async def parse_pdf_page_markdown(
+    file_bytes: bytes,
+    page_index: int,
+    ocr_options: Optional[Dict[str, Any]] = None,
+) -> str:
     """Extract Markdown for a single PDF page without touching/rendering/OCR-ing other pages."""
-    try:
-        import pdfplumber  # noqa: F401
-        pdata = await asyncio.to_thread(_extract_pdfplumber_single_page_sync, file_bytes, page_index)
-        if pdata is None:
-            return ""
-        text_parts: List[str] = list(pdata["base_parts"])
-        full_page_ocred = False
-
-        if not pdata["page_has_text"]:
-            page_ocr = await _ocr_full_pdf_page(file_bytes, pdata["page_index"])
-            if page_ocr and page_ocr.strip():
-                text_parts.append(
-                    "\n<!-- Start Page OCR -->\n"
-                    + page_ocr.strip()
-                    + "\n<!-- End Page OCR -->\n"
-                )
-                full_page_ocred = True
-
-        if not full_page_ocred and pdata["has_images"]:
-            cropped_images = pdata["cropped_images"]
-            if cropped_images is None:
-                cropped_images = await asyncio.to_thread(
-                    _crop_pdf_page_images_sync, file_bytes, pdata["page_index"]
-                )
-            for img_bytes in cropped_images:
-                if img_bytes is None:
-                    text_parts.append("![Image]\n")
-                else:
-                    ocr_result = await call_ocr_if_available(img_bytes, "image/png")
-                    text_parts.append(ocr_result + "\n")
-
-        return "\n".join(text_parts).strip()
-    except ImportError:
+    with ocr_options_context(ocr_options):
         try:
-            pdata = await asyncio.to_thread(_extract_pypdf_single_page_sync, file_bytes, page_index)
+            import pdfplumber  # noqa: F401
+            pdata = await asyncio.to_thread(_extract_pdfplumber_single_page_sync, file_bytes, page_index)
             if pdata is None:
                 return ""
-            page_text: List[str] = []
-            if pdata["text"]:
-                page_text.append(pdata["text"])
-            for img_item in pdata["images"]:
-                if img_item is None:
-                    page_text.append("![Image]\n")
-                else:
-                    img_bytes, mime_type = img_item
-                    ocr_result = await call_ocr_if_available(img_bytes, mime_type)
-                    page_text.append(ocr_result)
-            if page_text:
-                return f"## Page {pdata['page_num']}\n\n" + "\n".join(page_text)
-            return ""
+            text_parts: List[str] = list(pdata["base_parts"])
+            full_page_ocred = False
+
+            if not pdata["page_has_text"]:
+                page_ocr = await _ocr_full_pdf_page(file_bytes, pdata["page_index"])
+                if page_ocr and page_ocr.strip():
+                    text_parts.append(
+                        "\n<!-- Start Page OCR -->\n"
+                        + page_ocr.strip()
+                        + "\n<!-- End Page OCR -->\n"
+                    )
+                    full_page_ocred = True
+
+            if not full_page_ocred and pdata["has_images"]:
+                cropped_images = pdata["cropped_images"]
+                if cropped_images is None:
+                    cropped_images = await asyncio.to_thread(
+                        _crop_pdf_page_images_sync, file_bytes, pdata["page_index"]
+                    )
+                for img_bytes in cropped_images:
+                    if img_bytes is None:
+                        text_parts.append("![Image]\n")
+                    else:
+                        ocr_result = (
+                            await call_ocr_if_available(
+                                img_bytes, "image/png", ocr_options=ocr_options
+                            )
+                            if ocr_options is not None
+                            else await call_ocr_if_available(img_bytes, "image/png")
+                        )
+                        text_parts.append(ocr_result + "\n")
+
+            return "\n".join(text_parts).strip()
+        except ImportError:
+            try:
+                pdata = await asyncio.to_thread(_extract_pypdf_single_page_sync, file_bytes, page_index)
+                if pdata is None:
+                    return ""
+                page_text: List[str] = []
+                if pdata["text"]:
+                    page_text.append(pdata["text"])
+                for img_item in pdata["images"]:
+                    if img_item is None:
+                        page_text.append("![Image]\n")
+                    else:
+                        img_bytes, mime_type = img_item
+                        ocr_result = (
+                            await call_ocr_if_available(
+                                img_bytes, mime_type, ocr_options=ocr_options
+                            )
+                            if ocr_options is not None
+                            else await call_ocr_if_available(img_bytes, mime_type)
+                        )
+                        page_text.append(ocr_result)
+                if page_text:
+                    return f"## Page {pdata['page_num']}\n\n" + "\n".join(page_text)
+                return ""
+            except Exception as e:
+                raise ValueError(f"Failed to parse PDF page {page_index}: {str(e)}")
         except Exception as e:
             raise ValueError(f"Failed to parse PDF page {page_index}: {str(e)}")
-    except Exception as e:
-        raise ValueError(f"Failed to parse PDF page {page_index}: {str(e)}")
 
 
 def inspect_pptx_slides_pre_ocr(file_bytes: bytes) -> List[Dict[str, Any]]:
@@ -604,17 +1012,27 @@ def inspect_pptx_slides_pre_ocr(file_bytes: bytes) -> List[Dict[str, Any]]:
     return slides
 
 
-async def parse_pptx_slide_markdown(slide_info: Dict[str, Any]) -> str:
+async def parse_pptx_slide_markdown(
+    slide_info: Dict[str, Any],
+    ocr_options: Optional[Dict[str, Any]] = None,
+) -> str:
     """Run OCR only on a single slide's images and return Markdown."""
-    markdown_text: List[str] = []
-    for kind, payload in slide_info.get("items", []):
-        if kind == "text":
-            markdown_text.append(payload)
-        elif kind == "image":
-            img_bytes, mime_type = payload
-            ocr_result = await call_ocr_if_available(img_bytes, mime_type)
-            markdown_text.append(ocr_result)
-    return "\n".join(markdown_text).strip()
+    with ocr_options_context(ocr_options):
+        markdown_text: List[str] = []
+        for kind, payload in slide_info.get("items", []):
+            if kind == "text":
+                markdown_text.append(payload)
+            elif kind == "image":
+                img_bytes, mime_type = payload
+                ocr_result = (
+                    await call_ocr_if_available(
+                        img_bytes, mime_type, ocr_options=ocr_options
+                    )
+                    if ocr_options is not None
+                    else await call_ocr_if_available(img_bytes, mime_type)
+                )
+                markdown_text.append(ocr_result)
+        return "\n".join(markdown_text).strip()
 
 
 def format_excel_sheet_markdown(sheet_name: str, raw_rows: List[Tuple[Any, ...]]) -> str:
@@ -675,16 +1093,32 @@ def inspect_excel_sheets_raw(file_bytes: bytes) -> List[Dict[str, Any]]:
     return sheets
 
 
-async def parse_document(filename: str, file_bytes: bytes) -> str:
+async def parse_document(
+    filename: str,
+    file_bytes: bytes,
+    ocr_options: Optional[Dict[str, Any]] = None,
+) -> str:
     _, ext = os.path.splitext(filename.lower())
     if ext == ".pdf":
-        return await pdf_to_markdown(file_bytes)
+        return (
+            await pdf_to_markdown(file_bytes, ocr_options=ocr_options)
+            if ocr_options is not None
+            else await pdf_to_markdown(file_bytes)
+        )
     elif ext == ".docx":
-        return await docx_to_markdown(file_bytes)
+        return (
+            await docx_to_markdown(file_bytes, ocr_options=ocr_options)
+            if ocr_options is not None
+            else await docx_to_markdown(file_bytes)
+        )
     elif ext in [".xlsx", ".xls"]:
         return await excel_to_markdown(file_bytes)
     elif ext == ".pptx":
-        return await pptx_to_markdown(file_bytes)
+        return (
+            await pptx_to_markdown(file_bytes, ocr_options=ocr_options)
+            if ocr_options is not None
+            else await pptx_to_markdown(file_bytes)
+        )
     elif ext in [".txt", ".md", ".json", ".yml", ".yaml", ".ini", ".conf"]:
         return file_bytes.decode("utf-8", errors="ignore")
     else:

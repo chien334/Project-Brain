@@ -187,6 +187,10 @@ async def upload_document(
     doc_version: Optional[str] = Form(None),
     base_version: Optional[str] = Form(None),
     base_branch: Optional[str] = Form(None),
+    ocr_engine: Optional[str] = Form(None),
+    ocr_device: Optional[str] = Form(None),
+    local_ai_model: Optional[str] = Form(None),
+    local_ai_url: Optional[str] = Form(None),
     request: Request = None,
 ):
     from pathlib import Path
@@ -213,20 +217,52 @@ async def upload_document(
 
         # 1. Versioned pre-OCR delta ingestion (avoids eager full-doc OCR on unchanged units)
         from ...graphify_engine.doc_versioning import ingest_document_versioned
+        from ...utils.doc_parser import ocr_options_context
+
+        eff_ocr_engine = (
+            ocr_engine
+            if ocr_engine is not None
+            else (request.query_params.get("ocr_engine") if request else None)
+        )
+        eff_ocr_device = (
+            ocr_device
+            if ocr_device is not None
+            else (request.query_params.get("ocr_device") if request else None)
+        )
+        eff_local_ai_model = (
+            local_ai_model
+            if local_ai_model is not None
+            else (request.query_params.get("local_ai_model") if request else None)
+        )
+        eff_local_ai_url = (
+            local_ai_url
+            if local_ai_url is not None
+            else (request.query_params.get("local_ai_url") if request else None)
+        )
+        ocr_options: Dict[str, Any] = {}
+        if eff_ocr_engine is not None:
+            ocr_options["engine"] = eff_ocr_engine
+        if eff_ocr_device is not None:
+            ocr_options["device"] = eff_ocr_device
+        if eff_local_ai_model is not None:
+            ocr_options["local_ai_model"] = eff_local_ai_model
+        if eff_local_ai_url is not None:
+            ocr_options["local_ai_url"] = eff_local_ai_url
 
         try:
-            ver_res = await ingest_document_versioned(
-                filename=filename,
-                file_bytes=file_bytes,
-                project_id=project_id,
-                branch=branch,
-                author=author,
-                tags=tag_list,
-                doc_key=doc_key,
-                doc_version=doc_version,
-                base_version=base_version,
-                base_branch=base_branch,
-            )
+            with ocr_options_context(ocr_options or None):
+                ver_res = await ingest_document_versioned(
+                    filename=filename,
+                    file_bytes=file_bytes,
+                    project_id=project_id,
+                    branch=branch,
+                    author=author,
+                    tags=tag_list,
+                    doc_key=doc_key,
+                    doc_version=doc_version,
+                    base_version=base_version,
+                    base_branch=base_branch,
+                )
         except ValueError as ve:
             raise HTTPException(400, str(ve))
 
