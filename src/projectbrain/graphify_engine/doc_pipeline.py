@@ -155,7 +155,33 @@ class DocumentPipeline:
     def __init__(self, extractor: Optional[GraphifyExtractor] = None):
         self.extractor = extractor or GraphifyExtractor()
 
-    async def _extract_content(self, path: Path, raw_bytes: bytes) -> str:
+    @staticmethod
+    def _build_ocr_options(
+        ocr_options: Optional[Dict[str, Any]] = None,
+        ocr_engine: Optional[str] = None,
+        ocr_device: Optional[str] = None,
+        local_ai_model: Optional[str] = None,
+        local_ai_url: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        merged: Dict[str, Any] = {}
+        if ocr_options:
+            merged.update({k: v for k, v in ocr_options.items() if v is not None})
+        if ocr_engine is not None:
+            merged["engine"] = ocr_engine
+        if ocr_device is not None:
+            merged["device"] = ocr_device
+        if local_ai_model is not None:
+            merged["local_ai_model"] = local_ai_model
+        if local_ai_url is not None:
+            merged["local_ai_url"] = local_ai_url
+        return merged or None
+
+    async def _extract_content(
+        self,
+        path: Path,
+        raw_bytes: bytes,
+        ocr_options: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Extract Markdown text and tables from document bytes using doc_parser or internal handlers."""
         ext = path.suffix.lower()
 
@@ -174,7 +200,15 @@ class DocumentPipeline:
             try:
                 from projectbrain.utils.doc_parser import call_ocr_if_available
 
-                ocr_res = await call_ocr_if_available(raw_bytes, mime_type)
+                if ocr_options is not None:
+                    try:
+                        ocr_res = await call_ocr_if_available(
+                            raw_bytes, mime_type, ocr_options=ocr_options
+                        )
+                    except TypeError:
+                        ocr_res = await call_ocr_if_available(raw_bytes, mime_type)
+                else:
+                    ocr_res = await call_ocr_if_available(raw_bytes, mime_type)
                 if ocr_res and ocr_res.strip() and ocr_res.strip() != "![Image]":
                     return f"# Image: {path.name}\n\n{ocr_res.strip()}\n"
             except Exception as e:
@@ -185,6 +219,11 @@ class DocumentPipeline:
         try:
             from projectbrain.utils.doc_parser import parse_document
 
+            if ocr_options is not None:
+                try:
+                    return await parse_document(path.name, raw_bytes, ocr_options=ocr_options)
+                except TypeError:
+                    return await parse_document(path.name, raw_bytes)
             return await parse_document(path.name, raw_bytes)
         except Exception as e:
             logger.debug("doc_parser.parse_document failed for %s: %s. Using text fallback.", path.name, e)
@@ -202,6 +241,11 @@ class DocumentPipeline:
         doc_version: Optional[str] = None,
         base_version: Optional[str] = None,
         base_branch: Optional[str] = None,
+        ocr_engine: Optional[str] = None,
+        ocr_device: Optional[str] = None,
+        local_ai_model: Optional[str] = None,
+        local_ai_url: Optional[str] = None,
+        ocr_options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Process a single document file.
@@ -214,6 +258,7 @@ class DocumentPipeline:
         - Constructs GraphDelta with document nodes, section headers, rationale, and citations.
         - Returns server-ready push payload including unit and versioning metadata.
         """
+        import contextlib
         import inspect as _inspect
         from projectbrain.graphify_engine.doc_versioning import (
             derive_doc_key,
@@ -221,6 +266,18 @@ class DocumentPipeline:
             lookup_parent_units_by_hash,
             next_doc_version,
             resolve_doc_user_id,
+        )
+        try:
+            from projectbrain.utils.doc_parser import ocr_options_context
+        except ImportError:
+            ocr_options_context = None  # type: ignore[assignment]
+
+        effective_ocr_options = self._build_ocr_options(
+            ocr_options=ocr_options,
+            ocr_engine=ocr_engine,
+            ocr_device=ocr_device,
+            local_ai_model=local_ai_model,
+            local_ai_url=local_ai_url,
         )
 
         path = Path(file_path).resolve()
@@ -266,60 +323,68 @@ class DocumentPipeline:
         new_units = 0
         markdown_content = ""
 
-        try:
-            raw_units = await extract_raw_units(path.name, raw_bytes)
-            for idx, u in enumerate(raw_units):
-                u_sha = u["unit_sha256"]
-                matched_parent = None
-                if u_sha in parent_by_hash and parent_by_hash[u_sha]:
-                    matched_parent = parent_by_hash[u_sha].pop(0)
+        ocr_ctx = (
+            ocr_options_context(effective_ocr_options)
+            if (effective_ocr_options and ocr_options_context is not None)
+            else contextlib.nullcontext()
+        )
+        with ocr_ctx:
+            try:
+                raw_units = await extract_raw_units(path.name, raw_bytes)
+                for idx, u in enumerate(raw_units):
+                    u_sha = u["unit_sha256"]
+                    matched_parent = None
+                    if u_sha in parent_by_hash and parent_by_hash[u_sha]:
+                        matched_parent = parent_by_hash[u_sha].pop(0)
 
-                if matched_parent is not None:
-                    reused_units += 1
-                    unit_md = matched_parent.get("markdown_text") or ""
-                    resolved_units.append(
-                        {
-                            "unit_index": idx,
-                            "unit_type": u.get("unit_type") or matched_parent.get("unit_type") or "section",
-                            "unit_title": u.get("unit_title") or matched_parent.get("unit_title") or f"Unit {idx + 1}",
-                            "unit_sha256": u_sha,
-                            "markdown_text": unit_md,
-                            "reused": True,
-                        }
-                    )
-                else:
-                    new_units += 1
-                    if u.get("pre_extracted_text") is not None:
-                        unit_md = str(u["pre_extracted_text"])
-                    elif u.get("parse_fn") is not None:
-                        parsed = u["parse_fn"]()
-                        unit_md = await parsed if _inspect.isawaitable(parsed) else str(parsed)
+                    if matched_parent is not None:
+                        reused_units += 1
+                        unit_md = matched_parent.get("markdown_text") or ""
+                        resolved_units.append(
+                            {
+                                "unit_index": idx,
+                                "unit_type": u.get("unit_type") or matched_parent.get("unit_type") or "section",
+                                "unit_title": u.get("unit_title") or matched_parent.get("unit_title") or f"Unit {idx + 1}",
+                                "unit_sha256": u_sha,
+                                "markdown_text": unit_md,
+                                "reused": True,
+                            }
+                        )
                     else:
-                        unit_md = ""
-                    resolved_units.append(
-                        {
-                            "unit_index": idx,
-                            "unit_type": u.get("unit_type") or "section",
-                            "unit_title": u.get("unit_title") or f"Unit {idx + 1}",
-                            "unit_sha256": u_sha,
-                            "markdown_text": unit_md,
-                            "reused": False,
-                        }
-                    )
+                        new_units += 1
+                        if u.get("pre_extracted_text") is not None:
+                            unit_md = str(u["pre_extracted_text"])
+                        elif u.get("parse_fn") is not None:
+                            parsed = u["parse_fn"]()
+                            unit_md = await parsed if _inspect.isawaitable(parsed) else str(parsed)
+                        else:
+                            unit_md = ""
+                        resolved_units.append(
+                            {
+                                "unit_index": idx,
+                                "unit_type": u.get("unit_type") or "section",
+                                "unit_title": u.get("unit_title") or f"Unit {idx + 1}",
+                                "unit_sha256": u_sha,
+                                "markdown_text": unit_md,
+                                "reused": False,
+                            }
+                        )
 
-            markdown_content = "\n\n".join(
-                ru["markdown_text"].strip()
-                for ru in resolved_units
-                if ru.get("markdown_text") and str(ru["markdown_text"]).strip()
-            )
-        except Exception as e:
-            logger.debug("Pre-OCR unit extraction fallback to _extract_content for %s: %s", path.name, e)
-            resolved_units = []
-            reused_units = 0
-            new_units = 0
+                markdown_content = "\n\n".join(
+                    ru["markdown_text"].strip()
+                    for ru in resolved_units
+                    if ru.get("markdown_text") and str(ru["markdown_text"]).strip()
+                )
+            except Exception as e:
+                logger.debug("Pre-OCR unit extraction fallback to _extract_content for %s: %s", path.name, e)
+                resolved_units = []
+                reused_units = 0
+                new_units = 0
 
-        if not markdown_content.strip():
-            markdown_content = await self._extract_content(path, raw_bytes)
+            if not markdown_content.strip():
+                markdown_content = await self._extract_content(
+                    path, raw_bytes, ocr_options=effective_ocr_options
+                )
 
         # Generate semantic chunks
         raw_chunks = chunk_text(markdown_content, tgt=768, ovr=0.1)
@@ -392,6 +457,11 @@ class DocumentPipeline:
         tags: Optional[List[str]] = None,
         sector: str = "semantic",
         base_branch: Optional[str] = None,
+        ocr_engine: Optional[str] = None,
+        ocr_device: Optional[str] = None,
+        local_ai_model: Optional[str] = None,
+        local_ai_url: Optional[str] = None,
+        ocr_options: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Process a collection of document files, returning a list of payload dicts."""
         results: List[Dict[str, Any]] = []
@@ -405,6 +475,11 @@ class DocumentPipeline:
                     tags=tags,
                     sector=sector,
                     base_branch=base_branch,
+                    ocr_engine=ocr_engine,
+                    ocr_device=ocr_device,
+                    local_ai_model=local_ai_model,
+                    local_ai_url=local_ai_url,
+                    ocr_options=ocr_options,
                 )
                 results.append(res)
             except Exception as e:

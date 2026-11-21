@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import inspect
 import io
 import json
+import mimetypes
+import os
 import re
 import tempfile
 import xml.etree.ElementTree as ET
@@ -467,6 +470,37 @@ class MultimodalDocETLPlugin(ETLParserPlugin):
             return True
         return Path(source_name).suffix.lower() in self.supported_extensions
 
+    @staticmethod
+    async def _invoke_process_file(
+        pipeline: Any,
+        base_kwargs: Dict[str, Any],
+        ocr_kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Invoke DocumentPipeline.process_file forwarding OCR/Local-AI kwargs safely."""
+        if not ocr_kwargs:
+            return await pipeline.process_file(**base_kwargs)
+
+        accepted_extra: Dict[str, Any] = {}
+        try:
+            sig = inspect.signature(pipeline.process_file)
+            params = sig.parameters
+            has_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            for k, v in ocr_kwargs.items():
+                if has_var_kw or k in params:
+                    accepted_extra[k] = v
+        except (TypeError, ValueError):
+            accepted_extra = dict(ocr_kwargs)
+
+        if not accepted_extra:
+            return await pipeline.process_file(**base_kwargs)
+
+        try:
+            return await pipeline.process_file(**base_kwargs, **accepted_extra)
+        except TypeError:
+            return await pipeline.process_file(**base_kwargs)
+
     async def parse(
         self,
         source: Union[str, bytes],
@@ -480,19 +514,26 @@ class MultimodalDocETLPlugin(ETLParserPlugin):
         from projectbrain.graphify_engine.extractor import GraphifyExtractor
 
         meta = metadata or {}
+        ocr_kwargs: Dict[str, Any] = {}
+        for opt_key in ("ocr_engine", "ocr_device", "local_ai_model", "local_ai_url"):
+            val = meta.get(opt_key) if meta.get(opt_key) is not None else self.config.get(opt_key)
+            if val is not None:
+                ocr_kwargs[opt_key] = val
+
         existing = _is_existing_file(source)
         if existing is not None:
             extractor = GraphifyExtractor(cache_dir=self.config.get("cache_dir") or (existing.parent / ".projectbrain" / "cache"))
             pipeline = DocumentPipeline(extractor=extractor)
-            res = await pipeline.process_file(
-                file_path=existing,
-                project_id=project_id,
-                branch=branch,
-                author=meta.get("author"),
-                tags=meta.get("tags"),
-                sector=meta.get("sector", "semantic"),
-                doc_version=version_tag,
-            )
+            base_kwargs = {
+                "file_path": existing,
+                "project_id": project_id,
+                "branch": branch,
+                "author": meta.get("author"),
+                "tags": meta.get("tags"),
+                "sector": meta.get("sector", "semantic"),
+                "doc_version": version_tag,
+            }
+            res = await self._invoke_process_file(pipeline, base_kwargs, ocr_kwargs)
         else:
             raw_bytes, _ = _read_source_bytes(source)
             file_name = Path(source_name).name or "document.md"
@@ -502,15 +543,16 @@ class MultimodalDocETLPlugin(ETLParserPlugin):
                 file_path.write_bytes(raw_bytes)
                 extractor = GraphifyExtractor(cache_dir=self.config.get("cache_dir") or (tmp_path / ".cache"))
                 pipeline = DocumentPipeline(extractor=extractor)
-                res = await pipeline.process_file(
-                    file_path=file_path,
-                    project_id=project_id,
-                    branch=branch,
-                    author=meta.get("author"),
-                    tags=meta.get("tags"),
-                    sector=meta.get("sector", "semantic"),
-                    doc_version=version_tag,
-                )
+                base_kwargs = {
+                    "file_path": file_path,
+                    "project_id": project_id,
+                    "branch": branch,
+                    "author": meta.get("author"),
+                    "tags": meta.get("tags"),
+                    "sector": meta.get("sector", "semantic"),
+                    "doc_version": version_tag,
+                }
+                res = await self._invoke_process_file(pipeline, base_kwargs, ocr_kwargs)
 
         doc_info = res.get("document", {})
         return {
@@ -2551,11 +2593,609 @@ class StateFlowGraphPlugin(KnowledgeLinkerPlugin):
 
 
 # ---------------------------------------------------------------------------
+# 13. LocalAIOCRParserPlugin (GPU/CPU OCR + Local AI Vision Document Parser)
+# ---------------------------------------------------------------------------
+class LocalAIOCRParserPlugin(ETLParserPlugin):
+    """Parses scanned PDFs and images via UnifiedOCREngine (GPU/CPU OCR & Local AI backends)."""
+
+    SUPPORTED_ENGINES: Tuple[str, ...] = (
+        "auto",
+        "paddle",
+        "rapidocr",
+        "tesseract",
+        "ollama",
+        "vllm",
+        "lmstudio",
+        "llamacpp",
+        "hybrid_local",
+    )
+    SUPPORTED_DEVICES: Tuple[str, ...] = ("auto", "gpu", "cpu")
+
+    metadata = PluginMetadata(
+        plugin_id="etl.local_ai_ocr",
+        name="Local AI & GPU/CPU OCR Document Parser",
+        version="3.0.0",
+        category=PluginCategory.ETL_PARSER.value,
+        description=(
+            "Lazily invokes projectbrain.ocr_runtime.UnifiedOCREngine to parse scanned PDFs "
+            "and images into Markdown chunks and Graphify document nodes/edges across GPU/CPU "
+            "OCR (PaddleOCR, RapidOCR, Tesseract) and Local AI Vision backends (Ollama, vLLM, "
+            "LM Studio, llama.cpp, hybrid_local)."
+        ),
+        priority=85,
+        capabilities=[
+            "ocr_local",
+            "ocr_gpu",
+            "ocr_cpu",
+            "local_ai_vision",
+            "paddleocr",
+            "rapidocr",
+            "tesseract",
+            "ollama",
+            "vllm",
+            "lmstudio",
+            "llamacpp",
+            "hybrid_local",
+            "pdf_ocr",
+            "image_ocr",
+        ],
+        config_schema={
+            "ocr_engine": {"type": "string", "default": "auto", "enum": list(SUPPORTED_ENGINES)},
+            "ocr_device": {"type": "string", "default": "auto"},
+            "local_ai_model": {"type": "string", "default": None},
+            "local_ai_url": {"type": "string", "default": None},
+            "dpi": {"type": "integer", "default": 200},
+            "force_ocr": {"type": "boolean", "default": False},
+        },
+    )
+    supported_extensions: Tuple[str, ...] = (
+        ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp", ".pdf",
+    )
+    supported_formats: Tuple[str, ...] = (
+        "ocr",
+        "local_ai_ocr",
+        "scanned_pdf",
+        "image_ocr",
+        "paddle",
+        "rapidocr",
+        "tesseract",
+        "ollama",
+        "vllm",
+        "lmstudio",
+        "llamacpp",
+        "hybrid_local",
+    )
+
+    def can_parse(
+        self,
+        source_name: str,
+        format_hint: Optional[str] = None,
+        content_preview: Optional[str] = None,
+    ) -> bool:
+        if format_hint and format_hint.lower() in self.supported_formats:
+            return True
+        return Path(source_name).suffix.lower() in self.supported_extensions
+
+    def health_check(self) -> Dict[str, Any]:
+        base = super().health_check()
+        engine = self.config.get("ocr_engine") or self.config.get("engine") or os.getenv("PB_OCR_ENGINE", "auto")
+        device = self.config.get("ocr_device") or self.config.get("device") or os.getenv("PB_OCR_DEVICE", "auto")
+        base.update({"ocr_engine": engine, "ocr_device": device})
+        try:
+            from projectbrain.ocr_runtime import ComputeDeviceManager, UnifiedOCREngine
+
+            base["ocr_runtime_available"] = True
+            if hasattr(UnifiedOCREngine, "get_status"):
+                try:
+                    base["runtime_status"] = UnifiedOCREngine.get_status()
+                except TypeError:
+                    base["runtime_status"] = UnifiedOCREngine().get_status()
+            elif hasattr(ComputeDeviceManager, "detect_hardware"):
+                base["hardware"] = ComputeDeviceManager.detect_hardware()
+        except Exception as exc:  # noqa: BLE001
+            base["ocr_runtime_available"] = False
+            base["runtime_detail"] = str(exc)
+        return base
+
+    @staticmethod
+    def _instantiate_unified_engine(
+        engine_cls: Any,
+        engine: str,
+        device: str,
+        local_ai_model: Optional[str],
+        local_ai_url: Optional[str],
+        dpi: int,
+        force_ocr: bool,
+    ) -> Any:
+        candidate_kwargs: Dict[str, Any] = {
+            "engine": engine,
+            "ocr_engine": engine,
+            "device": device,
+            "ocr_device": device,
+            "local_ai_model": local_ai_model,
+            "model": local_ai_model,
+            "local_ai_url": local_ai_url,
+            "base_url": local_ai_url,
+            "dpi": dpi,
+            "force_ocr": force_ocr,
+        }
+        candidate_kwargs = {k: v for k, v in candidate_kwargs.items() if v is not None}
+        try:
+            sig = inspect.signature(engine_cls.__init__)
+            params = sig.parameters
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            init_kwargs: Dict[str, Any] = {}
+            if has_var_kw:
+                init_kwargs = {
+                    "engine": engine,
+                    "device": device,
+                    **({"local_ai_model": local_ai_model} if local_ai_model else {}),
+                    **({"local_ai_url": local_ai_url} if local_ai_url else {}),
+                }
+            else:
+                for k, v in candidate_kwargs.items():
+                    if k in params:
+                        init_kwargs[k] = v
+            return engine_cls(**init_kwargs)
+        except TypeError:
+            return engine_cls()
+
+    @staticmethod
+    async def _invoke_ocr_engine(
+        ocr_engine_obj: Any,
+        target_path: Path,
+        raw_bytes: bytes,
+        is_pdf: bool,
+        engine: str,
+        device: str,
+        local_ai_model: Optional[str],
+        local_ai_url: Optional[str],
+        dpi: int,
+        force_ocr: bool,
+    ) -> Tuple[str, Dict[str, Any]]:
+        method_order = (
+            ("parse_pdf", "ocr_pdf", "pdf_to_markdown", "parse_file", "process_file", "extract_markdown", "extract_text", "ocr_file", "parse")
+            if is_pdf
+            else ("parse_image", "ocr_image", "image_to_markdown", "extract_image", "extract_image_sync", "parse_file", "process_file", "extract_markdown", "extract_text", "ocr_file", "parse")
+        )
+        method = None
+        for mname in method_order:
+            cand = getattr(ocr_engine_obj, mname, None)
+            if callable(cand):
+                method = cand
+                break
+
+        # Real UnifiedOCREngine exposes extract_image/extract_batch rather than parse_pdf;
+        # when parsing a PDF without a dedicated PDF method, extract digital text or render pages.
+        if method is None and is_pdf and (
+            callable(getattr(ocr_engine_obj, "extract_image", None))
+            or callable(getattr(ocr_engine_obj, "extract_image_sync", None))
+        ):
+            return await LocalAIOCRParserPlugin._invoke_pdf_via_image_ocr(
+                ocr_engine_obj=ocr_engine_obj,
+                raw_bytes=raw_bytes,
+                engine=engine,
+                device=device,
+                local_ai_model=local_ai_model,
+                local_ai_url=local_ai_url,
+                dpi=dpi,
+                force_ocr=force_ocr,
+            )
+
+        if method is None:
+            raise RuntimeError(
+                "UnifiedOCREngine does not expose a supported OCR parse method "
+                "(expected one of parse_pdf/ocr_pdf/parse_image/ocr_image/extract_image/parse_file/extract_markdown)."
+            )
+
+        mime_type, _ = mimetypes.guess_type(target_path.name)
+        mime_type = mime_type or ("application/pdf" if is_pdf else "image/png")
+        optional_kwargs: Dict[str, Any] = {
+            "engine": engine,
+            "ocr_engine": engine,
+            "device": device,
+            "ocr_device": device,
+            "local_ai_model": local_ai_model,
+            "local_ai_url": local_ai_url,
+            "dpi": dpi,
+            "force_ocr": force_ocr,
+            "mime_type": mime_type,
+        }
+        optional_kwargs = {k: v for k, v in optional_kwargs.items() if v is not None}
+
+        sig = inspect.signature(method)
+        params = list(sig.parameters.values())
+        param_names = {p.name for p in params}
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
+        call_kwargs: Dict[str, Any] = {}
+        if "pdf_path" in param_names:
+            call_kwargs["pdf_path"] = str(target_path)
+        elif "image_path" in param_names:
+            call_kwargs["image_path"] = str(target_path)
+        elif "file_path" in param_names:
+            call_kwargs["file_path"] = str(target_path)
+        elif "path" in param_names:
+            call_kwargs["path"] = str(target_path)
+        elif "image_bytes" in param_names:
+            call_kwargs["image_bytes"] = raw_bytes
+        elif "data" in param_names:
+            call_kwargs["data"] = raw_bytes
+        elif "raw_bytes" in param_names:
+            call_kwargs["raw_bytes"] = raw_bytes
+
+        for k, v in optional_kwargs.items():
+            if k in param_names:
+                call_kwargs[k] = v
+        if has_var_kw:
+            for k in ("engine", "device", "local_ai_model", "local_ai_url", "dpi", "force_ocr"):
+                if k in optional_kwargs and k not in call_kwargs:
+                    call_kwargs[k] = optional_kwargs[k]
+
+        if call_kwargs:
+            try:
+                result = method(**call_kwargs)
+            except TypeError:
+                result = method(str(target_path))
+        else:
+            result = method(str(target_path))
+
+        if inspect.isawaitable(result):
+            result = await result
+
+        if isinstance(result, str):
+            return result, {}
+        if isinstance(result, dict):
+            md = result.get("markdown") or result.get("markdown_content") or result.get("text") or result.get("content") or ""
+            if not md and isinstance(result.get("pages"), list):
+                md = "\n\n".join(
+                    str(p.get("markdown") or p.get("text") or p) for p in result["pages"] if p
+                )
+            meta_out = {k: v for k, v in result.items() if k not in ("markdown", "markdown_content", "text", "content")}
+            return str(md), meta_out
+
+        md_attr = getattr(result, "markdown", None) or getattr(result, "text", None) or getattr(result, "content", None)
+        if md_attr is not None:
+            meta_out = _model_to_dict(result) if hasattr(result, "to_dict") or hasattr(result, "model_dump") or hasattr(result, "dict") else {}
+            meta_out.pop("markdown", None)
+            meta_out.pop("text", None)
+            meta_out.pop("content", None)
+            return str(md_attr), meta_out
+        return str(result or ""), {}
+
+    @staticmethod
+    async def _invoke_pdf_via_image_ocr(
+        ocr_engine_obj: Any,
+        raw_bytes: bytes,
+        engine: str,
+        device: str,
+        local_ai_model: Optional[str],
+        local_ai_url: Optional[str],
+        dpi: int,
+        force_ocr: bool,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Render PDF pages and run UnifiedOCREngine image OCR on pages needing OCR."""
+        layer: Dict[int, str] = {}
+        if not force_ocr:
+            try:
+                import pdfplumber
+
+                with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                    for idx, page in enumerate(pdf.pages):
+                        layer[idx] = page.extract_text(x_tolerance=2) or ""
+            except Exception:
+                layer = {}
+
+        try:
+            from projectbrain.utils.pdf_render import (
+                is_available as pdf_render_available,
+                page_count,
+                render_page_png,
+            )
+        except Exception as exc:
+            raise RuntimeError("PDF rendering utilities are unavailable for UnifiedOCREngine PDF OCR.") from exc
+
+        if not pdf_render_available():
+            if layer:
+                parts = [f"## Page {idx + 1}\n\n{txt.strip()}" for idx, txt in sorted(layer.items()) if txt.strip()]
+                return "\n\n".join(parts), {"engine_used": "pdfplumber", "device_used": "cpu", "pages": len(layer)}
+            raise RuntimeError("PyMuPDF (pymupdf) is required to render scanned PDFs for OCR.")
+
+        total_pages = page_count(raw_bytes)
+        page_texts: Dict[int, str] = {}
+        ocr_indices: List[int] = []
+        for idx in range(total_pages):
+            txt = layer.get(idx, "").strip()
+            if not force_ocr and len(txt) >= 15:
+                page_texts[idx] = txt
+            else:
+                ocr_indices.append(idx)
+
+        img_method = getattr(ocr_engine_obj, "extract_image", None) or getattr(ocr_engine_obj, "extract_image_sync", None)
+        last_meta: Dict[str, Any] = {}
+        for idx in ocr_indices:
+            png = render_page_png(raw_bytes, idx, dpi=dpi)
+            if not png:
+                page_texts[idx] = ""
+                continue
+            call_kw: Dict[str, Any] = {
+                "image_bytes": png,
+                "mime_type": "image/png",
+                "engine": engine,
+                "device": device,
+                **({"local_ai_model": local_ai_model} if local_ai_model else {}),
+                **({"local_ai_url": local_ai_url} if local_ai_url else {}),
+            }
+            try:
+                res = img_method(**call_kw)
+            except TypeError:
+                res = img_method(png)
+            if inspect.isawaitable(res):
+                res = await res
+            if isinstance(res, dict):
+                page_texts[idx] = str(res.get("text") or res.get("markdown") or res.get("content") or "").strip()
+                last_meta = {k: v for k, v in res.items() if k not in ("text", "markdown", "content")}
+            else:
+                page_texts[idx] = str(res or "").strip()
+
+        parts = [f"## Page {idx + 1}\n\n{page_texts.get(idx, '')}".strip() for idx in range(total_pages)]
+        return "\n\n".join(parts).strip(), {
+            **last_meta,
+            "pages": total_pages,
+            "ocr_pages": len(ocr_indices),
+        }
+
+    @staticmethod
+    def _chunk_markdown(
+        markdown_content: str,
+        stem: str,
+        sector: str,
+        tags: List[str],
+        ocr_engine: str,
+        ocr_device: str,
+    ) -> List[Dict[str, Any]]:
+        if not markdown_content.strip():
+            return []
+        try:
+            from projectbrain.utils.chunking import chunk_text
+
+            raw_chunks = chunk_text(markdown_content, tgt=768, ovr=0.1)
+        except Exception:
+            paragraphs = [p.strip() for p in re.split(r"\n{2,}", markdown_content) if p.strip()]
+            raw_chunks = [{"text": p, "start": 0, "end": len(p), "tokens": len(p.split())} for p in paragraphs]
+
+        chunks: List[Dict[str, Any]] = []
+        for idx, ch in enumerate(raw_chunks):
+            chunks.append(
+                {
+                    "chunk_id": f"{stem}_ocr_p{idx + 1}",
+                    "content": ch.get("text", ""),
+                    "start": ch.get("start", 0),
+                    "end": ch.get("end", 0),
+                    "tokens": ch.get("tokens", len(str(ch.get("text", "")).split())),
+                    "sector": sector,
+                    "tags": tags,
+                    "ocr_engine": ocr_engine,
+                    "ocr_device": ocr_device,
+                }
+            )
+        return chunks
+
+    async def parse(
+        self,
+        source: Union[str, bytes],
+        source_name: str = "scanned_document.pdf",
+        project_id: str = "default",
+        branch: str = "main",
+        version_tag: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        try:
+            from projectbrain.ocr_runtime import UnifiedOCREngine
+        except ImportError as exc:
+            raise RuntimeError(
+                "projectbrain.ocr_runtime.UnifiedOCREngine is not available. "
+                "Install an OCR extra (e.g. `pip install -e '.[ocr-cpu]'`, `'.[ocr-gpu]'`, "
+                "`'.[ocr-onnx]'`, or `'.[ocr-onnx-gpu]'`) or configure a Local AI backend."
+            ) from exc
+
+        meta = metadata or {}
+        engine = str(
+            meta.get("ocr_engine")
+            or meta.get("engine")
+            or self.config.get("ocr_engine")
+            or self.config.get("engine")
+            or os.getenv("PB_OCR_ENGINE")
+            or "auto"
+        ).strip().lower()
+        device = str(
+            meta.get("ocr_device")
+            or meta.get("device")
+            or self.config.get("ocr_device")
+            or self.config.get("device")
+            or os.getenv("PB_OCR_DEVICE")
+            or "auto"
+        ).strip().lower()
+        local_ai_model = (
+            meta.get("local_ai_model")
+            or self.config.get("local_ai_model")
+            or os.getenv("PB_LOCAL_AI_MODEL")
+            or os.getenv("PB_OLLAMA_VISION_MODEL")
+        )
+        local_ai_url = (
+            meta.get("local_ai_url")
+            or self.config.get("local_ai_url")
+            or os.getenv("PB_LOCAL_AI_URL")
+            or os.getenv("OLLAMA_URL")
+        )
+        dpi = int(meta.get("dpi") or self.config.get("dpi") or 200)
+        force_ocr = bool(meta.get("force_ocr") if "force_ocr" in meta else self.config.get("force_ocr", False))
+        sector = str(meta.get("sector", "semantic"))
+        tags = list(meta.get("tags") or [])
+
+        raw_bytes, existing_path = _read_source_bytes(source)
+        effective_name = existing_path.name if existing_path else (Path(source_name).name or "scanned_document.pdf")
+        ext = Path(effective_name).suffix.lower()
+        is_pdf = ext == ".pdf"
+        file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+        ocr_engine_obj = self._instantiate_unified_engine(
+            UnifiedOCREngine,
+            engine=engine,
+            device=device,
+            local_ai_model=local_ai_model,
+            local_ai_url=local_ai_url,
+            dpi=dpi,
+            force_ocr=force_ocr,
+        )
+
+        if existing_path is not None:
+            markdown_content, ocr_meta = await self._invoke_ocr_engine(
+                ocr_engine_obj,
+                existing_path,
+                raw_bytes,
+                is_pdf=is_pdf,
+                engine=engine,
+                device=device,
+                local_ai_model=local_ai_model,
+                local_ai_url=local_ai_url,
+                dpi=dpi,
+                force_ocr=force_ocr,
+            )
+            doc_path_str = str(existing_path)
+            cache_base = existing_path.parent / ".projectbrain" / "cache"
+        else:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                target_file = tmp_path / effective_name
+                target_file.write_bytes(raw_bytes)
+                markdown_content, ocr_meta = await self._invoke_ocr_engine(
+                    ocr_engine_obj,
+                    target_file,
+                    raw_bytes,
+                    is_pdf=is_pdf,
+                    engine=engine,
+                    device=device,
+                    local_ai_model=local_ai_model,
+                    local_ai_url=local_ai_url,
+                    dpi=dpi,
+                    force_ocr=force_ocr,
+                )
+            doc_path_str = source_name
+            cache_base = None
+
+        resolved_engine = str(ocr_meta.get("engine_used") or ocr_meta.get("engine") or engine)
+        resolved_device = str(ocr_meta.get("device_used") or ocr_meta.get("device") or device)
+        stem = Path(effective_name).stem or "ocr_doc"
+        chunks = self._chunk_markdown(
+            markdown_content=markdown_content,
+            stem=stem,
+            sector=sector,
+            tags=tags,
+            ocr_engine=resolved_engine,
+            ocr_device=resolved_device,
+        )
+
+        doc_metadata = {
+            **meta,
+            "sha256": file_sha256,
+            "file_type": "paper" if is_pdf else "image",
+            "ocr_engine": resolved_engine,
+            "ocr_device": resolved_device,
+            **({"local_ai_model": local_ai_model} if local_ai_model else {}),
+            **({"local_ai_url": local_ai_url} if local_ai_url else {}),
+            **({"version_tag": version_tag} if version_tag else {}),
+        }
+
+        graph_delta_dict: Dict[str, Any] = {}
+        try:
+            from projectbrain.graphify_engine.extractor import GraphifyExtractor
+
+            cache_dir = self.config.get("cache_dir") or cache_base
+            extractor = GraphifyExtractor(cache_dir=cache_dir) if cache_dir else GraphifyExtractor()
+            delta = extractor.extract_document_graph(
+                file_path=doc_path_str,
+                markdown_content=markdown_content,
+                project_id=project_id,
+                branch=branch,
+                metadata=doc_metadata,
+            )
+            graph_delta_dict = _model_to_dict(delta)
+        except Exception:
+            graph_delta_dict = {}
+
+        if not graph_delta_dict.get("nodes"):
+            doc_node_id = f"doc:{effective_name}"
+            nodes: List[GraphNode] = [
+                GraphNode(
+                    id=doc_node_id,
+                    project_id=project_id,
+                    label=effective_name,
+                    file_type="document",
+                    source_file=doc_path_str,
+                    metadata=doc_metadata,
+                )
+            ]
+            edges: List[GraphEdge] = []
+            for ch in chunks:
+                cid = f"doc_chunk:{ch['chunk_id']}"
+                nodes.append(
+                    GraphNode(
+                        id=cid,
+                        project_id=project_id,
+                        label=ch["chunk_id"],
+                        file_type="document",
+                        source_file=doc_path_str,
+                        metadata={
+                            "ocr_engine": resolved_engine,
+                            "ocr_device": resolved_device,
+                            "tokens": ch["tokens"],
+                            "version_tag": version_tag,
+                        },
+                    )
+                )
+                edges.append(
+                    GraphEdge(
+                        project_id=project_id,
+                        source=doc_node_id,
+                        target=cid,
+                        relation="contains_section",
+                        source_file=doc_path_str,
+                    )
+                )
+            graph_delta_dict = _build_delta(project_id, branch, nodes, edges)
+
+        return {
+            "plugin_id": self.metadata.plugin_id,
+            "graph_delta": graph_delta_dict,
+            "document": {
+                "filename": doc_path_str,
+                "sha256": file_sha256,
+                "file_type": "paper" if is_pdf else "image",
+                "markdown_content": markdown_content,
+                "chunks": chunks,
+                "ocr_engine": resolved_engine,
+                "ocr_device": resolved_device,
+                "local_ai_model": local_ai_model,
+                "local_ai_url": local_ai_url,
+                "ocr_metadata": ocr_meta,
+                "version_tag": version_tag,
+            },
+            "chunks": chunks,
+            "canonical_intents": [],
+            "error_rules": [],
+            "flow_nodes": [],
+            "flow_edges": [],
+        }
+
+
+# ---------------------------------------------------------------------------
 # Plugin Discovery / Registration Entrypoints
 # ---------------------------------------------------------------------------
 _BUILTIN_PLUGIN_CLASSES = (
     GraphifyASTETLPlugin,
     MultimodalDocETLPlugin,
+    LocalAIOCRParserPlugin,
     CodeDocLinkerPlugin,
     MarkdownWikiExporterPlugin,
     DocxExporterPlugin,
@@ -2570,12 +3210,12 @@ _BUILTIN_PLUGIN_CLASSES = (
 
 
 def get_plugins(config: Optional[Dict[str, Any]] = None) -> List[BasePlugin]:
-    """Instantiate and return all 12 built-in ETL, Linker, and Exporter plugins."""
+    """Instantiate and return all 13 built-in ETL, Linker, and Exporter plugins."""
     return [cls(config=config) for cls in _BUILTIN_PLUGIN_CLASSES]
 
 
 def register_plugins(registry: Any, config: Optional[Dict[str, Any]] = None) -> List[str]:
-    """Register all 12 built-in ETL, Linker, and Exporter plugins into the given PluginRegistry."""
+    """Register all 13 built-in ETL, Linker, and Exporter plugins into the given PluginRegistry."""
     registered: List[str] = []
     for plugin in get_plugins(config=config):
         registry.register(plugin)
@@ -2586,6 +3226,7 @@ def register_plugins(registry: Any, config: Optional[Dict[str, Any]] = None) -> 
 __all__ = [
     "GraphifyASTETLPlugin",
     "MultimodalDocETLPlugin",
+    "LocalAIOCRParserPlugin",
     "CodeDocLinkerPlugin",
     "MarkdownWikiExporterPlugin",
     "DocxExporterPlugin",

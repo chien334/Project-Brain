@@ -44,6 +44,7 @@ try:
         GraphifyASTETLPlugin,
         HardwareDatasheetETLPlugin,
         LegacyTestcaseETLPlugin,
+        LocalAIOCRParserPlugin,
         MarkdownWikiExporterPlugin,
         MultimodalDocETLPlugin,
         OpenAPI31ETLPlugin,
@@ -66,6 +67,7 @@ try:
             OpenAPI31ETLPlugin,
             CppEmbeddedETLPlugin,
             StateFlowGraphPlugin,
+            LocalAIOCRParserPlugin,
         ]
     )
 except Exception:  # pragma: no cover
