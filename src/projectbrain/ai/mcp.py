@@ -32,8 +32,9 @@ mem = Memory()
 import contextvars
 from pathlib import Path
 
-# ContextVar to store project/user ID for the current request context (e.g. from query params)
+# ContextVar to store project/user ID and role for the current request context (e.g. from query params/auth middleware)
 mcp_request_project_id = contextvars.ContextVar("mcp_request_project_id", default=None)
+mcp_request_role = contextvars.ContextVar("mcp_request_role", default=None)
 
 def resolve_mcp_user_id(user_id: str = None) -> str:
     # 1. Check if user_id is explicitly passed in the tool call arguments
@@ -429,7 +430,7 @@ async def projectbrain_ingest(source: str, creds: dict = None, filters: dict = N
         traceback.print_exc(file=sys.stderr)
         return f"Error: {str(e)}"
 
-async def sync_codebase_memories(project_id: str, dir_path: str) -> dict:
+async def sync_codebase_memories(project_id: str, dir_path: str, base_branch: Optional[str] = None) -> dict:
     import os
     exclude_dirs = {
         ".git", "node_modules", "dist", "build", "__pycache__", 
@@ -451,6 +452,62 @@ async def sync_codebase_memories(project_id: str, dir_path: str) -> dict:
     
     count = 0
     errors = 0
+
+    if base_branch and ":" in project_id:
+        proj, br = project_id.split(":", 1)
+        if br and br != base_branch:
+            from ..core.db import register_memory_branch, record_memory_tombstone
+            from ..memory.hsg import delete_branch_target_memories, invalidate_query_cache
+            from ..graphify_engine.extractor import GraphifyExtractor
+
+            register_memory_branch(proj, br, base_branch)
+            invalidate_query_cache()
+
+            resolved_dir = str(Path(dir_path).resolve())
+            changed_files, deleted_rel_paths = GraphifyExtractor()._discover_git_diff(
+                Path(resolved_dir), base_branch
+            )
+            for rel in deleted_rel_paths:
+                await delete_branch_target_memories(proj, br, "file", rel)
+                record_memory_tombstone(proj, br, "file", rel)
+
+            for fpath in changed_files:
+                fpath_str = str(fpath)
+                rel_path = os.path.relpath(fpath_str, resolved_dir).replace("\\", "/")
+                dir_parts = rel_path.split("/")[:-1]
+                if any(p in exclude_dirs or (p.startswith(".") and p not in (".", "..")) for p in dir_parts):
+                    continue
+                file = os.path.basename(fpath_str)
+                ext = os.path.splitext(file)[1].lower()
+                if ext in exclude_exts:
+                    continue
+
+                await delete_branch_target_memories(proj, br, "file", rel_path)
+                record_memory_tombstone(proj, br, "file", rel_path)
+                try:
+                    with open(fpath_str, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    if not content.strip():
+                        continue
+                    meta = {
+                        "source": "mcp_sync_all",
+                        "filename": file,
+                        "file_path": rel_path,
+                        "project_id": project_id
+                    }
+                    await mem.add(
+                        content=f"File: {rel_path}\n\n{content}",
+                        user_id=project_id,
+                        meta=meta,
+                        tags=["codebase", "file"]
+                    )
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Failed to ingest {rel_path} in MCP delta sync: {e}")
+                    errors += 1
+
+            invalidate_query_cache()
+            return {"total_ingested": count, "total_errors": errors}
     
     for root, dirs, files in os.walk(dir_path):
         dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")]
@@ -494,7 +551,8 @@ async def projectbrain_sync_codegraph(
     project_path: str = None, 
     branch: str = None, 
     sync_memories: bool = True,
-    author: str = None
+    author: str = None,
+    base_branch: Optional[str] = None
 ) -> str:
     """
     Synchronize the local codegraph database (.codegraph/codegraph.db in current working directory or specified project path)
@@ -506,6 +564,7 @@ async def projectbrain_sync_codegraph(
         branch: Optional branch name to associate with the synchronization. If not specified, tries to auto-detect the active git branch.
         sync_memories: If True (default), scans and ingests all text source files as memories.
         author: Optional name of the user performing the sync.
+        base_branch: Optional parent/base branch for delta-only memory sync and overlay inheritance.
     """
     import shutil
     import subprocess
@@ -746,13 +805,20 @@ async def projectbrain_sync_codegraph(
         
         mem_res = None
         if sync_memories:
-            mem_res = await sync_codebase_memories(sync_project_id, resolved_project_path)
+            mem_res = await sync_codebase_memories(sync_project_id, resolved_project_path, base_branch=base_branch)
             res["memories"] = mem_res
             res["message"] = (
                 f"Successfully synchronized {len(nodes)} nodes, {len(edges)} edges, "
                 f"and ingested {mem_res['total_ingested']} codebase files as memories "
                 f"(with {mem_res['total_errors']} errors)!"
             )
+        elif base_branch and ":" in sync_project_id:
+            proj, br = sync_project_id.split(":", 1)
+            if br and br != base_branch:
+                from ..core.db import register_memory_branch
+                from ..memory.hsg import invalidate_query_cache
+                register_memory_branch(proj, br, base_branch)
+                invalidate_query_cache()
             
         return json.dumps(res, indent=2)
     except Exception as e:
@@ -1136,7 +1202,8 @@ async def projectbrain_sync_graphify(
     git_dirty_only: bool = False,
     local_only: bool = False,
     cluster: bool = True,
-    include_docs: bool = True
+    include_docs: bool = True,
+    base_branch: Optional[str] = None
 ) -> str:
     """
     Extract AST code graph and document entities via Graphify and synchronize to ProjectBrain.
@@ -1166,6 +1233,7 @@ async def projectbrain_sync_graphify(
             scoped_paths=scoped_paths,
             git_dirty_only=git_dirty_only,
             include_docs=include_docs,
+            base_branch=base_branch,
         )
 
         if cluster and delta.nodes:
@@ -1180,19 +1248,21 @@ async def projectbrain_sync_graphify(
             output_dir=os.path.join(workspace_path, ".projectbrain", "local_graph")
         )
 
+        is_partial = bool(scoped_paths or git_dirty_only or (base_branch and base_branch != target_branch))
+
         if local_only:
             return json.dumps({
                 "status": "cached_local",
                 "project_id": target_proj,
                 "branch": target_branch,
+                "base_branch": base_branch,
                 "local_path": local_file,
                 "nodes_count": len(delta.nodes),
                 "edges_count": len(delta.edges),
                 "hyperedges_count": len(delta.hyperedges),
-                "partial": bool(scoped_paths or git_dirty_only),
+                "partial": is_partial,
             }, indent=2)
 
-        is_partial = bool(scoped_paths or git_dirty_only)
         synced_files_list = [sf["file_path"] if isinstance(sf, dict) else str(sf) for sf in delta.synced_files]
 
         if is_pb_remote_mode():
@@ -1203,6 +1273,7 @@ async def projectbrain_sync_graphify(
             payload = {
                 "project_id": target_proj,
                 "branch": target_branch,
+                "base_branch": base_branch,
                 "nodes": [n.to_dict() if hasattr(n, "to_dict") else n.model_dump() for n in delta.nodes],
                 "edges": [e.to_dict() if hasattr(e, "to_dict") else e.model_dump() for e in delta.edges],
                 "hyperedges": [h.to_dict() if hasattr(h, "to_dict") else h.model_dump() for h in delta.hyperedges],
@@ -1210,6 +1281,7 @@ async def projectbrain_sync_graphify(
                 "edge_tombstones": delta.edge_tombstones,
                 "hyperedge_tombstones": delta.hyperedge_tombstones,
                 "synced_files": delta.synced_files,
+                "deleted_files": delta.deleted_files,
                 "partial": is_partial,
                 "author": os.getenv("USER", "system"),
                 "cluster": False,
@@ -1227,8 +1299,18 @@ async def projectbrain_sync_graphify(
                     delta=delta,
                     partial=is_partial,
                     synced_files=synced_files_list,
+                    deleted_files=delta.deleted_files,
                     author=os.getenv("USER", "system"),
+                    base_branch=base_branch,
                 )
+                if base_branch and base_branch != target_branch:
+                    try:
+                        from ..core.db import register_memory_branch
+                        from ..memory.hsg import invalidate_query_cache
+                        register_memory_branch(target_proj, target_branch, base_branch)
+                        invalidate_query_cache()
+                    except Exception as me:
+                        logger.debug(f"Memory branch registration skipped for {target_proj}:{target_branch}: {me}")
                 return json.dumps(res, indent=2)
             finally:
                 store.close()
@@ -1459,7 +1541,7 @@ async def projectbrain_hybrid_query(
 
 @mcp_server.tool(
     name="projectbrain_upload_document",
-    description="Process and ingest multimodal document (.pdf, .docx, .xlsx, .pptx, .csv, .md, images) into Graphify and ProjectBrain memory."
+    description="Process and ingest multimodal document (.pdf, .docx, .xlsx, .pptx, .csv, .md, images) into Graphify and ProjectBrain memory with versioned pre-OCR delta reuse."
 )
 async def projectbrain_upload_document(
     file_path: str,
@@ -1467,7 +1549,11 @@ async def projectbrain_upload_document(
     branch: str = "main",
     author: Optional[str] = None,
     tags: Optional[List[str]] = None,
-    push_to_server: Optional[bool] = None
+    push_to_server: Optional[bool] = None,
+    doc_key: Optional[str] = None,
+    doc_version: Optional[str] = None,
+    base_version: Optional[str] = None,
+    base_branch: Optional[str] = None,
 ) -> str:
     """
     Process and ingest multimodal document into Graphify and ProjectBrain memory.
@@ -1477,9 +1563,8 @@ async def projectbrain_upload_document(
             return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
 
         from ..graphify_engine.doc_pipeline import DocumentPipeline
+        from ..graphify_engine.doc_versioning import ingest_document_versioned
         from ..graphify_engine.models import GraphDelta
-        from ..graphify_engine.store import get_graph_store
-        from ..memory.hsg import add_hsg_memory
 
         resolved_proj = resolve_mcp_user_id(project_id)
         if ":" in resolved_proj:
@@ -1497,10 +1582,18 @@ async def projectbrain_upload_document(
             branch=target_branch,
             author=author,
             tags=tags,
+            doc_key=doc_key,
+            doc_version=doc_version,
+            base_version=base_version,
+            base_branch=base_branch,
         )
 
         should_push = push_to_server if push_to_server is not None else is_pb_remote_mode()
         if should_push:
+            payload["doc_key"] = doc_key or payload["document"].get("doc_key")
+            payload["doc_version"] = doc_version or payload["document"].get("doc_version")
+            payload["base_version"] = base_version
+            payload["base_branch"] = base_branch or payload["document"].get("base_branch")
             res = await pipeline.push_processed_to_server(
                 server_url=get_pb_server_url(),
                 payload=payload,
@@ -1509,21 +1602,19 @@ async def projectbrain_upload_document(
             return json.dumps(res, indent=2)
         else:
             doc = payload["document"]
-            effective_user = f"{target_proj}:{target_branch}" if target_branch and target_branch != "main" and ":" not in target_proj else target_proj
-            memories_created = 0
-            for ch in doc.get("chunks", []):
-                content = ch.get("content") or ch.get("text") or ""
-                if not content.strip():
-                    continue
-                chunk_tags = ch.get("tags") or ["document"]
-                tag_str = ",".join(chunk_tags) if isinstance(chunk_tags, list) else str(chunk_tags)
-                await add_hsg_memory(
-                    content=content,
-                    tags=tag_str,
-                    metadata={"filename": doc.get("filename"), "sha256": doc.get("sha256"), "author": author},
-                    user_id=effective_user,
-                )
-                memories_created += 1
+            ver_res = await ingest_document_versioned(
+                filename=doc.get("filename") or str(file_path),
+                markdown_content=doc.get("markdown_content", ""),
+                precomputed_units=doc.get("units") or None,
+                project_id=target_proj,
+                branch=target_branch,
+                author=author,
+                tags=tags or ["document"],
+                doc_key=doc_key or doc.get("doc_key"),
+                doc_version=doc_version or doc.get("doc_version"),
+                base_version=base_version,
+                base_branch=base_branch or doc.get("base_branch"),
+            )
 
             delta_dict = payload["graph_delta"]
             delta = GraphDelta(
@@ -1546,6 +1637,7 @@ async def projectbrain_upload_document(
                     partial=True,
                     synced_files=[str(file_path)],
                     author=author or "system",
+                    base_branch=ver_res.get("base_branch") or base_branch,
                 )
             finally:
                 store.close()
@@ -1554,9 +1646,17 @@ async def projectbrain_upload_document(
                 "mode": "local",
                 "project_id": target_proj,
                 "branch": target_branch,
-                "memories_created": memories_created,
+                "memories_created": ver_res["memories_created"],
                 "nodes_upserted": sync_res.get("nodes_upserted", len(delta.nodes)),
                 "edges_upserted": sync_res.get("edges_upserted", len(delta.edges)),
+                "doc_key": ver_res["doc_key"],
+                "doc_version": ver_res["doc_version"],
+                "parent_version": ver_res["parent_version"],
+                "base_branch": ver_res["base_branch"],
+                "total_units": ver_res["total_units"],
+                "reused_units": ver_res["reused_units"],
+                "new_units": ver_res["new_units"],
+                "deleted_units": ver_res["deleted_units"],
             }, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
@@ -1564,7 +1664,7 @@ async def projectbrain_upload_document(
 
 @mcp_server.tool(
     name="projectbrain_push_processed_document",
-    description="Directly push pre-extracted document Markdown and Graphify entities to ProjectBrain server or local memory."
+    description="Directly push pre-extracted document Markdown and Graphify entities to ProjectBrain server or local memory with versioning."
 )
 async def projectbrain_push_processed_document(
     filename: str,
@@ -1573,7 +1673,11 @@ async def projectbrain_push_processed_document(
     branch: str = "main",
     author: Optional[str] = None,
     tags: Optional[List[str]] = None,
-    server_url: Optional[str] = None
+    server_url: Optional[str] = None,
+    doc_key: Optional[str] = None,
+    doc_version: Optional[str] = None,
+    base_version: Optional[str] = None,
+    base_branch: Optional[str] = None,
 ) -> str:
     """
     Directly push pre-extracted document Markdown and Graphify entities to ProjectBrain server or local memory.
@@ -1583,9 +1687,7 @@ async def projectbrain_push_processed_document(
             return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
 
         from ..graphify_engine.extractor import GraphifyExtractor
-        from ..graphify_engine.models import GraphDelta
-        from ..graphify_engine.store import get_graph_store
-        from ..memory.hsg import add_hsg_memory
+        from ..graphify_engine.doc_versioning import ingest_document_versioned
         from ..utils.chunking import chunk_text
 
         resolved_proj = resolve_mcp_user_id(project_id)
@@ -1615,6 +1717,10 @@ async def projectbrain_push_processed_document(
         payload = {
             "project_id": target_proj,
             "branch": target_branch,
+            "doc_key": doc_key,
+            "doc_version": doc_version,
+            "base_version": base_version,
+            "base_branch": base_branch,
             "document": {
                 "filename": filename,
                 "sha256": sha256,
@@ -1622,6 +1728,10 @@ async def projectbrain_push_processed_document(
                 "file_type": "document",
                 "markdown_content": markdown_content,
                 "chunks": chunks,
+                "doc_key": doc_key,
+                "doc_version": doc_version,
+                "base_version": base_version,
+                "base_branch": base_branch,
             },
             "graph_delta": delta.to_dict() if hasattr(delta, "to_dict") else delta.model_dump(),
         }
@@ -1635,16 +1745,18 @@ async def projectbrain_push_processed_document(
                 resp.raise_for_status()
                 return json.dumps(resp.json(), indent=2)
         else:
-            effective_user = f"{target_proj}:{target_branch}" if target_branch and target_branch != "main" and ":" not in target_proj else target_proj
-            memories_created = 0
-            for ch in chunks:
-                await add_hsg_memory(
-                    content=ch["content"],
-                    tags=",".join(ch["tags"]),
-                    metadata={"filename": filename, "sha256": sha256, "author": author},
-                    user_id=effective_user,
-                )
-                memories_created += 1
+            ver_res = await ingest_document_versioned(
+                filename=filename,
+                markdown_content=markdown_content,
+                project_id=target_proj,
+                branch=target_branch,
+                author=author,
+                tags=tags or ["document"],
+                doc_key=doc_key,
+                doc_version=doc_version,
+                base_version=base_version,
+                base_branch=base_branch,
+            )
 
             store = _get_mcp_graph_store()
             try:
@@ -1655,6 +1767,7 @@ async def projectbrain_push_processed_document(
                     partial=True,
                     synced_files=[filename],
                     author=author or "system",
+                    base_branch=ver_res.get("base_branch") or base_branch,
                 )
             finally:
                 store.close()
@@ -1663,13 +1776,151 @@ async def projectbrain_push_processed_document(
                 "mode": "local",
                 "project_id": target_proj,
                 "branch": target_branch,
-                "memories_created": memories_created,
+                "memories_created": ver_res["memories_created"],
                 "nodes_upserted": sync_res.get("nodes_upserted", len(delta.nodes)),
                 "edges_upserted": sync_res.get("edges_upserted", len(delta.edges)),
+                "doc_key": ver_res["doc_key"],
+                "doc_version": ver_res["doc_version"],
+                "parent_version": ver_res["parent_version"],
+                "base_branch": ver_res["base_branch"],
+                "total_units": ver_res["total_units"],
+                "reused_units": ver_res["reused_units"],
+                "new_units": ver_res["new_units"],
+                "deleted_units": ver_res["deleted_units"],
             }, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_push_processed_document: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_list_document_versions",
+    description="List version history for a versioned document (doc_key) in a ProjectBrain project and optional branch."
+)
+async def projectbrain_list_document_versions(
+    doc_key: str,
+    project_id: Optional[str] = None,
+    branch: Optional[str] = None,
+) -> str:
+    """List version history for a specific doc_key."""
+    try:
+        if project_id and project_id.strip():
+            raw_proj = project_id.strip()
+            if ":" in raw_proj:
+                target_proj, proj_br = raw_proj.split(":", 1)
+                target_branch = branch if branch is not None else proj_br
+            else:
+                target_proj = raw_proj
+                target_branch = branch
+        else:
+            resolved_proj = resolve_mcp_user_id(project_id)
+            if ":" in resolved_proj:
+                target_proj, proj_br = resolved_proj.split(":", 1)
+                target_branch = branch if branch is not None else proj_br
+            else:
+                target_proj = resolved_proj
+                target_branch = branch
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            headers = {"Authorization": f"Bearer {get_pb_api_key()}"} if get_pb_api_key() else {}
+            params: Dict[str, Any] = {"project_id": target_proj}
+            if target_branch:
+                params["branch"] = target_branch
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{server_url}/sources/documents/{doc_key}/versions",
+                    params=params,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            from ..graphify_engine.doc_versioning import list_document_versions
+            versions = list_document_versions(
+                project_id=target_proj,
+                doc_key=doc_key,
+                branch=target_branch,
+            )
+            return json.dumps({
+                "project_id": target_proj,
+                "doc_key": doc_key,
+                "branch": target_branch,
+                "versions": versions,
+            }, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_list_document_versions: {str(e)}"
+
+@mcp_server.tool(
+    name="projectbrain_diff_document_versions",
+    description="Compute unit-level diff (unchanged, modified, added, removed pages/sections/slides/sheets) between two versions of a document."
+)
+async def projectbrain_diff_document_versions(
+    doc_key: str,
+    from_version: str,
+    to_version: str,
+    project_id: Optional[str] = None,
+    branch: Optional[str] = None,
+    from_branch: Optional[str] = None,
+    to_branch: Optional[str] = None,
+) -> str:
+    """Compute unit-level diff between two versions of a document."""
+    try:
+        if project_id and project_id.strip():
+            raw_proj = project_id.strip()
+            if ":" in raw_proj:
+                target_proj, proj_br = raw_proj.split(":", 1)
+                target_branch = branch or proj_br or "main"
+            else:
+                target_proj = raw_proj
+                target_branch = branch or "main"
+        else:
+            resolved_proj = resolve_mcp_user_id(project_id)
+            if ":" in resolved_proj:
+                target_proj, proj_br = resolved_proj.split(":", 1)
+                target_branch = branch or proj_br or "main"
+            else:
+                target_proj = resolved_proj
+                target_branch = branch or "main"
+
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            headers = {"Authorization": f"Bearer {get_pb_api_key()}"} if get_pb_api_key() else {}
+            params: Dict[str, Any] = {
+                "project_id": target_proj,
+                "from_version": from_version,
+                "to_version": to_version,
+                "branch": target_branch,
+            }
+            if from_branch:
+                params["from_branch"] = from_branch
+            if to_branch:
+                params["to_branch"] = to_branch
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{server_url}/sources/documents/{doc_key}/diff",
+                    params=params,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        else:
+            from ..graphify_engine.doc_versioning import diff_document_versions
+            diff_res = diff_document_versions(
+                project_id=target_proj,
+                doc_key=doc_key,
+                from_version=from_version,
+                to_version=to_version,
+                branch=target_branch,
+                from_branch=from_branch,
+                to_branch=to_branch,
+            )
+            return json.dumps(diff_res, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_diff_document_versions: {str(e)}"
 
 @mcp_server.tool(
     name="projectbrain_promote_branch_graph",
@@ -1677,10 +1928,11 @@ async def projectbrain_push_processed_document(
 )
 async def projectbrain_promote_branch_graph(
     project_id: str,
-    branch: str
+    branch: str,
+    target_branch: Optional[str] = None
 ) -> str:
     """
-    Atomically promote branch overlay schema mutations into canonical root schema.
+    Atomically promote branch overlay schema mutations into canonical root or target parent branch schema.
     """
     try:
         if check_read_only():
@@ -1691,10 +1943,10 @@ async def projectbrain_promote_branch_graph(
         if ":" in resolved_proj:
             p_parts = resolved_proj.split(":", 1)
             target_proj = p_parts[0]
-            target_branch = branch if branch else (p_parts[1] or "main")
+            source_branch = branch if branch else (p_parts[1] or "main")
         else:
             target_proj = resolved_proj
-            target_branch = branch
+            source_branch = branch
 
         if is_pb_remote_mode():
             import httpx
@@ -1703,7 +1955,11 @@ async def projectbrain_promote_branch_graph(
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
                     f"{server_url}/graphify/promote",
-                    json={"project_id": target_proj, "branch": target_branch},
+                    json={
+                        "project_id": target_proj,
+                        "branch": source_branch,
+                        "target_branch": target_branch,
+                    },
                     headers=headers,
                 )
                 resp.raise_for_status()
@@ -1711,7 +1967,11 @@ async def projectbrain_promote_branch_graph(
         else:
             store = _get_mcp_graph_store()
             try:
-                res = store.promote_branch_to_root(project_id=target_proj, branch_name=target_branch)
+                res = store.promote_branch_to_root(
+                    project_id=target_proj,
+                    branch_name=source_branch,
+                    target_branch=target_branch,
+                )
                 return json.dumps(res, indent=2)
             finally:
                 store.close()
@@ -2007,6 +2267,761 @@ async def projectbrain_generate_project_docs(
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_generate_project_docs: {str(e)}"
 
+
+
+# ---------------------------------------------------------------------------
+# Plugin Microkernel & v3.0 Testing KB FastMCP Tools (Local & Remote Mode)
+# ---------------------------------------------------------------------------
+
+def _resolve_v3_project_branch(project_id: Optional[str], branch: str = "main") -> Tuple[str, str]:
+    resolved_proj = resolve_mcp_user_id(project_id)
+    if ":" in resolved_proj:
+        p_parts = resolved_proj.split(":", 1)
+        target_proj = p_parts[0]
+        target_branch = branch if branch != "main" else (p_parts[1] or "main")
+    else:
+        target_proj = resolved_proj
+        target_branch = branch or "main"
+    return target_proj, target_branch
+
+
+async def _pb_remote_v3_request(
+    method: str,
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: float = 60.0,
+) -> Any:
+    import httpx
+    server_url = get_pb_server_url()
+    api_key = get_pb_api_key()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    clean_params = {k: v for k, v in (params or {}).items() if v is not None}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.request(
+            method.upper(),
+            f"{server_url}{path}",
+            params=clean_params or None,
+            json=json_body,
+            headers=headers,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _select_v3_etl_parser(
+    registry: Any,
+    source_name: str,
+    format_hint: Optional[str] = None,
+    content_preview: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> Optional[Any]:
+    from ..plugins.base import PluginCategory
+
+    parsers = registry.resolve_all(PluginCategory.ETL_PARSER, project_id=project_id)
+    if format_hint:
+        hint_lower = format_hint.strip().lower()
+        for p in parsers:
+            supported = tuple(getattr(p, "supported_formats", ()) or ())
+            if hint_lower in supported and p.can_parse(
+                source_name, format_hint=format_hint, content_preview=content_preview
+            ):
+                return p
+
+    generic_ids = {"etl.graphify_ast", "etl.multimodal_doc"}
+    for p in parsers:
+        if p.metadata.plugin_id not in generic_ids and p.can_parse(
+            source_name, format_hint=format_hint, content_preview=content_preview
+        ):
+            return p
+
+    for p in parsers:
+        if p.can_parse(source_name, format_hint=format_hint, content_preview=content_preview):
+            return p
+
+    return None
+
+
+_FORBIDDEN_MCP_SYSTEM_PREFIXES = (
+    "/etc",
+    "/private/etc",
+    "/proc",
+    "/sys",
+    "/var/run",
+    "/private/var/run",
+    "/root",
+    "/dev",
+    "/boot",
+)
+_FORBIDDEN_MCP_SENSITIVE_DIR_NAMES = (".ssh", ".aws", ".gnupg")
+
+
+def _validate_mcp_safe_path(file_path: str) -> Path:
+    """Reject raw '..' traversal and sensitive system/credential paths while allowing workspace and pytest tmp_path files."""
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise ValueError("file_path must be a non-empty string")
+    if "\x00" in file_path:
+        raise ValueError("Null byte is not allowed in file_path")
+
+    clean_str = file_path.strip()
+    norm_slashes = clean_str.replace("\\", "/")
+    raw_path = Path(clean_str)
+    if ".." in raw_path.parts or ".." in norm_slashes.split("/"):
+        raise ValueError(f"Path traversal ('..') is not allowed in file_path: {file_path}")
+
+    expanded = raw_path.expanduser()
+    norm_abs = os.path.abspath(str(expanded))
+    resolved = expanded.resolve()
+
+    for cand in (norm_abs, str(resolved)):
+        for prefix in _FORBIDDEN_MCP_SYSTEM_PREFIXES:
+            if cand == prefix or cand.startswith(prefix + "/"):
+                raise ValueError(f"Access to sensitive system path '{file_path}' is forbidden")
+
+    home_raw = Path.home()
+    home_resolved = home_raw.resolve()
+    forbidden_home_dirs = []
+    for sub in _FORBIDDEN_MCP_SENSITIVE_DIR_NAMES:
+        forbidden_home_dirs.append(Path(os.path.abspath(str(home_raw / sub))))
+        forbidden_home_dirs.append((home_resolved / sub).resolve())
+
+    for cand_path in (Path(norm_abs), resolved):
+        for forbidden_dir in forbidden_home_dirs:
+            if cand_path == forbidden_dir or forbidden_dir in cand_path.parents:
+                raise ValueError(f"Access to sensitive credential directory '{file_path}' is forbidden")
+        if any(part in _FORBIDDEN_MCP_SENSITIVE_DIR_NAMES for part in cand_path.parts):
+            raise ValueError(f"Access to sensitive credential path '{file_path}' is forbidden")
+
+    pb_ws_root = os.getenv("PB_WORKSPACE_ROOT")
+    if pb_ws_root:
+        ws_root_resolved = Path(pb_ws_root).expanduser().resolve()
+        try:
+            resolved.relative_to(ws_root_resolved)
+        except ValueError as exc:
+            raise ValueError(f"file_path '{file_path}' escapes configured PB_WORKSPACE_ROOT") from exc
+
+    return resolved
+
+
+@mcp_server.tool(
+    name="projectbrain_list_plugins",
+    description="List registered ProjectBrain v3.0 microkernel plugins, categories, priorities, enabled status, and health."
+)
+async def projectbrain_list_plugins(
+    category: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> str:
+    """List all registered ProjectBrain plugins and health status."""
+    try:
+        from ..server.routes.plugins_v3 import _redact_plugin_config
+
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request(
+                "GET",
+                "/plugins",
+                params={"category": category, "project_id": project_id},
+            )
+            if isinstance(res, dict) and isinstance(res.get("plugins"), list):
+                redacted = []
+                for p in res["plugins"]:
+                    if isinstance(p, dict):
+                        p_copy = dict(p)
+                        p_copy["config"] = _redact_plugin_config(p_copy.get("config") or {})
+                        redacted.append(p_copy)
+                    else:
+                        redacted.append(p)
+                res = {**res, "plugins": redacted}
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        registry = get_default_registry()
+        plugins = registry.list_plugins(category=category, project_id=project_id)
+        redacted_plugins: List[Dict[str, Any]] = []
+        for p in plugins:
+            p_copy = dict(p)
+            p_copy["config"] = _redact_plugin_config(p_copy.get("config") or {})
+            redacted_plugins.append(p_copy)
+        health = registry.health_report(project_id=project_id)
+        return json.dumps(
+            {
+                "status": "ok",
+                "project_id": project_id,
+                "category": category,
+                "count": len(redacted_plugins),
+                "plugins": redacted_plugins,
+                "health": health,
+            },
+            default=str,
+            indent=2,
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_list_plugins: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_toggle_plugin",
+    description="Enable, disable, or update configuration for a ProjectBrain v3.0 plugin globally or per project."
+)
+async def projectbrain_toggle_plugin(
+    plugin_id: str,
+    enabled: bool = True,
+    project_id: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Enable, disable, or configure a plugin in ProjectBrain."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        req_role = mcp_request_role.get() or os.getenv("PB_MCP_ROLE")
+        if req_role is not None and str(req_role).strip().lower() != "admin":
+            return "Error: Permission denied. Admin role is required to toggle or configure plugins."
+
+        from ..server.routes.plugins_v3 import _redact_plugin_config
+
+        if is_pb_remote_mode():
+            action = "enable" if enabled else "disable"
+            body: Dict[str, Any] = {}
+            if project_id is not None:
+                body["project_id"] = project_id
+            res = await _pb_remote_v3_request("POST", f"/plugins/{plugin_id}/{action}", json_body=body)
+            if config is not None:
+                cfg_body: Dict[str, Any] = {"config": config}
+                if project_id is not None:
+                    cfg_body["project_id"] = project_id
+                cfg_res = await _pb_remote_v3_request("PUT", f"/plugins/{plugin_id}/config", json_body=cfg_body)
+                if isinstance(cfg_res, dict) and "config" in cfg_res:
+                    cfg_res = {**cfg_res, "config": _redact_plugin_config(cfg_res["config"])}
+                if isinstance(res, dict):
+                    res["config_update"] = cfg_res
+            if isinstance(res, dict) and "config" in res:
+                res = {**res, "config": _redact_plugin_config(res["config"])}
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        registry = get_default_registry()
+        if registry.get(plugin_id) is None:
+            return f"Error: Plugin '{plugin_id}' is not registered."
+
+        if enabled:
+            registry.enable(plugin_id, project_id=project_id)
+        else:
+            registry.disable(plugin_id, project_id=project_id)
+
+        effective_config = registry.get_effective_config(plugin_id, project_id=project_id)
+        if config is not None:
+            effective_config = registry.configure(plugin_id, config, project_id=project_id)
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "plugin_id": plugin_id,
+                "project_id": project_id,
+                "enabled": registry.is_enabled(plugin_id, project_id=project_id),
+                "config": _redact_plugin_config(effective_config),
+            },
+            default=str,
+            indent=2,
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_toggle_plugin: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_v3_ingest_etl",
+    description="Ingest testcases, hardware datasheets, OpenAPI 3.1 specs, C++/Qt/LD artifacts, or documents via v3.0 ETL plugins and sync resulting GraphDelta."
+)
+async def projectbrain_v3_ingest_etl(
+    file_path: Optional[str] = None,
+    content: Optional[str] = None,
+    source_name: str = "input.md",
+    format_hint: Optional[str] = None,
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    version_tag: Optional[str] = None,
+) -> str:
+    """Parse and ingest a source via ProjectBrain v3.0 ETL parser plugins."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        if not file_path and content is None:
+            return "Error: Either 'file_path' or 'content' must be provided."
+
+        validated_path: Optional[Path] = None
+        if file_path is not None:
+            try:
+                validated_path = _validate_mcp_safe_path(file_path)
+            except ValueError as ve:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": f"Invalid or forbidden file_path: {ve}",
+                    },
+                    indent=2,
+                )
+
+        target_proj, target_branch = _resolve_v3_project_branch(project_id, branch)
+
+        if is_pb_remote_mode():
+            payload = {
+                "file_path": file_path,
+                "content": content,
+                "source_name": source_name,
+                "format_hint": format_hint,
+                "project_id": target_proj,
+                "branch": target_branch,
+                "version_tag": version_tag,
+            }
+            res = await _pb_remote_v3_request("POST", "/v3/etl/ingest", json_body=payload, timeout=120.0)
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        from ..graphify_engine.models import GraphDelta
+
+        registry = get_default_registry()
+        preview_text: Optional[str] = None
+        if file_path:
+            src_path = validated_path if validated_path is not None else _validate_mcp_safe_path(file_path)
+            if not src_path.is_file():
+                return f"Error: File '{file_path}' does not exist or is not a file."
+            effective_name = src_path.name
+            source_obj: Any = str(src_path)
+            try:
+                preview_text = src_path.read_bytes()[:4096].decode("utf-8", errors="ignore")
+            except Exception:
+                preview_text = None
+        else:
+            effective_name = source_name or "input.md"
+            source_obj = content or ""
+            preview_text = (content or "")[:4096]
+
+        parser = _select_v3_etl_parser(
+            registry=registry,
+            source_name=effective_name,
+            format_hint=format_hint,
+            content_preview=preview_text,
+            project_id=target_proj,
+        )
+        if parser is None:
+            return f"Error: No enabled ETL parser plugin could handle '{effective_name}' (format_hint={format_hint})."
+
+        parsed = await parser.parse(
+            source=source_obj,
+            source_name=effective_name,
+            project_id=target_proj,
+            branch=target_branch,
+            version_tag=version_tag,
+        )
+
+        # Sync graph delta if nodes or edges were produced
+        graph_sync: Optional[Dict[str, Any]] = None
+        delta_dict = parsed.get("graph_delta")
+        if isinstance(delta_dict, dict) and (delta_dict.get("nodes") or delta_dict.get("edges")):
+            delta = GraphDelta(
+                project_id=target_proj,
+                branch=target_branch,
+                nodes=delta_dict.get("nodes", []),
+                edges=delta_dict.get("edges", []),
+                hyperedges=delta_dict.get("hyperedges", []),
+                node_tombstones=delta_dict.get("node_tombstones", []),
+                edge_tombstones=delta_dict.get("edge_tombstones", []),
+                hyperedge_tombstones=delta_dict.get("hyperedge_tombstones", []),
+                synced_files=delta_dict.get("synced_files", []),
+            )
+            synced_file_set = {
+                sf
+                for sf in (
+                    [effective_name]
+                    + [n.source_file for n in delta.nodes]
+                    + [e.source_file for e in delta.edges]
+                )
+                if sf
+            }
+            store = _get_mcp_graph_store()
+            try:
+                graph_sync = store.sync_branch_delta(
+                    project_id=target_proj,
+                    branch_name=target_branch,
+                    delta=delta,
+                    partial=True,
+                    synced_files=sorted(synced_file_set) or [effective_name],
+                    author=os.getenv("USER", "mcp"),
+                )
+            finally:
+                store.close()
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "plugin_id": parsed.get("plugin_id", parser.metadata.plugin_id),
+                "project_id": target_proj,
+                "branch": target_branch,
+                "version_tag": version_tag,
+                "source_name": effective_name,
+                "canonical_intents_count": len(parsed.get("canonical_intents") or []),
+                "error_rules_count": len(parsed.get("error_rules") or []),
+                "flow_nodes_count": len(parsed.get("flow_nodes") or []),
+                "flow_edges_count": len(parsed.get("flow_edges") or []),
+                "graph_sync": graph_sync,
+                "result": parsed,
+            },
+            default=str,
+            indent=2,
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_v3_ingest_etl: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_v3_script_cache_lookup",
+    description="Look up a verified UDCP script cache entry by intent_id, platform, build_version, and optional screen_hash."
+)
+async def projectbrain_v3_script_cache_lookup(
+    intent_id: str,
+    platform: str,
+    build_version: str,
+    project_id: Optional[str] = None,
+    screen_hash: Optional[str] = None,
+) -> str:
+    """Look up a verified UDCP script in the Layer 1 script cache."""
+    try:
+        target_proj, _ = _resolve_v3_project_branch(project_id)
+
+        if is_pb_remote_mode():
+            payload = {
+                "project_id": target_proj,
+                "intent_id": intent_id,
+                "platform": platform,
+                "build_version": build_version,
+                "screen_hash": screen_hash,
+            }
+            res = await _pb_remote_v3_request("POST", "/v3/script-cache/lookup", json_body=payload)
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        from ..plugins.base import PluginCategory
+
+        registry = get_default_registry()
+        cache_plugin = registry.resolve(PluginCategory.SCRIPT_CACHE, project_id=target_proj)
+        entry = cache_plugin.lookup_script(
+            project_id=target_proj,
+            intent_id=intent_id,
+            platform=platform,
+            build_version=build_version,
+            screen_hash=screen_hash,
+        )
+        return json.dumps(
+            {
+                "status": "ok",
+                "project_id": target_proj,
+                "cache_hit": entry is not None,
+                "entry": entry,
+            },
+            default=str,
+            indent=2,
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_v3_script_cache_lookup: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_v3_script_cache_store",
+    description="Store or update a verified UDCP script cache entry for a test intent, platform, and build version."
+)
+async def projectbrain_v3_script_cache_store(
+    intent_id: str,
+    platform: str,
+    build_version: str,
+    udcp_commands: List[Dict[str, Any]],
+    project_id: Optional[str] = None,
+    screen_hash: str = "",
+    ui_fingerprint: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Store a verified UDCP script in the Layer 1 script cache."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        target_proj, _ = _resolve_v3_project_branch(project_id)
+        payload = {
+            "project_id": target_proj,
+            "intent_id": intent_id,
+            "platform": platform,
+            "build_version": build_version,
+            "udcp_commands": udcp_commands,
+            "screen_hash": screen_hash,
+            "ui_fingerprint": ui_fingerprint or {},
+        }
+
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request("POST", "/v3/script-cache/store", json_body=payload)
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        from ..plugins.base import PluginCategory
+
+        registry = get_default_registry()
+        cache_plugin = registry.resolve(PluginCategory.SCRIPT_CACHE, project_id=target_proj)
+        stored = cache_plugin.store_script(payload)
+        return json.dumps(
+            {
+                "status": "ok",
+                "project_id": target_proj,
+                "entry": stored,
+            },
+            default=str,
+            indent=2,
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_v3_script_cache_store: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_v3_index_artifact",
+    description="Index a synchronized telemetry or evidence artifact (video_h264, har, pcap, crashpad_dmp, gdb_hardfault, uart_log, power_trace_ma, screenshot_png)."
+)
+async def projectbrain_v3_index_artifact(
+    run_id: str,
+    step_id: str,
+    artifact_type: str,
+    uri: str,
+    ntp_timestamp_ms: int,
+    project_id: Optional[str] = None,
+    device_id: str = "",
+    build_version: str = "",
+    retention_days: int = 30,
+    summary_metrics: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Index a synchronized telemetry artifact into the Layer 1 artifact store."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        target_proj, _ = _resolve_v3_project_branch(project_id)
+        payload = {
+            "project_id": target_proj,
+            "run_id": run_id,
+            "step_id": step_id,
+            "artifact_type": artifact_type,
+            "uri": uri,
+            "ntp_timestamp_ms": ntp_timestamp_ms,
+            "device_id": device_id,
+            "build_version": build_version,
+            "retention_days": retention_days,
+            "summary_metrics": summary_metrics or {},
+        }
+
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request("POST", "/v3/artifacts/index", json_body=payload)
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        from ..plugins.base import PluginCategory
+
+        registry = get_default_registry()
+        artifact_plugin = registry.resolve(PluginCategory.ARTIFACT_STORE, project_id=target_proj)
+        indexed = artifact_plugin.index_artifact(payload)
+        return json.dumps(
+            {
+                "status": "ok",
+                "project_id": target_proj,
+                "artifact": indexed,
+            },
+            default=str,
+            indent=2,
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_v3_index_artifact: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_v3_query_evidence_window",
+    description="Query synchronized multimodal telemetry evidence around an NTP timestamp window with video_offset_ms alignment."
+)
+async def projectbrain_v3_query_evidence_window(
+    run_id: str,
+    center_ts_ms: int,
+    window_ms: int = 5000,
+    project_id: Optional[str] = None,
+) -> str:
+    """Query synchronized telemetry artifacts within a +/- window_ms NTP window."""
+    try:
+        target_proj, _ = _resolve_v3_project_branch(project_id)
+
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request(
+                "GET",
+                "/v3/artifacts/window",
+                params={
+                    "run_id": run_id,
+                    "center_ts_ms": center_ts_ms,
+                    "window_ms": window_ms,
+                    "project_id": target_proj,
+                },
+            )
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        from ..plugins.base import PluginCategory
+        from ..server.routes.plugins_v3 import _accepts_kwarg
+
+        registry = get_default_registry()
+        artifact_plugin = registry.resolve(PluginCategory.ARTIFACT_STORE, project_id=target_proj)
+        win_kwargs: Dict[str, Any] = {
+            "run_id": run_id,
+            "center_ts_ms": center_ts_ms,
+            "window_ms": window_ms,
+        }
+        if target_proj and _accepts_kwarg(artifact_plugin.query_evidence_window, "project_id"):
+            win_kwargs["project_id"] = target_proj
+        window = artifact_plugin.query_evidence_window(**win_kwargs)
+        return json.dumps(window, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_v3_query_evidence_window: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_v3_plan_test_dag",
+    description="Plan an impact-driven topological test execution DAG with automatic precondition injection and UDCP script cache bindings."
+)
+async def projectbrain_v3_plan_test_dag(
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    version_tag: Optional[str] = None,
+    srs_diff: str = "",
+    code_diff_files: Optional[List[str]] = None,
+    artifacts: Optional[List[str]] = None,
+    target_devices: Optional[List[str]] = None,
+) -> str:
+    """Plan an impact-driven topological test execution DAG via brain.planner."""
+    try:
+        target_proj, target_branch = _resolve_v3_project_branch(project_id, branch)
+        payload = {
+            "project_id": target_proj,
+            "branch": target_branch,
+            "version_tag": version_tag,
+            "srs_diff": srs_diff,
+            "code_diff_files": code_diff_files or [],
+            "artifacts": artifacts or [],
+            "target_devices": target_devices or [],
+        }
+
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request("POST", "/v3/planner/test-dag", json_body=payload)
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        from ..plugins.base import PluginCategory
+
+        registry = get_default_registry()
+        planner = registry.resolve(
+            PluginCategory.BRAIN_CONSUMER,
+            preferred_id="brain.planner",
+            project_id=target_proj,
+        )
+        res = await planner.execute(payload, registry=registry)
+        return json.dumps(res, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_v3_plan_test_dag: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_v3_oracle_context",
+    description="Evaluate telemetry against SRS acceptance criteria, expected state flow transitions, UART/AT error rules, HardFaults, power budgets, and HTTP responses."
+)
+async def projectbrain_v3_oracle_context(
+    project_id: Optional[str] = None,
+    branch: str = "main",
+    version_tag: Optional[str] = None,
+    test_intent_id: Optional[str] = None,
+    screen_id: Optional[str] = None,
+    telemetry_summary: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Evaluate telemetry against knowledge base rules via brain.oracle."""
+    try:
+        target_proj, target_branch = _resolve_v3_project_branch(project_id, branch)
+        payload = {
+            "project_id": target_proj,
+            "branch": target_branch,
+            "version_tag": version_tag,
+            "test_intent_id": test_intent_id,
+            "screen_id": screen_id,
+            "telemetry_summary": telemetry_summary or {},
+        }
+
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request("POST", "/v3/oracle/context", json_body=payload)
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        from ..plugins.base import PluginCategory
+
+        registry = get_default_registry()
+        oracle = registry.resolve(
+            PluginCategory.BRAIN_CONSUMER,
+            preferred_id="brain.oracle",
+            project_id=target_proj,
+        )
+        res = await oracle.execute(payload, registry=registry)
+        return json.dumps(res, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_v3_oracle_context: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_v3_rca_triage",
+    description="Normalize stacktraces/logs, deduplicate RCA incidents, classify fault domain, extract ticket refs, and apply self-heal feedback to UDCP script cache."
+)
+async def projectbrain_v3_rca_triage(
+    stacktrace_or_log: str,
+    project_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    test_intent_id: Optional[str] = None,
+    cache_id: Optional[str] = None,
+) -> str:
+    """Run deterministic RCA triage and deduplication via brain.rca."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        target_proj, _ = _resolve_v3_project_branch(project_id)
+        payload = {
+            "project_id": target_proj,
+            "stacktrace_or_log": stacktrace_or_log,
+            "run_id": run_id or "",
+            "test_intent_id": test_intent_id,
+            "cache_id": cache_id,
+        }
+
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request("POST", "/v3/rca/triage", json_body=payload)
+            return json.dumps(res, default=str, indent=2)
+
+        from ..plugins.registry import get_default_registry
+        from ..plugins.base import PluginCategory
+
+        registry = get_default_registry()
+        rca = registry.resolve(
+            PluginCategory.BRAIN_CONSUMER,
+            preferred_id="brain.rca",
+            project_id=target_proj,
+        )
+        res = await rca.execute(payload, registry=registry)
+        return json.dumps(res, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_v3_rca_triage: {str(e)}"
 
 
 # Dynamically register custom extensions

@@ -140,6 +140,22 @@ class DB:
                 version=EXCLUDED.version, mean_dim=EXCLUDED.mean_dim, mean_vec=EXCLUDED.mean_vec, 
                 compressed_vec=EXCLUDED.compressed_vec, feedback_score=EXCLUDED.feedback_score"""
 
+        elif "INSERT OR REPLACE INTO memory_branch_links" in sql:
+            sql = sql.replace("INSERT OR REPLACE INTO memory_branch_links", "INSERT INTO memory_branch_links")
+            sql += " ON CONFLICT (project_id, branch) DO UPDATE SET base_branch=EXCLUDED.base_branch, updated_at=EXCLUDED.updated_at"
+
+        elif "INSERT OR REPLACE INTO memory_overlay_tombstones" in sql:
+            sql = sql.replace("INSERT OR REPLACE INTO memory_overlay_tombstones", "INSERT INTO memory_overlay_tombstones")
+            sql += " ON CONFLICT (project_id, branch, target_type, target_key) DO UPDATE SET created_at=EXCLUDED.created_at"
+
+        elif "INSERT OR REPLACE INTO document_versions" in sql:
+            sql = sql.replace("INSERT OR REPLACE INTO document_versions", "INSERT INTO document_versions")
+            sql += " ON CONFLICT (project_id, branch, doc_key, version) DO UPDATE SET parent_version=EXCLUDED.parent_version, base_branch=EXCLUDED.base_branch, filename=EXCLUDED.filename, file_sha256=EXCLUDED.file_sha256, total_units=EXCLUDED.total_units, reused_units=EXCLUDED.reused_units, new_units=EXCLUDED.new_units, deleted_units=EXCLUDED.deleted_units, status=EXCLUDED.status, created_at=EXCLUDED.created_at"
+
+        elif "INSERT OR REPLACE INTO document_units" in sql:
+            sql = sql.replace("INSERT OR REPLACE INTO document_units", "INSERT INTO document_units")
+            sql += " ON CONFLICT (id) DO UPDATE SET project_id=EXCLUDED.project_id, branch=EXCLUDED.branch, doc_key=EXCLUDED.doc_key, version=EXCLUDED.version, unit_index=EXCLUDED.unit_index, unit_type=EXCLUDED.unit_type, unit_title=EXCLUDED.unit_title, unit_sha256=EXCLUDED.unit_sha256, markdown_text=EXCLUDED.markdown_text, memory_ids_json=EXCLUDED.memory_ids_json"
+
         return sql
 
     def execute(self, sql: str, params: tuple = ()):
@@ -267,3 +283,188 @@ def log_maint_op(op_type: str, count: int = 0) -> None:
 
 def transaction():
     return db.conn
+
+
+def _normalize_overlay_key(target_type: str, target_key: str) -> str:
+    raw = str(target_key or "").strip()
+    if target_type == "file":
+        norm = raw.replace("\\", "/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        return norm.lstrip("/")
+    return raw
+
+
+def ensure_memory_overlay_tables() -> None:
+    if db.conn is None:
+        db.connect()
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS memory_branch_links "
+        "(project_id TEXT NOT NULL, branch TEXT NOT NULL, base_branch TEXT NOT NULL, "
+        "updated_at BIGINT, PRIMARY KEY (project_id, branch))"
+    )
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS memory_overlay_tombstones "
+        "(project_id TEXT NOT NULL, branch TEXT NOT NULL, target_type TEXT NOT NULL, "
+        "target_key TEXT NOT NULL, created_at BIGINT, "
+        "PRIMARY KEY (project_id, branch, target_type, target_key))"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mem_tomb_proj_branch "
+        "ON memory_overlay_tombstones(project_id, branch)"
+    )
+    db.commit()
+
+
+def register_memory_branch(project_id: str, branch: str, base_branch: str, max_depth: int = 8) -> None:
+    proj = (project_id or "").strip()
+    br = (branch or "").strip()
+    base = (base_branch or "").strip()
+    if not proj or not br or not base or br == base:
+        return
+
+    ensure_memory_overlay_tables()
+    rows = db.fetchall(
+        "SELECT branch, base_branch FROM memory_branch_links WHERE project_id=?",
+        (proj,),
+    )
+    parent_map: Dict[str, str] = {
+        r["branch"]: r["base_branch"]
+        for r in rows
+        if r.get("branch") and r.get("base_branch")
+    }
+    parent_map[br] = base
+
+    for start_branch in parent_map:
+        visited = {start_branch}
+        cur = parent_map.get(start_branch)
+        depth = 1
+        while cur:
+            if cur in visited:
+                raise ValueError(
+                    f"Cycle detected in memory branch hierarchy: '{br}' -> '{base}'"
+                )
+            visited.add(cur)
+            if depth > max_depth:
+                raise ValueError(
+                    f"Memory branch hierarchy depth exceeds maximum of {max_depth} for branch '{start_branch}'"
+                )
+            nxt = parent_map.get(cur)
+            if not nxt or nxt == cur:
+                break
+            depth += 1
+            cur = nxt
+
+    now_ms = int(time.time() * 1000)
+    db.execute(
+        "INSERT OR REPLACE INTO memory_branch_links(project_id, branch, base_branch, updated_at) VALUES (?,?,?,?)",
+        (proj, br, base, now_ms),
+    )
+    db.commit()
+
+
+def record_memory_tombstone(project_id: str, branch: str, target_type: str, target_key: str) -> None:
+    proj = (project_id or "").strip()
+    br = (branch or "").strip()
+    ttype = (target_type or "").strip()
+    norm_key = _normalize_overlay_key(ttype, target_key)
+    if not proj or not br or not ttype or not norm_key:
+        return
+
+    ensure_memory_overlay_tables()
+    now_ms = int(time.time() * 1000)
+    db.execute(
+        "INSERT OR REPLACE INTO memory_overlay_tombstones(project_id, branch, target_type, target_key, created_at) VALUES (?,?,?,?,?)",
+        (proj, br, ttype, norm_key, now_ms),
+    )
+    db.commit()
+
+
+def get_memory_branch_lineage(project_id: str, branch: str, max_depth: int = 8) -> List[str]:
+    proj = (project_id or "").strip()
+    br = (branch or "").strip()
+    if not br:
+        return []
+    if not proj:
+        return [br]
+
+    ensure_memory_overlay_tables()
+    lineage: List[str] = [br]
+    visited = {br}
+    cur = br
+
+    while len(lineage) <= max_depth:
+        row = db.fetchone(
+            "SELECT base_branch FROM memory_branch_links WHERE project_id=? AND branch=?",
+            (proj, cur),
+        )
+        parent = row["base_branch"].strip() if row and row.get("base_branch") else None
+        if not parent:
+            try:
+                gb_row = db.fetchone(
+                    "SELECT base_branch FROM graph_branches WHERE project_id=? AND branch_name=?",
+                    (proj, cur),
+                )
+                if gb_row and gb_row.get("base_branch"):
+                    parent = str(gb_row["base_branch"]).strip()
+            except Exception:
+                parent = None
+
+        if not parent or parent == cur or parent in visited:
+            break
+        lineage.append(parent)
+        visited.add(parent)
+        cur = parent
+
+    return lineage
+
+
+def get_memory_tombstones(project_id: str, branch: str) -> Dict[str, set]:
+    res: Dict[str, set] = {"file": set(), "doc": set()}
+    proj = (project_id or "").strip()
+    br = (branch or "").strip()
+    if not proj or not br:
+        return res
+
+    ensure_memory_overlay_tables()
+    rows = db.fetchall(
+        "SELECT target_type, target_key FROM memory_overlay_tombstones WHERE project_id=? AND branch=?",
+        (proj, br),
+    )
+    for r in rows:
+        ttype = r.get("target_type")
+        tkey = r.get("target_key")
+        if ttype and tkey:
+            res.setdefault(ttype, set()).add(_normalize_overlay_key(ttype, tkey))
+    return res
+
+
+def ensure_doc_versioning_tables() -> None:
+    if db.conn is None:
+        db.connect()
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS document_versions "
+        "(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, branch TEXT NOT NULL, "
+        "doc_key TEXT NOT NULL, version TEXT NOT NULL, parent_version TEXT, "
+        "base_branch TEXT, filename TEXT NOT NULL, file_sha256 TEXT NOT NULL, "
+        "total_units INTEGER DEFAULT 0, reused_units INTEGER DEFAULT 0, "
+        "new_units INTEGER DEFAULT 0, deleted_units INTEGER DEFAULT 0, "
+        "status TEXT DEFAULT 'active', created_at BIGINT NOT NULL, "
+        "UNIQUE(project_id, branch, doc_key, version))"
+    )
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS document_units "
+        "(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, branch TEXT NOT NULL, "
+        "doc_key TEXT NOT NULL, version TEXT NOT NULL, unit_index INTEGER NOT NULL, "
+        "unit_type TEXT NOT NULL, unit_title TEXT, unit_sha256 TEXT NOT NULL, "
+        "markdown_text TEXT NOT NULL, memory_ids_json TEXT DEFAULT '[]')"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_doc_units_lookup "
+        "ON document_units(project_id, doc_key, unit_sha256)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_doc_versions_lookup "
+        "ON document_versions(project_id, branch, doc_key, status)"
+    )
+    db.commit()

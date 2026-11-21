@@ -185,7 +185,78 @@ class EnvConfig:
         self.ollama_embedding_model = pb_getenv("OM_OLLAMA_EMBEDDING_MODEL")
         self.gemini_embedding_model = pb_getenv("OM_GEMINI_EMBEDDING_MODEL")
         self.aws_embedding_model = pb_getenv("OM_AWS_EMBEDDING_MODEL")
+        self.root_branch = get("graph", "root_branch", "PB_ROOT_BRANCH", "") or pb_getenv("OM_ROOT_BRANCH") or "main"
         self.active_project = None
+
+        # Plugin Microkernel configuration (projectbrain.toml [plugins] & PB_PLUGINS_* env vars)
+        plugins_sec = self._toml.get("plugins", {})
+        if not isinstance(plugins_sec, dict):
+            plugins_sec = {}
+
+        def _parse_plugin_list(raw: Any) -> List[str]:
+            if raw is None:
+                return []
+            if isinstance(raw, str):
+                return [item.strip() for item in raw.split(",") if item.strip()]
+            if isinstance(raw, (list, tuple, set)):
+                return [str(item).strip() for item in raw if str(item).strip()]
+            return []
+
+        raw_plugins_dir = plugins_sec.get("dir")
+        if raw_plugins_dir is None:
+            raw_plugins_dir = plugins_sec.get("plugins_dir")
+        if (
+            raw_plugins_dir is None
+            and isinstance(plugins_sec.get("directories"), list)
+            and plugins_sec["directories"]
+        ):
+            raw_plugins_dir = plugins_sec["directories"][0]
+        if raw_plugins_dir is not None:
+            self.plugins_dir: str = str(raw_plugins_dir)
+        else:
+            self.plugins_dir = s_str(
+                pb_getenv("PB_PLUGINS_DIR") or pb_getenv("OM_PLUGINS_DIR"),
+                "./plugins",
+            )
+
+        raw_plugins_cfg = plugins_sec.get("config_path")
+        if raw_plugins_cfg is None:
+            raw_plugins_cfg = plugins_sec.get("plugins_config_path")
+        if raw_plugins_cfg is not None:
+            self.plugins_config_path: Optional[str] = str(raw_plugins_cfg)
+        else:
+            cfg_env = (
+                pb_getenv("PB_PLUGINS_CONFIG_PATH")
+                or pb_getenv("PB_PLUGINS_CONFIG")
+                or pb_getenv("OM_PLUGINS_CONFIG_PATH")
+            )
+            self.plugins_config_path = str(cfg_env) if cfg_env else None
+
+        raw_enabled = plugins_sec.get("enabled")
+        if raw_enabled is None:
+            raw_enabled = plugins_sec.get("enabled_plugins")
+        if raw_enabled is not None:
+            self.enabled_plugins: List[str] = _parse_plugin_list(raw_enabled)
+        else:
+            merged_enabled: List[str] = []
+            for env_key in ("PB_PLUGINS_ENABLED", "PB_ENABLED_PLUGINS"):
+                for item in _parse_plugin_list(pb_getenv(env_key)):
+                    if item not in merged_enabled:
+                        merged_enabled.append(item)
+            self.enabled_plugins = merged_enabled
+
+        raw_disabled = plugins_sec.get("disabled")
+        if raw_disabled is None:
+            raw_disabled = plugins_sec.get("disabled_plugins")
+        if raw_disabled is not None:
+            self.disabled_plugins: List[str] = _parse_plugin_list(raw_disabled)
+        else:
+            merged_disabled: List[str] = []
+            for env_key in ("PB_PLUGINS_DISABLED", "PB_DISABLED_PLUGINS"):
+                for item in _parse_plugin_list(pb_getenv(env_key)):
+                    if item not in merged_disabled:
+                        merged_disabled.append(item)
+            self.disabled_plugins = merged_disabled
         
     @property
     def database_url(self) -> str:

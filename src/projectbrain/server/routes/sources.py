@@ -50,6 +50,10 @@ class PushDocumentRequest(BaseModel):
     branch: str = "main"
     document: Dict[str, Any]
     graph_delta: Optional[Dict[str, Any]] = None
+    doc_key: Optional[str] = None
+    doc_version: Optional[str] = None
+    base_version: Optional[str] = None
+    base_branch: Optional[str] = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -68,52 +72,40 @@ async def push_processed(req: PushDocumentRequest):
         file_type = doc.get("file_type", "document")
         markdown_content = doc.get("markdown_content", "")
         chunks = doc.get("chunks")
+        precomputed_units = doc.get("units")
+        doc_key = doc.get("doc_key") or req.doc_key
+        doc_version = doc.get("doc_version") or req.doc_version
+        base_version = doc.get("base_version") or req.base_version
+        base_branch = doc.get("base_branch") or req.base_branch
 
-        # Determine effective user_id
-        if ":" in project_id:
-            effective_user_id = project_id
-        elif branch and branch != "main":
-            effective_user_id = f"{project_id}:{branch}"
-        else:
-            effective_user_id = project_id
+        # 1. Versioned ingestion into HSG memory (with unit reuse & superseding)
+        from ...graphify_engine.doc_versioning import ingest_document_versioned
 
-        # 1. Ingest chunks into HSG memory
-        from ...memory.hsg import add_hsg_memory
-        from ...utils.chunking import chunk_text
+        doc_tags = doc.get("tags")
+        if isinstance(doc_tags, str):
+            doc_tags = [t.strip() for t in doc_tags.split(",") if t.strip()]
+        elif not isinstance(doc_tags, list):
+            doc_tags = ["document", file_type] if file_type else ["document"]
 
-        if not chunks and markdown_content:
-            raw_chunks = chunk_text(markdown_content, tgt=768, ovr=0.1)
-            chunks = [{"content": c["text"], "chunk_id": f"p_{i + 1}"} for i, c in enumerate(raw_chunks)]
-
-        memories_created = 0
-        if chunks:
-            for ch in chunks:
-                chunk_text_content = ch.get("content") or ch.get("text") or ""
-                if not chunk_text_content.strip():
-                    continue
-                chunk_tags = ch.get("tags") or ["document", file_type]
-                tag_str = ",".join(chunk_tags) if isinstance(chunk_tags, list) else str(chunk_tags)
-                chunk_meta = {
-                    "source": "push-processed",
-                    "filename": filename,
-                    "sha256": sha256,
-                    "author": author,
-                    "file_type": file_type,
-                    "chunk_id": ch.get("chunk_id"),
-                    "project_id": project_id,
-                    "branch": branch,
-                }
-                await add_hsg_memory(
-                    content=chunk_text_content,
-                    tags=tag_str,
-                    metadata=chunk_meta,
-                    user_id=effective_user_id,
-                )
-                memories_created += 1
+        ver_res = await ingest_document_versioned(
+            filename=filename,
+            markdown_content=markdown_content,
+            chunks=chunks,
+            precomputed_units=precomputed_units,
+            project_id=project_id,
+            branch=branch,
+            author=author,
+            tags=doc_tags,
+            doc_key=doc_key,
+            doc_version=doc_version,
+            base_version=base_version,
+            base_branch=base_branch,
+        )
+        memories_created = ver_res["memories_created"]
+        effective_markdown = ver_res.get("markdown_content") or markdown_content
 
         # 2. Ingest GraphDelta into GraphStore
         from ...graphify_engine.models import GraphDelta
-        from ...graphify_engine.store import get_graph_store
         from ...graphify_engine.extractor import GraphifyExtractor
 
         if req.graph_delta and isinstance(req.graph_delta, dict):
@@ -132,10 +124,16 @@ async def push_processed(req: PushDocumentRequest):
             extractor = GraphifyExtractor()
             delta = extractor.extract_document_graph(
                 file_path=filename,
-                markdown_content=markdown_content,
+                markdown_content=effective_markdown,
                 project_id=project_id,
                 branch=branch,
-                metadata={"author": author, "sha256": sha256, "file_type": file_type},
+                metadata={
+                    "author": author,
+                    "sha256": sha256,
+                    "file_type": file_type,
+                    "doc_key": ver_res["doc_key"],
+                    "doc_version": ver_res["doc_version"],
+                },
             )
 
         store = _get_store()
@@ -147,6 +145,7 @@ async def push_processed(req: PushDocumentRequest):
                 partial=True,
                 synced_files=[filename],
                 author=author,
+                base_branch=ver_res.get("base_branch") or base_branch,
             )
             schema_used = sync_res.get("schema_name") or sync_res.get("schema_used") or ("root" if store.is_root_branch(branch) else f"branch_{branch}")
         finally:
@@ -162,6 +161,14 @@ async def push_processed(req: PushDocumentRequest):
             "nodes_upserted": nodes_upserted,
             "edges_upserted": edges_upserted,
             "memories_created": memories_created,
+            "doc_key": ver_res["doc_key"],
+            "doc_version": ver_res["doc_version"],
+            "parent_version": ver_res["parent_version"],
+            "base_branch": ver_res["base_branch"],
+            "total_units": ver_res["total_units"],
+            "reused_units": ver_res["reused_units"],
+            "new_units": ver_res["new_units"],
+            "deleted_units": ver_res["deleted_units"],
         }
     except HTTPException:
         raise
@@ -176,6 +183,10 @@ async def upload_document(
     branch: str = Form("main"),
     tags: Optional[str] = Form(""),
     author: Optional[str] = Form(None),
+    doc_key: Optional[str] = Form(None),
+    doc_version: Optional[str] = Form(None),
+    base_version: Optional[str] = Form(None),
+    base_branch: Optional[str] = Form(None),
     request: Request = None,
 ):
     from pathlib import Path
@@ -196,20 +207,32 @@ async def upload_document(
         file_bytes = chunk
         filename = safe_name
 
-        # 1. Parse document to markdown using our utility
-        from ...utils.doc_parser import parse_document
-        markdown_content = await parse_document(filename, file_bytes)
-
-        if not markdown_content.strip():
-            raise HTTPException(400, "Document content is empty or could not be parsed.")
-
-        # 2. Add to memory under the project_id (which maps to user_id)
-        from ...main import Memory
-        mem = Memory()
-
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
         if "document" not in tag_list:
             tag_list.append("document")
+
+        # 1. Versioned pre-OCR delta ingestion (avoids eager full-doc OCR on unchanged units)
+        from ...graphify_engine.doc_versioning import ingest_document_versioned
+
+        try:
+            ver_res = await ingest_document_versioned(
+                filename=filename,
+                file_bytes=file_bytes,
+                project_id=project_id,
+                branch=branch,
+                author=author,
+                tags=tag_list,
+                doc_key=doc_key,
+                doc_version=doc_version,
+                base_version=base_version,
+                base_branch=base_branch,
+            )
+        except ValueError as ve:
+            raise HTTPException(400, str(ve))
+
+        markdown_content = ver_res.get("markdown_content", "")
+        if not markdown_content.strip():
+            raise HTTPException(400, "Document content is empty or could not be parsed.")
 
         meta = {
             "source": "upload",
@@ -217,28 +240,18 @@ async def upload_document(
             "size": len(file_bytes),
             "project_id": project_id,
             "branch": branch,
+            "doc_key": ver_res["doc_key"],
+            "doc_version": ver_res["doc_version"],
         }
         if author:
             meta["author"] = author
 
-        user_target = project_id
-        if ":" not in user_target and branch and branch != "main":
-            user_target = f"{project_id}:{branch}"
-
-        res = await mem.add(
-            content=f"Document: {filename}\n\n{markdown_content}",
-            user_id=user_target,
-            meta=meta,
-            tags=tag_list
-        )
-
-        # 3. Extract and sync document graph into GraphStore branch overlay
+        # 2. Extract and sync document graph into GraphStore branch overlay
         nodes_upserted = 0
         edges_upserted = 0
         graphify_synced = False
         try:
             from ...graphify_engine.extractor import GraphifyExtractor
-            from ...graphify_engine.store import get_graph_store
             extractor = GraphifyExtractor()
             delta = extractor.extract_document_graph(
                 file_path=filename,
@@ -256,6 +269,7 @@ async def upload_document(
                     partial=True,
                     synced_files=[filename],
                     author=author or "system",
+                    base_branch=ver_res.get("base_branch") or base_branch,
                 )
             finally:
                 store.close()
@@ -266,21 +280,94 @@ async def upload_document(
             graphify_synced = False
             logger.warning(f"Graphify extraction for uploaded file {filename} skipped or failed: {ge}")
 
+        memory_ids = ver_res.get("memory_ids") or []
         return {
             "status": "success",
             "filename": filename,
             "project_id": project_id,
             "branch": branch,
-            "memory_id": res.get("root_memory_id") or res.get("id"),
+            "memory_id": memory_ids[0] if memory_ids else None,
             "tags": tag_list,
             "graphify_synced": graphify_synced,
             "nodes_upserted": nodes_upserted,
             "edges_upserted": edges_upserted,
+            "doc_key": ver_res["doc_key"],
+            "doc_version": ver_res["doc_version"],
+            "parent_version": ver_res["parent_version"],
+            "total_units": ver_res["total_units"],
+            "reused_units": ver_res["reused_units"],
+            "new_units": ver_res["new_units"],
+            "deleted_units": ver_res["deleted_units"],
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, f"Failed to upload and parse document: {str(e)}")
+
+
+@router.get("/documents")
+async def get_documents(
+    project_id: str = "default",
+    branch: Optional[str] = None,
+    status: str = "active",
+):
+    from ...graphify_engine.doc_versioning import list_documents
+    try:
+        docs = list_documents(project_id=project_id, branch=branch, status=status)
+        return {
+            "project_id": project_id,
+            "branch": branch,
+            "status": status,
+            "documents": docs,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list documents: {str(e)}")
+
+
+@router.get("/documents/{doc_key}/versions")
+async def get_document_versions(
+    doc_key: str,
+    project_id: str = "default",
+    branch: Optional[str] = None,
+):
+    from ...graphify_engine.doc_versioning import list_document_versions
+    try:
+        versions = list_document_versions(project_id=project_id, doc_key=doc_key, branch=branch)
+        return {
+            "project_id": project_id,
+            "doc_key": doc_key,
+            "branch": branch,
+            "versions": versions,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list document versions: {str(e)}")
+
+
+@router.get("/documents/{doc_key}/diff")
+async def get_document_diff(
+    doc_key: str,
+    from_version: str,
+    to_version: str,
+    project_id: str = "default",
+    branch: str = "main",
+    from_branch: Optional[str] = None,
+    to_branch: Optional[str] = None,
+):
+    from ...graphify_engine.doc_versioning import diff_document_versions
+    try:
+        return diff_document_versions(
+            project_id=project_id,
+            doc_key=doc_key,
+            from_version=from_version,
+            to_version=to_version,
+            branch=branch,
+            from_branch=from_branch,
+            to_branch=to_branch,
+        )
+    except (KeyError, ValueError) as not_found_err:
+        raise HTTPException(404, str(not_found_err))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to diff document versions: {str(e)}")
 
 
 class ingest_req(BaseModel):

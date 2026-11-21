@@ -786,6 +786,7 @@ class GraphifyExtractor:
         git_dirty_only: bool = False,
         include_docs: bool = True,
         use_cache: bool = True,
+        base_branch: Optional[str] = None,
     ) -> GraphDelta:
         """
         Extract code AST and semantic document entities across a workspace.
@@ -794,6 +795,7 @@ class GraphifyExtractor:
         - Full workspace scanning.
         - Partial scoped extraction via `scoped_paths`.
         - Incremental git dirty scan (`git_dirty_only=True`).
+        - Git-diff auto-delta against `base_branch` (`base_branch...HEAD` + uncommitted changes).
         - SHA256 content+path caching.
         - Deletion tracking via `.projectbrain/local_graph/manifest.json`.
         """
@@ -802,6 +804,7 @@ class GraphifyExtractor:
 
         target_files: List[Path] = []
         deleted_rel_paths: List[str] = []
+        used_git_diff = False
 
         # 1. Discover Target Files
         if git_dirty_only:
@@ -816,7 +819,23 @@ class GraphifyExtractor:
                         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
                         for f in files:
                             target_files.append(Path(root) / f)
-        else:
+        elif base_branch and base_branch != branch:
+            try:
+                verify_res = subprocess.run(
+                    ["git", "rev-parse", "--verify", base_branch],
+                    cwd=str(ws_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                if verify_res.returncode == 0:
+                    target_files, deleted_rel_paths = self._discover_git_diff(ws_root, base_branch)
+                    used_git_diff = True
+            except Exception as e:
+                logger.debug("git rev-parse verify failed for %s in %s: %s", base_branch, ws_root, e)
+
+        if not git_dirty_only and not scoped_paths and not used_git_diff:
             # Full workspace walk
             for root, dirs, files in os.walk(ws_root):
                 dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
@@ -942,7 +961,89 @@ class GraphifyExtractor:
             edge_tombstones=edge_tombstones,
             hyperedge_tombstones=[],
             synced_files=synced_files,
+            deleted_files=deleted_rel_paths,
+            base_branch=base_branch,
         )
+
+    def _discover_git_diff(self, ws_root: Path, base_branch: str) -> Tuple[List[Path], List[str]]:
+        """Run `git diff --name-status <base_branch>...HEAD` and merge with uncommitted git dirty changes."""
+        target_map: Dict[str, Path] = {}
+        deleted_set: Set[str] = set()
+
+        try:
+            verify_res = subprocess.run(
+                ["git", "rev-parse", "--verify", base_branch],
+                cwd=str(ws_root),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if verify_res.returncode != 0:
+                return [], []
+
+            diff_res = subprocess.run(
+                ["git", "diff", "--name-status", f"{base_branch}...HEAD"],
+                cwd=str(ws_root),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if diff_res.returncode == 0:
+                for line in diff_res.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split("\t")
+                    status = parts[0].strip()
+                    if not status:
+                        continue
+                    if status.startswith("R") and len(parts) >= 3:
+                        old_rel = parts[1].strip().strip('"').replace("\\", "/")
+                        new_rel = parts[2].strip().strip('"').replace("\\", "/")
+                        if old_rel:
+                            deleted_set.add(old_rel)
+                        if new_rel:
+                            p = ws_root / new_rel
+                            if p.is_file():
+                                target_map[new_rel] = p
+                    elif status.startswith("C") and len(parts) >= 3:
+                        new_rel = parts[2].strip().strip('"').replace("\\", "/")
+                        if new_rel:
+                            p = ws_root / new_rel
+                            if p.is_file():
+                                target_map[new_rel] = p
+                    elif status.startswith("D") and len(parts) >= 2:
+                        del_rel = parts[1].strip().strip('"').replace("\\", "/")
+                        if del_rel:
+                            deleted_set.add(del_rel)
+                    elif status[0] in ("A", "M", "T", "C") and len(parts) >= 2:
+                        rel = parts[1].strip().strip('"').replace("\\", "/")
+                        if rel:
+                            p = ws_root / rel
+                            if p.is_file():
+                                target_map[rel] = p
+        except Exception as e:
+            logger.debug("git diff failed against %s in %s: %s", base_branch, ws_root, e)
+
+        dirty_targets, dirty_deleted = self._discover_git_dirty(ws_root)
+        for d_rel in dirty_deleted:
+            norm_d = d_rel.replace("\\", "/")
+            deleted_set.add(norm_d)
+            target_map.pop(norm_d, None)
+
+        for p in dirty_targets:
+            try:
+                norm_rel = str(p.relative_to(ws_root)).replace("\\", "/")
+            except ValueError:
+                norm_rel = str(p).replace("\\", "/")
+            if p.is_file():
+                target_map[norm_rel] = p
+                deleted_set.discard(norm_rel)
+
+        target_files = [p for rel, p in target_map.items() if p.is_file() and rel not in deleted_set]
+        return target_files, sorted(deleted_set)
 
     def _discover_git_dirty(self, ws_root: Path) -> Tuple[List[Path], List[str]]:
         """Run `git status --porcelain` to isolate dirty, added, and deleted files."""
