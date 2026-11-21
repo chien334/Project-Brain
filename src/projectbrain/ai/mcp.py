@@ -1191,6 +1191,52 @@ def get_hybrid_resolver():
     return HybridResolver(store=_get_mcp_graph_store())
 
 @mcp_server.tool(
+    name="projectbrain_hardware_status",
+    description="Inspect read-only hardware acceleration (CUDA, Apple MPS, CPU, ONNX), OCR engines, Graphify compute backend, and local AI server readiness."
+)
+async def projectbrain_hardware_status(
+    ocr_device: Optional[str] = None,
+    graphify_device: Optional[str] = None,
+    semantic_engine: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return combined OCR, Graphify GPU/CPU, and Local AI hardware readiness status."""
+    try:
+        remote_url = os.getenv("PB_REMOTE_URL")
+        if is_pb_remote_mode() or remote_url:
+            import httpx
+
+            server_url = (remote_url or get_pb_server_url()).rstrip("/")
+            api_key = get_pb_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            params: Dict[str, str] = {}
+            if ocr_device is not None:
+                params["ocr_device"] = ocr_device
+            if graphify_device is not None:
+                params["graphify_device"] = graphify_device
+            if semantic_engine is not None:
+                params["semantic_engine"] = semantic_engine
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{server_url}/graphify/hardware",
+                    params=params,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return resp.json()
+
+        from ..server.routes.graphify import collect_hardware_status
+
+        return await collect_hardware_status(
+            ocr_device=ocr_device,
+            graphify_device=graphify_device,
+            semantic_engine=semantic_engine,
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return {"status": "error", "error": str(e)}
+
+
+@mcp_server.tool(
     name="projectbrain_sync_graphify",
     description="Extract AST code graph and document entities via Graphify and synchronize to ProjectBrain local or remote graph store."
 )
@@ -1203,7 +1249,10 @@ async def projectbrain_sync_graphify(
     local_only: bool = False,
     cluster: bool = True,
     include_docs: bool = True,
-    base_branch: Optional[str] = None
+    base_branch: Optional[str] = None,
+    device: Optional[str] = None,
+    workers: Optional[int] = None,
+    semantic_engine: Optional[str] = None,
 ) -> str:
     """
     Extract AST code graph and document entities via Graphify and synchronize to ProjectBrain.
@@ -1225,7 +1274,13 @@ async def projectbrain_sync_graphify(
             target_proj = resolved_proj
             target_branch = branch or "main"
 
-        extractor = GraphifyExtractor()
+        eff_device = device or "auto"
+        eff_semantic_engine = semantic_engine or "auto"
+        extractor = GraphifyExtractor(
+            device=eff_device,
+            workers=workers,
+            semantic_engine=eff_semantic_engine,
+        )
         delta = extractor.extract_workspace(
             workspace_path=workspace_path,
             project_id=target_proj,
@@ -1234,11 +1289,19 @@ async def projectbrain_sync_graphify(
             git_dirty_only=git_dirty_only,
             include_docs=include_docs,
             base_branch=base_branch,
+            device=eff_device,
+            workers=workers,
+            semantic_engine=eff_semantic_engine,
         )
 
         if cluster and delta.nodes:
             try:
-                delta = extractor.cluster_graph(delta)
+                delta = extractor.cluster_graph(
+                    delta,
+                    device=eff_device,
+                    workers=workers,
+                    semantic_engine=eff_semantic_engine,
+                )
             except Exception as ce:
                 logger.debug(f"Clustering skipped: {ce}")
 
@@ -1286,6 +1349,12 @@ async def projectbrain_sync_graphify(
                 "author": os.getenv("USER", "system"),
                 "cluster": False,
             }
+            if device is not None:
+                payload["device"] = device
+            if workers is not None:
+                payload["workers"] = workers
+            if semantic_engine is not None:
+                payload["semantic_engine"] = semantic_engine
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(f"{server_url}/graphify/sync", json=payload, headers=headers)
                 resp.raise_for_status()
@@ -1554,6 +1623,10 @@ async def projectbrain_upload_document(
     doc_version: Optional[str] = None,
     base_version: Optional[str] = None,
     base_branch: Optional[str] = None,
+    ocr_engine: Optional[str] = None,
+    ocr_device: Optional[str] = None,
+    local_ai_model: Optional[str] = None,
+    local_ai_url: Optional[str] = None,
 ) -> str:
     """
     Process and ingest multimodal document into Graphify and ProjectBrain memory.
@@ -1576,7 +1649,7 @@ async def projectbrain_upload_document(
             target_branch = branch or "main"
 
         pipeline = DocumentPipeline()
-        payload = await pipeline.process_file(
+        process_kwargs: Dict[str, Any] = dict(
             file_path=file_path,
             project_id=target_proj,
             branch=target_branch,
@@ -1587,6 +1660,15 @@ async def projectbrain_upload_document(
             base_version=base_version,
             base_branch=base_branch,
         )
+        if ocr_engine is not None:
+            process_kwargs["ocr_engine"] = ocr_engine
+        if ocr_device is not None:
+            process_kwargs["ocr_device"] = ocr_device
+        if local_ai_model is not None:
+            process_kwargs["local_ai_model"] = local_ai_model
+        if local_ai_url is not None:
+            process_kwargs["local_ai_url"] = local_ai_url
+        payload = await pipeline.process_file(**process_kwargs)
 
         should_push = push_to_server if push_to_server is not None else is_pb_remote_mode()
         if should_push:
@@ -1594,6 +1676,14 @@ async def projectbrain_upload_document(
             payload["doc_version"] = doc_version or payload["document"].get("doc_version")
             payload["base_version"] = base_version
             payload["base_branch"] = base_branch or payload["document"].get("base_branch")
+            if ocr_engine is not None:
+                payload["document"]["ocr_engine"] = ocr_engine
+            if ocr_device is not None:
+                payload["document"]["ocr_device"] = ocr_device
+            if local_ai_model is not None:
+                payload["document"]["local_ai_model"] = local_ai_model
+            if local_ai_url is not None:
+                payload["document"]["local_ai_url"] = local_ai_url
             res = await pipeline.push_processed_to_server(
                 server_url=get_pb_server_url(),
                 payload=payload,
@@ -1989,7 +2079,12 @@ async def projectbrain_build_complete_kb(
     branch: str = "main",
     persist_memory: bool = True,
     output_dir: Optional[str] = None,
-    generate_office_exports: bool = True
+    generate_office_exports: bool = True,
+    device: Optional[str] = None,
+    workers: Optional[int] = None,
+    semantic_engine: Optional[str] = None,
+    ocr_engine: Optional[str] = None,
+    ocr_device: Optional[str] = None,
 ) -> str:
     """
     Build and cross-link complete ProjectBrain Knowledge Base for the workspace.
@@ -2020,6 +2115,16 @@ async def projectbrain_build_complete_kb(
                 "output_dir": output_dir,
                 "generate_office_exports": generate_office_exports,
             }
+            if device is not None:
+                payload["device"] = device
+            if workers is not None:
+                payload["workers"] = workers
+            if semantic_engine is not None:
+                payload["semantic_engine"] = semantic_engine
+            if ocr_engine is not None:
+                payload["ocr_engine"] = ocr_engine
+            if ocr_device is not None:
+                payload["ocr_device"] = ocr_device
             async with httpx.AsyncClient(timeout=180.0) as client:
                 resp = await client.post(f"{server_url}/kb/build", json=payload, headers=headers)
                 resp.raise_for_status()
@@ -2034,7 +2139,16 @@ async def projectbrain_build_complete_kb(
             )
             store = _get_mcp_graph_store()
             try:
-                builder = UnifiedKBBuilder(workspace_path=workspace_path)
+                eff_device = device or "auto"
+                eff_ocr_device = ocr_device or "auto"
+                eff_ocr_engine = ocr_engine or "auto"
+                eff_semantic_engine = semantic_engine or "auto"
+                builder = UnifiedKBBuilder(
+                    workspace_path=workspace_path,
+                    device=eff_device,
+                    ocr_device=eff_ocr_device,
+                    ocr_engine=eff_ocr_engine,
+                )
                 res = await builder.build_unified_kb(
                     project_id=target_proj,
                     branch=target_branch,
@@ -2043,6 +2157,11 @@ async def projectbrain_build_complete_kb(
                     generate_office_exports=generate_office_exports,
                     store=store,
                     db_path=db_path,
+                    device=eff_device,
+                    ocr_device=eff_ocr_device,
+                    ocr_engine=eff_ocr_engine,
+                    workers=workers,
+                    semantic_engine=eff_semantic_engine,
                 )
                 return json.dumps(res, indent=2)
             finally:
