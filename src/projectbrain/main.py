@@ -451,7 +451,18 @@ def run_ingest_files(project_id: str, dir_path: str, server_url: Optional[str] =
     import asyncio
     asyncio.run(async_ingest_files(project_id, dir_path, server_url))
 
-def run_upload_file(project_id: str, file_path: str, server_url: str = None, tags: str = "", author: str = None):
+def run_upload_file(
+    project_id: str,
+    file_path: str,
+    server_url: str = None,
+    tags: str = "",
+    author: str = None,
+    branch: str = "main",
+    doc_key: Optional[str] = None,
+    doc_version: Optional[str] = None,
+    base_version: Optional[str] = None,
+    base_branch: Optional[str] = None,
+):
     import os
     import sys
     import httpx
@@ -478,9 +489,18 @@ def run_upload_file(project_id: str, file_path: str, server_url: str = None, tag
             files = {"file": (filename, f, mime_type)}
             data = {
                 "project_id": project_id,
+                "branch": branch or "main",
                 "tags": tags,
-                "author": author or "cli"
+                "author": author or "cli",
             }
+            if doc_key:
+                data["doc_key"] = doc_key
+            if doc_version:
+                data["doc_version"] = doc_version
+            if base_version:
+                data["base_version"] = base_version
+            if base_branch:
+                data["base_branch"] = base_branch
             
             headers = {}
             api_key = os.getenv("PB_API_KEY") or os.getenv("OM_API_KEY")
@@ -514,7 +534,8 @@ def run_graphify_sync(
     scoped_paths: Optional[List[str]] = None,
     git_dirty: bool = False,
     local_only: bool = False,
-    cluster: bool = True
+    cluster: bool = True,
+    base_branch: Optional[str] = None
 ):
     import os
     import sys
@@ -535,7 +556,8 @@ def run_graphify_sync(
         branch=branch,
         scoped_paths=scoped_paths,
         git_dirty_only=git_dirty,
-        include_docs=True
+        include_docs=True,
+        base_branch=base_branch
     )
     if cluster and delta.nodes:
         try:
@@ -561,6 +583,7 @@ def run_graphify_sync(
     payload = {
         "project_id": project_id,
         "branch": branch,
+        "base_branch": base_branch,
         "nodes": [n.to_dict() if hasattr(n, "to_dict") else n.model_dump() for n in delta.nodes],
         "edges": [e.to_dict() if hasattr(e, "to_dict") else e.model_dump() for e in delta.edges],
         "hyperedges": [h.to_dict() if hasattr(h, "to_dict") else h.model_dump() for h in delta.hyperedges],
@@ -568,7 +591,8 @@ def run_graphify_sync(
         "edge_tombstones": delta.edge_tombstones,
         "hyperedge_tombstones": delta.hyperedge_tombstones,
         "synced_files": delta.synced_files,
-        "partial": bool(scoped_paths or git_dirty),
+        "deleted_files": delta.deleted_files,
+        "partial": bool(scoped_paths or git_dirty or (base_branch and base_branch != branch)),
         "author": os.getenv("USER", "cli"),
         "cluster": False,
         "project_path": target_dir
@@ -649,7 +673,11 @@ def run_upload_doc(
     file_path: str,
     branch: str = "main",
     server_url: Optional[str] = None,
-    author: Optional[str] = None
+    author: Optional[str] = None,
+    doc_key: Optional[str] = None,
+    doc_version: Optional[str] = None,
+    base_version: Optional[str] = None,
+    base_branch: Optional[str] = None,
 ):
     import os
     import sys
@@ -671,7 +699,11 @@ def run_upload_doc(
         file_path=file_path,
         project_id=project_id,
         branch=branch,
-        author=author or os.getenv("USER", "cli")
+        author=author or os.getenv("USER", "cli"),
+        doc_key=doc_key,
+        doc_version=doc_version,
+        base_version=base_version,
+        base_branch=base_branch,
     ))
 
     print(f"Pushing processed document and graph delta to {server_url}/sources/push-processed...")
@@ -780,8 +812,462 @@ def run_kb_coverage(
     print(json.dumps(res.model_dump(), indent=2))
 
 
+def run_plugins_cli(
+    action: str = "list",
+    target: Optional[str] = None,
+    project_id: Optional[str] = None,
+    category: Optional[str] = None,
+) -> Dict[str, Any]:
+    import json
+    from .plugins.registry import get_default_registry
+
+    registry = get_default_registry()
+    act = (action or "list").strip().lower()
+
+    if act == "list":
+        plugins = registry.list_plugins(category=category, project_id=project_id)
+        res: Dict[str, Any] = {
+            "status": "ok",
+            "action": "list",
+            "project_id": project_id,
+            "category": category,
+            "count": len(plugins),
+            "plugins": plugins,
+        }
+    elif act == "enable":
+        if not target:
+            print("Usage: python -m projectbrain.main plugins enable <plugin_id> [--project P]")
+            sys.exit(1)
+        if registry.get(target) is None:
+            print(f"Error: Plugin '{target}' is not registered.")
+            sys.exit(1)
+        registry.enable(target, project_id=project_id)
+        res = {
+            "status": "ok",
+            "action": "enable",
+            "plugin_id": target,
+            "project_id": project_id,
+            "enabled": registry.is_enabled(target, project_id=project_id),
+        }
+    elif act == "disable":
+        if not target:
+            print("Usage: python -m projectbrain.main plugins disable <plugin_id> [--project P]")
+            sys.exit(1)
+        if registry.get(target) is None:
+            print(f"Error: Plugin '{target}' is not registered.")
+            sys.exit(1)
+        registry.disable(target, project_id=project_id)
+        res = {
+            "status": "ok",
+            "action": "disable",
+            "plugin_id": target,
+            "project_id": project_id,
+            "enabled": registry.is_enabled(target, project_id=project_id),
+        }
+    elif act == "reload":
+        reload_dir = target or os.getenv("PB_PLUGINS_DIR") or "./plugins"
+        reloaded = registry.reload_directory(reload_dir)
+        res = {
+            "status": "ok",
+            "action": "reload",
+            "directory": os.path.abspath(reload_dir),
+            "reloaded_plugins": reloaded,
+        }
+    else:
+        print(f"Error: Unknown plugins action '{action}'. Supported: list, enable, disable, reload.")
+        sys.exit(1)
+
+    print(json.dumps(res, default=str, indent=2))
+    return res
+
+
+def run_v3_etl(
+    project_id: str,
+    file_path: str,
+    branch: str = "main",
+    version_tag: Optional[str] = None,
+    format_hint: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    import asyncio
+    import json
+    from pathlib import Path
+    from .plugins.registry import get_default_registry
+    from .plugins.base import PluginCategory
+    from .graphify_engine.models import GraphDelta
+    from .graphify_engine.store import get_graph_store
+
+    src_path = Path(file_path)
+    if not src_path.is_file():
+        print(f"Error: File '{file_path}' does not exist or is not a file.")
+        sys.exit(1)
+
+    registry = get_default_registry()
+    parsers = registry.resolve_all(PluginCategory.ETL_PARSER, project_id=project_id)
+    try:
+        preview = src_path.read_bytes()[:4096].decode("utf-8", errors="ignore")
+    except Exception:
+        preview = None
+
+    selected = None
+    if format_hint:
+        hint_lower = format_hint.strip().lower()
+        for p in parsers:
+            if hint_lower in tuple(getattr(p, "supported_formats", ()) or ()) and p.can_parse(
+                src_path.name, format_hint=format_hint, content_preview=preview
+            ):
+                selected = p
+                break
+    if selected is None:
+        generic_ids = {"etl.graphify_ast", "etl.multimodal_doc"}
+        for p in parsers:
+            if p.metadata.plugin_id not in generic_ids and p.can_parse(
+                src_path.name, format_hint=format_hint, content_preview=preview
+            ):
+                selected = p
+                break
+    if selected is None:
+        for p in parsers:
+            if p.can_parse(src_path.name, format_hint=format_hint, content_preview=preview):
+                selected = p
+                break
+
+    if selected is None:
+        print(f"Error: No enabled ETL parser plugin could handle '{file_path}' (format={format_hint}).")
+        sys.exit(1)
+
+    parsed = asyncio.run(
+        selected.parse(
+            source=str(src_path),
+            source_name=src_path.name,
+            project_id=project_id,
+            branch=branch,
+            version_tag=version_tag,
+        )
+    )
+
+    graph_sync: Optional[Dict[str, Any]] = None
+    delta_dict = parsed.get("graph_delta")
+    if isinstance(delta_dict, dict) and (delta_dict.get("nodes") or delta_dict.get("edges")):
+        delta = GraphDelta(
+            project_id=project_id,
+            branch=branch,
+            nodes=delta_dict.get("nodes", []),
+            edges=delta_dict.get("edges", []),
+            hyperedges=delta_dict.get("hyperedges", []),
+            node_tombstones=delta_dict.get("node_tombstones", []),
+            edge_tombstones=delta_dict.get("edge_tombstones", []),
+            hyperedge_tombstones=delta_dict.get("hyperedge_tombstones", []),
+            synced_files=delta_dict.get("synced_files", []),
+        )
+        store = get_graph_store(db_path=db_path)
+        try:
+            graph_sync = store.sync_branch_delta(
+                project_id=project_id,
+                branch_name=branch,
+                delta=delta,
+                partial=True,
+                synced_files=[src_path.name],
+                author=os.getenv("USER", "cli"),
+            )
+        finally:
+            store.close()
+
+    res = {
+        "status": "ok",
+        "plugin_id": parsed.get("plugin_id", selected.metadata.plugin_id),
+        "project_id": project_id,
+        "branch": branch,
+        "version_tag": version_tag,
+        "canonical_intents_count": len(parsed.get("canonical_intents") or []),
+        "error_rules_count": len(parsed.get("error_rules") or []),
+        "graph_sync": graph_sync,
+        "result": parsed,
+    }
+    print(json.dumps(res, default=str, indent=2))
+    return res
+
+
+def run_v3_cache(
+    action: str,
+    project_id: str,
+    intent_id: str,
+    platform: str,
+    build_version: str,
+    screen_hash: Optional[str] = None,
+    udcp_commands: Optional[List[Dict[str, Any]]] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    import json
+    from .plugins.registry import get_default_registry
+    from .plugins.base import PluginCategory
+    from .plugins.builtins.cache_and_artifact_plugins import SqlitePgScriptCachePlugin
+
+    act = (action or "").strip().lower()
+    if act not in ("lookup", "store"):
+        print(f"Error: Unknown v3-cache action '{action}'. Supported: lookup, store.")
+        sys.exit(1)
+
+    owned_plugin = None
+    if db_path:
+        cache_plugin = SqlitePgScriptCachePlugin(db_path=db_path)
+        owned_plugin = cache_plugin
+    else:
+        registry = get_default_registry()
+        cache_plugin = registry.resolve(PluginCategory.SCRIPT_CACHE, project_id=project_id)
+
+    try:
+        if act == "lookup":
+            entry = cache_plugin.lookup_script(
+                project_id=project_id,
+                intent_id=intent_id,
+                platform=platform,
+                build_version=build_version,
+                screen_hash=screen_hash,
+            )
+            res: Dict[str, Any] = {
+                "status": "ok",
+                "action": "lookup",
+                "project_id": project_id,
+                "cache_hit": entry is not None,
+                "entry": entry,
+            }
+        else:
+            stored = cache_plugin.store_script(
+                {
+                    "project_id": project_id,
+                    "intent_id": intent_id,
+                    "platform": platform,
+                    "build_version": build_version,
+                    "screen_hash": screen_hash or "",
+                    "udcp_commands": udcp_commands or [],
+                }
+            )
+            res = {
+                "status": "ok",
+                "action": "store",
+                "project_id": project_id,
+                "entry": stored,
+            }
+    finally:
+        if owned_plugin is not None:
+            owned_plugin.shutdown()
+
+    print(json.dumps(res, default=str, indent=2))
+    return res
+
+
+def run_v3_artifacts(
+    action: str,
+    run_id: Optional[str] = None,
+    center_ts_ms: Optional[int] = None,
+    window_ms: int = 5000,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    import json
+    from .plugins.registry import get_default_registry
+    from .plugins.base import PluginCategory
+    from .plugins.builtins.cache_and_artifact_plugins import LocalSqliteArtifactStorePlugin
+
+    act = (action or "").strip().lower()
+    if act not in ("window", "purge"):
+        print(f"Error: Unknown v3-artifacts action '{action}'. Supported: window, purge.")
+        sys.exit(1)
+
+    owned_plugin = None
+    if db_path:
+        artifact_plugin = LocalSqliteArtifactStorePlugin(db_path=db_path)
+        owned_plugin = artifact_plugin
+    else:
+        registry = get_default_registry()
+        artifact_plugin = registry.resolve(PluginCategory.ARTIFACT_STORE)
+
+    try:
+        if act == "window":
+            if not run_id or center_ts_ms is None:
+                print("Usage: python -m projectbrain.main v3-artifacts window --run-id R --center-ts T [--window-ms W] [--db-path DB]")
+                sys.exit(1)
+            res = artifact_plugin.query_evidence_window(
+                run_id=run_id,
+                center_ts_ms=int(center_ts_ms),
+                window_ms=int(window_ms),
+            )
+        else:
+            res = artifact_plugin.purge_expired()
+    finally:
+        if owned_plugin is not None:
+            owned_plugin.shutdown()
+
+    print(json.dumps(res, default=str, indent=2))
+    return res
+
+
+def run_v3_plan(
+    project_id: str,
+    branch: str = "main",
+    version_tag: Optional[str] = None,
+    files: Optional[List[str]] = None,
+    artifacts: Optional[List[str]] = None,
+    srs_diff: str = "",
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    import asyncio
+    import json
+    from .plugins.registry import get_default_registry
+    from .plugins.base import PluginCategory
+    from .plugins.builtins.cache_and_artifact_plugins import SqlitePgScriptCachePlugin
+    from .graphify_engine.store import get_graph_store
+
+    registry = get_default_registry()
+    planner = registry.resolve(
+        PluginCategory.BRAIN_CONSUMER,
+        preferred_id="brain.planner",
+        project_id=project_id,
+    )
+    ctx: Dict[str, Any] = {}
+    owned_cache = None
+    if db_path:
+        store = get_graph_store(db_path=db_path)
+        try:
+            ctx["graph_data"] = store.get_resolved_subgraph(project_id, branch, limit=100000)
+        finally:
+            store.close()
+        owned_cache = SqlitePgScriptCachePlugin(db_path=db_path)
+        ctx["cache_plugin"] = owned_cache
+
+    try:
+        res = asyncio.run(
+            planner.execute(
+                {
+                    "project_id": project_id,
+                    "branch": branch,
+                    "version_tag": version_tag,
+                    "srs_diff": srs_diff,
+                    "code_diff_files": files or [],
+                    "artifacts": artifacts or [],
+                },
+                registry=registry,
+                context=ctx,
+            )
+        )
+    finally:
+        if owned_cache is not None:
+            owned_cache.shutdown()
+
+    print(json.dumps(res, default=str, indent=2))
+    return res
+
+
+def run_v3_oracle(
+    project_id: str,
+    intent_id: Optional[str] = None,
+    version_tag: Optional[str] = None,
+    uart_log: Optional[str] = None,
+    branch: str = "main",
+    screen_id: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    import asyncio
+    import json
+    from .plugins.registry import get_default_registry
+    from .plugins.base import PluginCategory
+
+    registry = get_default_registry()
+    oracle = registry.resolve(
+        PluginCategory.BRAIN_CONSUMER,
+        preferred_id="brain.oracle",
+        project_id=project_id,
+    )
+
+    log_text = ""
+    if uart_log:
+        if os.path.isfile(uart_log):
+            with open(uart_log, "r", encoding="utf-8", errors="replace") as f:
+                log_text = f.read()
+        else:
+            log_text = uart_log
+
+    telemetry_summary: Dict[str, Any] = {}
+    if log_text:
+        telemetry_summary["uart_log"] = log_text
+
+    ctx: Dict[str, Any] = {}
+    if db_path:
+        from .plugins.builtins.storage_plugins import SqliteOverlayGraphPlugin
+        ctx["graph_plugin"] = SqliteOverlayGraphPlugin(config={"db_path": db_path})
+
+    res = asyncio.run(
+        oracle.execute(
+            {
+                "project_id": project_id,
+                "branch": branch,
+                "version_tag": version_tag,
+                "test_intent_id": intent_id,
+                "screen_id": screen_id,
+                "telemetry_summary": telemetry_summary,
+            },
+            registry=registry,
+            context=ctx,
+        )
+    )
+    print(json.dumps(res, default=str, indent=2))
+    return res
+
+
+def run_v3_rca(
+    project_id: str,
+    log_text_or_file: str,
+    run_id: Optional[str] = None,
+    cache_id: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    import asyncio
+    import json
+    from .plugins.registry import get_default_registry
+    from .plugins.base import PluginCategory
+    from .plugins.builtins.brain_consumer_plugins import RCATriageMemoryPlugin
+
+    if os.path.isfile(log_text_or_file):
+        with open(log_text_or_file, "r", encoding="utf-8", errors="replace") as f:
+            raw_log = f.read()
+    else:
+        raw_log = log_text_or_file
+
+    registry = get_default_registry()
+    owned_rca = None
+    if db_path:
+        rca = RCATriageMemoryPlugin(config={"db_path": db_path})
+        owned_rca = rca
+    else:
+        rca = registry.resolve(
+            PluginCategory.BRAIN_CONSUMER,
+            preferred_id="brain.rca",
+            project_id=project_id,
+        )
+
+    try:
+        res = asyncio.run(
+            rca.execute(
+                {
+                    "project_id": project_id,
+                    "run_id": run_id or "",
+                    "stacktrace_or_log": raw_log,
+                    "cache_id": cache_id,
+                },
+                registry=registry,
+            )
+        )
+    finally:
+        if owned_rca is not None:
+            owned_rca.shutdown()
+
+    print(json.dumps(res, default=str, indent=2))
+    return res
+
+
 _CLI_VALUE_FLAGS = frozenset({
     "--branch",
+    "--base-branch",
     "--url",
     "--scoped",
     "--base",
@@ -790,6 +1276,27 @@ _CLI_VALUE_FLAGS = frozenset({
     "--author",
     "--output",
     "--db-path",
+    "--doc-key",
+    "--doc-version",
+    "--base-version",
+    "--project",
+    "--category",
+    "--version-tag",
+    "--format",
+    "--intent-id",
+    "--platform",
+    "--build-version",
+    "--screen-hash",
+    "--commands",
+    "--run-id",
+    "--center-ts",
+    "--window-ms",
+    "--files",
+    "--artifacts",
+    "--srs-diff",
+    "--uart-log",
+    "--screen-id",
+    "--cache-id",
 })
 
 
@@ -835,17 +1342,18 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "graphify-sync":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 1:
-            print("Usage: python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--url URL] [--scoped P1,P2] [--dirty] [--local-only]")
+            print("Usage: python -m projectbrain.main graphify-sync <project_id> [path] [--branch B] [--base-branch BASE] [--url URL] [--scoped P1,P2] [--dirty] [--local-only]")
             sys.exit(1)
         project_id = pos_args[0]
         workspace_path = pos_args[1] if len(pos_args) > 1 else _get_flag("--path", ".")
         branch = _get_flag("--branch", "main")
+        base_branch = _get_flag("--base-branch", None)
         server_url = _get_flag("--url", None)
         scoped_raw = _get_flag("--scoped", None)
         scoped_paths = [p.strip() for p in scoped_raw.split(",") if p.strip()] if scoped_raw else None
         git_dirty = any(a in sys.argv for a in ["--dirty", "-d"])
         local_only = any(a in sys.argv for a in ["--local-only", "-l"])
-        run_graphify_sync(project_id, workspace_path, branch, server_url, scoped_paths, git_dirty, local_only)
+        run_graphify_sync(project_id, workspace_path, branch, server_url, scoped_paths, git_dirty, local_only, base_branch=base_branch)
     elif len(sys.argv) > 1 and sys.argv[1] == "graphify-diff":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 1:
@@ -861,14 +1369,28 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "upload-doc":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 2:
-            print("Usage: python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--url URL] [--author A]")
+            print("Usage: python -m projectbrain.main upload-doc <project_id> <file_path> [--branch main] [--base-branch BASE] [--doc-key KEY] [--doc-version VER] [--base-version BASE_VER] [--url URL] [--author A]")
             sys.exit(1)
         project_id = pos_args[0]
         file_path = pos_args[1]
         branch = _get_flag("--branch", "main")
         server_url = _get_flag("--url", None)
         author = _get_flag("--author", None)
-        run_upload_doc(project_id, file_path, branch, server_url, author)
+        doc_key = _get_flag("--doc-key", None)
+        doc_version = _get_flag("--doc-version", None)
+        base_version = _get_flag("--base-version", None)
+        base_branch = _get_flag("--base-branch", None)
+        run_upload_doc(
+            project_id,
+            file_path,
+            branch,
+            server_url,
+            author,
+            doc_key=doc_key,
+            doc_version=doc_version,
+            base_version=base_version,
+            base_branch=base_branch,
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "codegraph-sync":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         if len(pos_args) < 1:
@@ -891,15 +1413,32 @@ if __name__ == "__main__":
         dir_path = sys.argv[3]
         run_ingest_files(project_id, dir_path)
     elif len(sys.argv) > 1 and sys.argv[1] == "upload-file":
-        if len(sys.argv) < 4:
-            print("Usage: python -m projectbrain.main upload-file <project_id> <file_path> [url] [tags] [author]")
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 2:
+            print("Usage: python -m projectbrain.main upload-file <project_id> <file_path> [url] [tags] [author] [--branch main] [--base-branch BASE] [--doc-key KEY] [--doc-version VER] [--base-version BASE_VER]")
             sys.exit(1)
-        project_id = sys.argv[2]
-        file_path = sys.argv[3]
-        server_url = sys.argv[4] if len(sys.argv) > 4 else None
-        tags = sys.argv[5] if len(sys.argv) > 5 else ""
-        author = sys.argv[6] if len(sys.argv) > 6 else None
-        run_upload_file(project_id, file_path, server_url, tags, author)
+        project_id = pos_args[0]
+        file_path = pos_args[1]
+        server_url = pos_args[2] if len(pos_args) > 2 else _get_flag("--url", None)
+        tags = pos_args[3] if len(pos_args) > 3 else ""
+        author = pos_args[4] if len(pos_args) > 4 else _get_flag("--author", None)
+        branch = _get_flag("--branch", "main")
+        doc_key = _get_flag("--doc-key", None)
+        doc_version = _get_flag("--doc-version", None)
+        base_version = _get_flag("--base-version", None)
+        base_branch = _get_flag("--base-branch", None)
+        run_upload_file(
+            project_id,
+            file_path,
+            server_url,
+            tags,
+            author,
+            branch=branch,
+            doc_key=doc_key,
+            doc_version=doc_version,
+            base_version=base_version,
+            base_branch=base_branch,
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "build-kb":
         pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
         project_id = pos_args[0] if len(pos_args) > 0 else "project-brain"
@@ -931,6 +1470,138 @@ if __name__ == "__main__":
         workspace_path = _get_flag("--path", ".")
         db_path = _get_flag("--db-path", None)
         run_kb_coverage(project_id, branch, workspace_path, db_path)
+    elif len(sys.argv) > 1 and sys.argv[1] == "plugins":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        action = pos_args[0] if len(pos_args) > 0 else "list"
+        target = pos_args[1] if len(pos_args) > 1 else None
+        project_id = _get_flag("--project", None)
+        category = _get_flag("--category", None)
+        run_plugins_cli(action=action, target=target, project_id=project_id, category=category)
+    elif len(sys.argv) > 1 and sys.argv[1] == "v3-etl":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 2:
+            print("Usage: python -m projectbrain.main v3-etl <project_id> <file_path> [--branch B] [--version-tag V] [--format F] [--db-path DB]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        file_path = pos_args[1]
+        branch = _get_flag("--branch", "main")
+        version_tag = _get_flag("--version-tag", None)
+        format_hint = _get_flag("--format", None)
+        db_path = _get_flag("--db-path", None)
+        run_v3_etl(project_id, file_path, branch=branch, version_tag=version_tag, format_hint=format_hint, db_path=db_path)
+    elif len(sys.argv) > 1 and sys.argv[1] == "v3-cache":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 2:
+            print("Usage: python -m projectbrain.main v3-cache <lookup|store> <project_id> --intent-id I --platform P --build-version V [--screen-hash H] [--commands JSON] [--db-path DB]")
+            sys.exit(1)
+        action = pos_args[0]
+        project_id = pos_args[1]
+        intent_id = _get_flag("--intent-id", None)
+        platform = _get_flag("--platform", None)
+        build_version = _get_flag("--build-version", None)
+        if not intent_id or not platform or not build_version:
+            print("Error: --intent-id, --platform, and --build-version are required for v3-cache.")
+            sys.exit(1)
+        screen_hash = _get_flag("--screen-hash", None)
+        commands_raw = _get_flag("--commands", None)
+        udcp_commands: Optional[List[Dict[str, Any]]] = None
+        if commands_raw:
+            import json as _json
+            if os.path.isfile(str(commands_raw)):
+                with open(str(commands_raw), "r", encoding="utf-8") as f:
+                    udcp_commands = _json.load(f)
+            else:
+                udcp_commands = _json.loads(str(commands_raw))
+        db_path = _get_flag("--db-path", None)
+        run_v3_cache(
+            action=action,
+            project_id=project_id,
+            intent_id=str(intent_id),
+            platform=str(platform),
+            build_version=str(build_version),
+            screen_hash=str(screen_hash) if screen_hash is not None else None,
+            udcp_commands=udcp_commands,
+            db_path=db_path,
+        )
+    elif len(sys.argv) > 1 and sys.argv[1] == "v3-artifacts":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
+            print("Usage: python -m projectbrain.main v3-artifacts <window|purge> [--run-id R] [--center-ts T] [--window-ms W] [--db-path DB]")
+            sys.exit(1)
+        action = pos_args[0]
+        run_id = _get_flag("--run-id", None)
+        center_ts_raw = _get_flag("--center-ts", None)
+        center_ts_ms = int(center_ts_raw) if center_ts_raw is not None else None
+        window_ms = int(_get_flag("--window-ms", 5000))
+        db_path = _get_flag("--db-path", None)
+        run_v3_artifacts(
+            action=action,
+            run_id=str(run_id) if run_id is not None else None,
+            center_ts_ms=center_ts_ms,
+            window_ms=window_ms,
+            db_path=db_path,
+        )
+    elif len(sys.argv) > 1 and sys.argv[1] == "v3-plan":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
+            print("Usage: python -m projectbrain.main v3-plan <project_id> [--branch B] [--version-tag V] [--files f1,f2] [--artifacts a1,a2] [--srs-diff TEXT] [--db-path DB]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        branch = _get_flag("--branch", "main")
+        version_tag = _get_flag("--version-tag", None)
+        files_raw = _get_flag("--files", None)
+        files_list = [f.strip() for f in str(files_raw).split(",") if f.strip()] if files_raw else []
+        artifacts_raw = _get_flag("--artifacts", None)
+        artifacts_list = [a.strip() for a in str(artifacts_raw).split(",") if a.strip()] if artifacts_raw else []
+        srs_diff = _get_flag("--srs-diff", "") or ""
+        db_path = _get_flag("--db-path", None)
+        run_v3_plan(
+            project_id=project_id,
+            branch=branch,
+            version_tag=version_tag,
+            files=files_list,
+            artifacts=artifacts_list,
+            srs_diff=str(srs_diff),
+            db_path=db_path,
+        )
+    elif len(sys.argv) > 1 and sys.argv[1] == "v3-oracle":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 1:
+            print("Usage: python -m projectbrain.main v3-oracle <project_id> [--intent-id I] [--version-tag V] [--uart-log L] [--branch B] [--screen-id S] [--db-path DB]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        intent_id = _get_flag("--intent-id", None)
+        version_tag = _get_flag("--version-tag", None)
+        uart_log = _get_flag("--uart-log", None)
+        branch = _get_flag("--branch", "main")
+        screen_id = _get_flag("--screen-id", None)
+        db_path = _get_flag("--db-path", None)
+        run_v3_oracle(
+            project_id=project_id,
+            intent_id=intent_id,
+            version_tag=version_tag,
+            uart_log=uart_log,
+            branch=branch,
+            screen_id=screen_id,
+            db_path=db_path,
+        )
+    elif len(sys.argv) > 1 and sys.argv[1] == "v3-rca":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        if len(pos_args) < 2:
+            print("Usage: python -m projectbrain.main v3-rca <project_id> <log_text_or_file> [--run-id R] [--cache-id C] [--db-path DB]")
+            sys.exit(1)
+        project_id = pos_args[0]
+        log_text_or_file = pos_args[1]
+        run_id = _get_flag("--run-id", None)
+        cache_id = _get_flag("--cache-id", None)
+        db_path = _get_flag("--db-path", None)
+        run_v3_rca(
+            project_id=project_id,
+            log_text_or_file=log_text_or_file,
+            run_id=run_id,
+            cache_id=cache_id,
+            db_path=db_path,
+        )
     else:
         print("ProjectBrain Python SDK / Server")
         print("Usage:")
@@ -945,3 +1616,10 @@ if __name__ == "__main__":
         print("  python -m projectbrain.main build-kb [project_id] [path] [--branch B] [--no-memory] [--no-office] [--output DIR] [--db-path DB]")
         print("  python -m projectbrain.main kb-trace <project_id> <target> [--branch B] [--path PATH] [--db-path DB]")
         print("  python -m projectbrain.main kb-coverage <project_id> [--branch B] [--path PATH] [--db-path DB]")
+        print("  python -m projectbrain.main plugins [list|enable|disable|reload] [target] [--project P] [--category C]")
+        print("  python -m projectbrain.main v3-etl <project_id> <file_path> [--branch B] [--version-tag V] [--format F] [--db-path DB]")
+        print("  python -m projectbrain.main v3-cache <lookup|store> <project_id> --intent-id I --platform P --build-version V [--db-path DB]")
+        print("  python -m projectbrain.main v3-artifacts <window|purge> [--run-id R] [--center-ts T] [--window-ms W] [--db-path DB]")
+        print("  python -m projectbrain.main v3-plan <project_id> [--branch B] [--version-tag V] [--files f1,f2] [--artifacts a1,a2] [--db-path DB]")
+        print("  python -m projectbrain.main v3-oracle <project_id> [--intent-id I] [--version-tag V] [--uart-log L] [--db-path DB]")
+        print("  python -m projectbrain.main v3-rca <project_id> <log_text_or_file> [--run-id R] [--db-path DB]")

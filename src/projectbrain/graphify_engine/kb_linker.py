@@ -1236,11 +1236,58 @@ class UnifiedKBBuilder:
     cognitive memory persistence, and traceability inspection.
     """
 
-    def __init__(self, workspace_path: Union[str, Path] = "."):
+    def __init__(
+        self,
+        workspace_path: Union[str, Path] = ".",
+        registry: Optional[Any] = None,
+    ):
         self.workspace_path = Path(workspace_path).resolve()
         self.linker = CodeDocLinker(workspace_path=self.workspace_path)
         self.store: Optional[GraphStore] = None
         self.last_drift_items: List[CodeDocDrift] = []
+        if registry is not None:
+            self.registry = registry
+        else:
+            try:
+                from projectbrain.plugins.registry import get_default_registry
+                self.registry = get_default_registry()
+            except Exception:
+                self.registry = None
+
+    @staticmethod
+    def _merge_delta_dict(target: GraphDelta, raw_delta: Optional[Dict[str, Any]], project_id: str) -> None:
+        if not isinstance(raw_delta, dict):
+            return
+        seen_nodes = {n.id for n in target.nodes}
+        for n in raw_delta.get("nodes") or []:
+            node_obj = n if isinstance(n, GraphNode) else GraphNode(**{**n, "project_id": n.get("project_id") or project_id})
+            if node_obj.id not in seen_nodes:
+                target.nodes.append(node_obj)
+                seen_nodes.add(node_obj.id)
+        seen_edges = {(e.source, e.target, e.relation) for e in target.edges}
+        for e in raw_delta.get("edges") or []:
+            edge_obj = e if isinstance(e, GraphEdge) else GraphEdge(**{**e, "project_id": e.get("project_id") or project_id})
+            ek = (edge_obj.source, edge_obj.target, edge_obj.relation)
+            if ek not in seen_edges:
+                target.edges.append(edge_obj)
+                seen_edges.add(ek)
+
+    @staticmethod
+    def _resolve_exporters(active_registry: Optional[Any], project_id: str) -> Dict[str, Any]:
+        exporters_by_fmt: Dict[str, Any] = {}
+        if active_registry is None or not hasattr(active_registry, "resolve_all"):
+            return exporters_by_fmt
+        try:
+            for exp in active_registry.resolve_all("doc_exporter", project_id=project_id):
+                fmt = (
+                    getattr(exp, "export_format", None)
+                    or exp.metadata.plugin_id.rsplit(".", 1)[-1]
+                ).lower()
+                if fmt not in exporters_by_fmt:
+                    exporters_by_fmt[fmt] = exp
+        except Exception as e:
+            logger.debug("doc_exporter plugin resolution skipped: %s", e)
+        return exporters_by_fmt
 
     async def build_unified_kb(
         self,
@@ -1251,21 +1298,28 @@ class UnifiedKBBuilder:
         generate_office_exports: bool = True,
         store: Optional[GraphStore] = None,
         db_path: Optional[str] = None,
+        registry: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         End-to-end execution:
-        1. Extract AST workspace graph with Leiden clustering.
-        2. Synthesize Markdown wiki and multimodal Office exports via ProjectDocSynthesizer (lazy-imported).
+        1. Extract AST workspace graph with Leiden clustering (via etl_parser plugins).
+        2. Synthesize Markdown wiki and multimodal Office exports via doc_exporter plugins.
         3. Ingest and hierarchically chunk all project docs (docs/**, wiki/**, README.md).
-        4. Build symbol index and emit bidirectional cross-linking edges.
+        4. Build symbol index and emit bidirectional cross-linking edges via knowledge_linker plugins.
         5. Persist chunks to HSG cognitive memory and create waypoints between connected chunks.
         6. Enrich GraphNode.metadata in GraphStore and persist manifest.
         """
+        active_registry = registry if registry is not None else self.registry
+
         # 1. Resolve storage backends and database isolation
         if store is not None:
             self.store = store
         else:
-            self.store = get_graph_store(db_path=db_path, root_branch="main")
+            self.store = get_graph_store(
+                db_path=db_path,
+                project_id=project_id,
+                registry=active_registry,
+            )
 
         self.store.ensure_root_schema()
         if not self.store.is_root_branch(branch):
@@ -1280,43 +1334,114 @@ class UnifiedKBBuilder:
         wiki_dir = base_out_dir / "wiki"
         exports_dir = base_out_dir / "exports"
 
-        # 2. Extract AST workspace graph (code and tests)
-        extractor = GraphifyExtractor()
-        graph_delta = extractor.extract_workspace(
-            workspace_path=self.workspace_path,
-            project_id=project_id,
-            branch=branch,
-            include_docs=False,
-        )
+        # 2. Extract AST workspace graph (code and tests) via ETLParserPlugin
+        etl_parsers: List[Any] = []
+        if active_registry is not None and hasattr(active_registry, "resolve_all"):
+            try:
+                etl_parsers = active_registry.resolve_all("etl_parser", project_id=project_id)
+            except Exception as e:
+                logger.debug("etl_parser plugin resolution skipped: %s", e)
 
-        # 3. Concurrency-Safe Integration with TASK-10A (ProjectDocSynthesizer)
-        try:
-            from projectbrain.graphify_engine.doc_synthesizer import ProjectDocSynthesizer
-        except ImportError:
-            ProjectDocSynthesizer = None
+        ast_plugin = None
+        for p in etl_parsers:
+            pid = getattr(getattr(p, "metadata", None), "plugin_id", "")
+            if pid == "etl.multimodal_doc":
+                continue
+            if pid == "etl.graphify_ast" or (
+                hasattr(p, "can_parse") and p.can_parse(str(self.workspace_path), format_hint="workspace")
+            ):
+                ast_plugin = p
+                break
+
+        extractor = GraphifyExtractor(
+            cache_dir=ast_plugin.config.get("cache_dir") if ast_plugin and isinstance(getattr(ast_plugin, "config", None), dict) else None
+        )
+        if ast_plugin is not None and (
+            getattr(getattr(ast_plugin, "metadata", None), "plugin_id", "") != "etl.graphify_ast"
+            or "parse" in getattr(ast_plugin, "__dict__", {})
+            or type(ast_plugin).__name__ != "GraphifyASTETLPlugin"
+        ):
+            parsed_ast = await ast_plugin.parse(
+                str(self.workspace_path),
+                source_name=str(self.workspace_path),
+                project_id=project_id,
+                branch=branch,
+                metadata={"include_docs": False},
+            )
+            graph_delta = GraphDelta(project_id=project_id, branch=branch)
+            self._merge_delta_dict(graph_delta, parsed_ast.get("graph_delta"), project_id)
+        elif ast_plugin is not None or active_registry is None:
+            use_cache = bool(ast_plugin.config.get("use_cache", True)) if ast_plugin else True
+            graph_delta = extractor.extract_workspace(
+                workspace_path=self.workspace_path,
+                project_id=project_id,
+                branch=branch,
+                include_docs=False,
+                use_cache=use_cache,
+            )
+        else:
+            graph_delta = GraphDelta(project_id=project_id, branch=branch)
+
+        # 3. Initial Doc Exports via DocExporterPlugin (with safe fallback)
+        exporters_by_fmt = self._resolve_exporters(active_registry, project_id)
+        export_ctx = {
+            "workspace_path": str(self.workspace_path),
+            "project_id": project_id,
+            "branch": branch,
+        }
 
         synthesizer = None
-        if ProjectDocSynthesizer is not None:
-            synthesizer = ProjectDocSynthesizer(workspace_path=self.workspace_path)
+        if not exporters_by_fmt and active_registry is None:
             try:
+                from projectbrain.graphify_engine.doc_synthesizer import ProjectDocSynthesizer
+                synthesizer = ProjectDocSynthesizer(workspace_path=self.workspace_path)
+            except ImportError:
+                synthesizer = None
+
+        try:
+            if "wiki" in exporters_by_fmt:
+                exporters_by_fmt["wiki"].export(graph_delta, str(wiki_dir), context=export_ctx)
+            elif synthesizer is not None:
                 synthesizer.synthesize_wiki(graph_delta, output_dir=wiki_dir)
-                if generate_office_exports:
+
+            if generate_office_exports:
+                if "docx" in exporters_by_fmt:
+                    exporters_by_fmt["docx"].export(
+                        graph_delta,
+                        str(exports_dir / "ProjectBrain_Architecture_Spec.docx"),
+                        context=export_ctx,
+                    )
+                elif synthesizer is not None:
                     synthesizer.export_docx_specification(
                         graph_delta,
                         output_path=exports_dir / "ProjectBrain_Architecture_Spec.docx",
                     )
+
+                if "pptx" in exporters_by_fmt:
+                    exporters_by_fmt["pptx"].export(
+                        graph_delta,
+                        str(exports_dir / "ProjectBrain_Architecture_Deck.pptx"),
+                        context=export_ctx,
+                    )
+                elif synthesizer is not None:
                     synthesizer.export_pptx_architecture_deck(
                         graph_delta,
                         output_path=exports_dir / "ProjectBrain_Architecture_Deck.pptx",
                     )
-            except Exception as e:
-                logger.warning("ProjectDocSynthesizer initial export warning: %s", e)
+        except Exception as e:
+            logger.warning("DocExporterPlugin initial export warning: %s", e)
 
-        # 4. Ingest and hierarchically chunk all project documentation
+        # 4. Ingest and hierarchically chunk all project documentation + domain ETL parsers
         doc_pipeline = DocumentPipeline(extractor=extractor)
         all_chunks: List[DocChunk] = []
 
         doc_extensions = {".md", ".markdown"} | OFFICE_EXTENSIONS | PAPER_EXTENSIONS
+        extra_etl_parsers = [
+            p
+            for p in etl_parsers
+            if getattr(getattr(p, "metadata", None), "plugin_id", "")
+            not in ("etl.graphify_ast", "etl.multimodal_doc")
+        ]
 
         for root, _, files in os.walk(self.workspace_path):
             rel_root = os.path.relpath(root, self.workspace_path).replace("\\", "/")
@@ -1324,12 +1449,32 @@ class UnifiedKBBuilder:
                 continue
 
             for f in files:
-                ext = Path(f).suffix.lower()
-                if ext not in doc_extensions:
-                    continue
-
                 abs_file = Path(root) / f
                 rel_file = os.path.relpath(abs_file, self.workspace_path).replace("\\", "/")
+                ext = Path(f).suffix.lower()
+
+                if extra_etl_parsers and not rel_root.startswith("docs/kb"):
+                    preview = ""
+                    if ext not in OFFICE_EXTENSIONS and ext != ".pdf":
+                        try:
+                            preview = abs_file.read_text(encoding="utf-8", errors="replace")[:512]
+                        except Exception:
+                            preview = ""
+                    for ep in extra_etl_parsers:
+                        try:
+                            if ep.can_parse(rel_file, content_preview=preview):
+                                ep_res = await ep.parse(
+                                    str(abs_file),
+                                    source_name=rel_file,
+                                    project_id=project_id,
+                                    branch=branch,
+                                )
+                                self._merge_delta_dict(graph_delta, ep_res.get("graph_delta"), project_id)
+                        except Exception as ep_exc:
+                            logger.debug("Extra ETL parser %s skipped %s: %s", getattr(getattr(ep, "metadata", None), "plugin_id", "?"), rel_file, ep_exc)
+
+                if ext not in doc_extensions:
+                    continue
 
                 try:
                     if ext in (".md", ".markdown"):
@@ -1347,26 +1492,91 @@ class UnifiedKBBuilder:
                 except Exception as e:
                     logger.debug("Failed to ingest doc %s: %s", rel_file, e)
 
-        # 5. Build symbol index and emit cross-linking edges & drift
-        symbol_index = self.linker.build_symbol_index(graph_delta)
-        cross_edges, drift_items = self.linker.link_chunks_to_code(all_chunks, symbol_index, graph_delta)
-        test_edges = self.linker.link_tests_to_code(graph_delta, all_chunks)
+        # 5. Build symbol index and emit cross-linking edges & drift via KnowledgeLinkerPlugin
+        linker_plugins: List[Any] = []
+        if active_registry is not None and hasattr(active_registry, "resolve_all"):
+            try:
+                linker_plugins = active_registry.resolve_all("knowledge_linker", project_id=project_id)
+            except Exception as e:
+                logger.debug("knowledge_linker plugin resolution skipped: %s", e)
+
+        code_doc_plugin = next(
+            (lp for lp in linker_plugins if getattr(getattr(lp, "metadata", None), "plugin_id", "") == "linker.code_doc"),
+            None,
+        )
+
+        cross_edges: List[CrossLinkEdge] = []
+        drift_items: List[CodeDocDrift] = []
+        test_edges: List[CrossLinkEdge] = []
+
+        if code_doc_plugin is not None or active_registry is None:
+            if code_doc_plugin is not None and (
+                "link" in getattr(code_doc_plugin, "__dict__", {})
+                or type(code_doc_plugin).__name__ != "CodeDocLinkerPlugin"
+            ):
+                custom_res = code_doc_plugin.link(
+                    project_id=project_id,
+                    branch=branch,
+                    graph_data=graph_delta,
+                    chunks=all_chunks,
+                    context={"workspace_path": str(self.workspace_path)},
+                )
+                for e_dict in custom_res.get("edges") or []:
+                    cross_edges.append(e_dict if isinstance(e_dict, CrossLinkEdge) else CrossLinkEdge(**e_dict))
+                for d_dict in custom_res.get("drift_items") or []:
+                    drift_items.append(d_dict if isinstance(d_dict, CodeDocDrift) else CodeDocDrift(**d_dict))
+            else:
+                symbol_index = self.linker.build_symbol_index(graph_delta)
+                cross_edges, drift_items = self.linker.link_chunks_to_code(all_chunks, symbol_index, graph_delta)
+                test_edges = self.linker.link_tests_to_code(graph_delta, all_chunks)
+
+        for lp in linker_plugins:
+            lpid = getattr(getattr(lp, "metadata", None), "plugin_id", "")
+            if lpid == "linker.code_doc":
+                continue
+            try:
+                lp_res = lp.link(
+                    project_id=project_id,
+                    branch=branch,
+                    graph_data=graph_delta,
+                    chunks=all_chunks,
+                    context={"workspace_path": str(self.workspace_path)},
+                )
+                if isinstance(lp_res, dict):
+                    self._merge_delta_dict(graph_delta, lp_res.get("graph_delta"), project_id)
+                    for e_dict in lp_res.get("edges") or []:
+                        if isinstance(e_dict, CrossLinkEdge):
+                            cross_edges.append(e_dict)
+                        elif isinstance(e_dict, dict) and {"source_id", "target_id", "relation", "confidence", "confidence_score", "evidence"} <= set(e_dict.keys()):
+                            cross_edges.append(CrossLinkEdge(**e_dict))
+            except Exception as lp_exc:
+                logger.debug("KnowledgeLinkerPlugin %s warning: %s", lpid, lp_exc)
+
         all_link_edges = cross_edges + test_edges
         self.last_drift_items = list(drift_items)
 
-        # 6. Post-link trace matrix export if TASK-10A is available
-        if synthesizer is not None and generate_office_exports:
+        # 6. Post-link trace matrix export via DocExporterPlugin
+        if generate_office_exports and ("xlsx" in exporters_by_fmt or synthesizer is not None):
             try:
                 matrix_path = exports_dir / "ProjectBrain_Traceability_Matrix.xlsx"
-                synthesizer.export_xlsx_traceability_matrix(
-                    graph_data=graph_delta,
-                    output_path=matrix_path,
-                    linker_index={
-                        "links": [e.model_dump() for e in all_link_edges],
-                        "chunks": [c.model_dump() for c in all_chunks],
-                        "coverage": {},
-                    },
-                )
+                xlsx_linker_index = {
+                    "links": [e.model_dump() for e in all_link_edges],
+                    "chunks": [c.model_dump() for c in all_chunks],
+                    "coverage": {},
+                }
+                if "xlsx" in exporters_by_fmt:
+                    exporters_by_fmt["xlsx"].export(
+                        graph_delta,
+                        str(matrix_path),
+                        linker_index=xlsx_linker_index,
+                        context=export_ctx,
+                    )
+                elif synthesizer is not None:
+                    synthesizer.export_xlsx_traceability_matrix(
+                        graph_data=graph_delta,
+                        output_path=matrix_path,
+                        linker_index=xlsx_linker_index,
+                    )
             except Exception as e:
                 logger.warning("Traceability matrix export warning: %s", e)
 
@@ -1559,20 +1769,48 @@ class UnifiedKBBuilder:
         coverage_report.orphan_docs = list(set([d.symbol_id for d in drift_items if d.drift_type == "removed_symbol_in_doc"]))
 
         # Export full traceability matrix workbook with populated real coverage stats
-        if synthesizer is not None and generate_office_exports:
+        if generate_office_exports and ("xlsx" in exporters_by_fmt or synthesizer is not None):
             try:
                 matrix_path = exports_dir / "ProjectBrain_Traceability_Matrix.xlsx"
-                synthesizer.export_xlsx_traceability_matrix(
-                    graph_data=graph_delta,
-                    output_path=matrix_path,
+                final_linker_index = {
+                    "links": [e.model_dump() for e in all_link_edges],
+                    "chunks": [c.model_dump() for c in all_chunks],
+                    "coverage": coverage_report.model_dump(),
+                }
+                if "xlsx" in exporters_by_fmt:
+                    exporters_by_fmt["xlsx"].export(
+                        graph_delta,
+                        str(matrix_path),
+                        linker_index=final_linker_index,
+                        context=export_ctx,
+                    )
+                elif synthesizer is not None:
+                    synthesizer.export_xlsx_traceability_matrix(
+                        graph_data=graph_delta,
+                        output_path=matrix_path,
+                        linker_index=final_linker_index,
+                    )
+            except Exception as e:
+                logger.warning("Traceability matrix export warning: %s", e)
+
+        # Invoke any additional custom doc_exporter plugins beyond the standard 4 formats
+        for fmt, exp_plugin in exporters_by_fmt.items():
+            if fmt in ("wiki", "docx", "pptx", "xlsx"):
+                continue
+            try:
+                custom_out = exports_dir / f"ProjectBrain_Export.{fmt}"
+                exp_plugin.export(
+                    graph_delta,
+                    str(custom_out),
                     linker_index={
                         "links": [e.model_dump() for e in all_link_edges],
                         "chunks": [c.model_dump() for c in all_chunks],
                         "coverage": coverage_report.model_dump(),
                     },
+                    context=export_ctx,
                 )
             except Exception as e:
-                logger.warning("Traceability matrix export warning: %s", e)
+                logger.warning("Custom DocExporterPlugin (%s) warning: %s", fmt, e)
 
         base_out_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = base_out_dir / "kb_manifest.json"
@@ -1618,7 +1856,7 @@ class UnifiedKBBuilder:
                     if (self.workspace_path / ".projectbrain" / "kb" / "projectbrain_kb.db").exists()
                     else None)
             )
-            self.store = get_graph_store(db_path=db_path, root_branch="main")
+            self.store = get_graph_store(db_path=db_path)
 
         subgraph = self.store.get_resolved_subgraph(project_id, branch, limit=100000)
         nodes = subgraph.get("nodes", [])
@@ -1775,7 +2013,7 @@ class UnifiedKBBuilder:
                     if (self.workspace_path / ".projectbrain" / "kb" / "projectbrain_kb.db").exists()
                     else None)
             )
-            self.store = get_graph_store(db_path=db_path, root_branch="main")
+            self.store = get_graph_store(db_path=db_path)
 
         subgraph = self.store.get_resolved_subgraph(project_id, branch, limit=100000)
         nodes = subgraph.get("nodes", [])

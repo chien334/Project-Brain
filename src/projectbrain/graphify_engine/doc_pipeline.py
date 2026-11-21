@@ -198,15 +198,31 @@ class DocumentPipeline:
         author: Optional[str] = None,
         tags: Optional[List[str]] = None,
         sector: str = "semantic",
+        doc_key: Optional[str] = None,
+        doc_version: Optional[str] = None,
+        base_version: Optional[str] = None,
+        base_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Process a single document file.
 
-        - Extracts structured Markdown and tables.
+        - Performs pre-OCR unit inspection and reuses unchanged units from prior
+          versions in local document_units (skipping OCR on unchanged PDF pages /
+          PPTX slides).
+        - Extracts structured Markdown and tables for new/changed units.
         - Chunks content into token-sized segments.
         - Constructs GraphDelta with document nodes, section headers, rationale, and citations.
-        - Returns server-ready push payload.
+        - Returns server-ready push payload including unit and versioning metadata.
         """
+        import inspect as _inspect
+        from projectbrain.graphify_engine.doc_versioning import (
+            derive_doc_key,
+            extract_raw_units,
+            lookup_parent_units_by_hash,
+            next_doc_version,
+            resolve_doc_user_id,
+        )
+
         path = Path(file_path).resolve()
         if not path.is_file():
             raise FileNotFoundError(f"Document file not found: {file_path}")
@@ -216,8 +232,94 @@ class DocumentPipeline:
         ext = path.suffix.lower()
         file_type = _classify_document_type(ext)
 
-        # Extract Markdown text representation
-        markdown_content = await self._extract_content(path, raw_bytes)
+        target_proj, target_branch, _ = resolve_doc_user_id(project_id, branch)
+        d_key = derive_doc_key(path.name, doc_key)
+
+        parent_version: Optional[str] = None
+        parent_branch: Optional[str] = None
+        parent_by_hash: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            parent_version, parent_branch, parent_by_hash = lookup_parent_units_by_hash(
+                project_id=target_proj,
+                branch=target_branch,
+                doc_key=d_key,
+                base_version=base_version,
+                base_branch=base_branch,
+            )
+        except Exception as e:
+            logger.debug("Local document_units lookup skipped for %s: %s", path.name, e)
+
+        effective_base_branch = base_branch or (
+            parent_branch if (parent_branch and parent_branch != target_branch) else None
+        )
+        try:
+            d_ver = (
+                doc_version.strip()
+                if (doc_version and str(doc_version).strip())
+                else next_doc_version(target_proj, target_branch, d_key, base_branch=effective_base_branch)
+            )
+        except Exception:
+            d_ver = (doc_version.strip() if (doc_version and str(doc_version).strip()) else "v1")
+
+        resolved_units: List[Dict[str, Any]] = []
+        reused_units = 0
+        new_units = 0
+        markdown_content = ""
+
+        try:
+            raw_units = await extract_raw_units(path.name, raw_bytes)
+            for idx, u in enumerate(raw_units):
+                u_sha = u["unit_sha256"]
+                matched_parent = None
+                if u_sha in parent_by_hash and parent_by_hash[u_sha]:
+                    matched_parent = parent_by_hash[u_sha].pop(0)
+
+                if matched_parent is not None:
+                    reused_units += 1
+                    unit_md = matched_parent.get("markdown_text") or ""
+                    resolved_units.append(
+                        {
+                            "unit_index": idx,
+                            "unit_type": u.get("unit_type") or matched_parent.get("unit_type") or "section",
+                            "unit_title": u.get("unit_title") or matched_parent.get("unit_title") or f"Unit {idx + 1}",
+                            "unit_sha256": u_sha,
+                            "markdown_text": unit_md,
+                            "reused": True,
+                        }
+                    )
+                else:
+                    new_units += 1
+                    if u.get("pre_extracted_text") is not None:
+                        unit_md = str(u["pre_extracted_text"])
+                    elif u.get("parse_fn") is not None:
+                        parsed = u["parse_fn"]()
+                        unit_md = await parsed if _inspect.isawaitable(parsed) else str(parsed)
+                    else:
+                        unit_md = ""
+                    resolved_units.append(
+                        {
+                            "unit_index": idx,
+                            "unit_type": u.get("unit_type") or "section",
+                            "unit_title": u.get("unit_title") or f"Unit {idx + 1}",
+                            "unit_sha256": u_sha,
+                            "markdown_text": unit_md,
+                            "reused": False,
+                        }
+                    )
+
+            markdown_content = "\n\n".join(
+                ru["markdown_text"].strip()
+                for ru in resolved_units
+                if ru.get("markdown_text") and str(ru["markdown_text"]).strip()
+            )
+        except Exception as e:
+            logger.debug("Pre-OCR unit extraction fallback to _extract_content for %s: %s", path.name, e)
+            resolved_units = []
+            reused_units = 0
+            new_units = 0
+
+        if not markdown_content.strip():
+            markdown_content = await self._extract_content(path, raw_bytes)
 
         # Generate semantic chunks
         raw_chunks = chunk_text(markdown_content, tgt=768, ovr=0.1)
@@ -243,6 +345,8 @@ class DocumentPipeline:
             "file_type": file_type,
             "tags": tags or [],
             "sector": sector,
+            "doc_key": d_key,
+            "doc_version": d_ver,
         }
         graph_delta = self.extractor.extract_document_graph(
             file_path=str(file_path),
@@ -268,6 +372,13 @@ class DocumentPipeline:
                 "file_type": file_type,
                 "markdown_content": markdown_content,
                 "chunks": chunks,
+                "units": resolved_units,
+                "doc_key": d_key,
+                "doc_version": d_ver,
+                "parent_version": parent_version,
+                "base_branch": effective_base_branch,
+                "reused_units": reused_units,
+                "new_units": new_units,
             },
             "graph_delta": delta_dict,
         }
@@ -280,6 +391,7 @@ class DocumentPipeline:
         author: Optional[str] = None,
         tags: Optional[List[str]] = None,
         sector: str = "semantic",
+        base_branch: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Process a collection of document files, returning a list of payload dicts."""
         results: List[Dict[str, Any]] = []
@@ -292,6 +404,7 @@ class DocumentPipeline:
                     author=author,
                     tags=tags,
                     sector=sector,
+                    base_branch=base_branch,
                 )
                 results.append(res)
             except Exception as e:

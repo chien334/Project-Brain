@@ -47,6 +47,35 @@ __all__ = [
 ]
 
 
+def _parse_edge_metadata(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _extract_edge_metadata_dict(edge_or_meta: Any) -> Dict[str, Any]:
+    if isinstance(edge_or_meta, dict):
+        return dict(edge_or_meta)
+    if isinstance(edge_or_meta, str):
+        return _parse_edge_metadata(edge_or_meta)
+    if edge_or_meta is None:
+        return {}
+    raw = getattr(edge_or_meta, "metadata", None)
+    if raw is None and hasattr(edge_or_meta, "to_dict"):
+        raw = edge_or_meta.to_dict().get("metadata")
+    return _parse_edge_metadata(raw)
+
+
+def _serialize_edge_metadata(edge_or_meta: Any) -> str:
+    return json.dumps(_extract_edge_metadata_dict(edge_or_meta))
+
+
 def sanitize_branch_schema_name(project_id: str, branch_name: str) -> str:
     """Compute a deterministic, sanitized PostgreSQL schema identifier <= 60 bytes.
 
@@ -102,13 +131,233 @@ class GraphStore(ABC):
             return True
         return branch_name.strip() == self.root_branch
 
+    def get_branch_lineage(self, project_id: str, branch_name: str, max_depth: int = 8) -> List[str]:
+        """Return ordered ancestor lineage [root_branch, ..., parent_branch, branch_name]."""
+        if self.is_root_branch(branch_name):
+            return [self.root_branch]
+        return [self.root_branch, branch_name.strip()]
+
+    def _validate_branch_hierarchy(
+        self,
+        branch_name: str,
+        resolved_base: str,
+        existing_parents: Dict[str, str],
+        max_depth: int = 8,
+    ) -> None:
+        """Validate that setting branch_name -> resolved_base creates no cycle and depth <= max_depth."""
+        visited: Set[str] = {branch_name}
+        cur: Optional[str] = resolved_base
+        depth = 1
+        while cur and not self.is_root_branch(cur):
+            if cur in visited:
+                raise ValueError(f"Cycle detected in branch hierarchy: '{branch_name}' -> '{resolved_base}'")
+            visited.add(cur)
+            depth += 1
+            if depth > max_depth:
+                raise ValueError(f"Branch hierarchy depth exceeds maximum of {max_depth} for branch '{branch_name}'")
+            cur = existing_parents.get(cur)
+
+    def _walk_lineage(
+        self,
+        branch_name: str,
+        parent_map: Dict[str, str],
+        max_depth: int = 8,
+    ) -> List[str]:
+        """Walk parent_map from branch_name up to root_branch, returning [root, ..., branch_name]."""
+        if self.is_root_branch(branch_name):
+            return [self.root_branch]
+        chain: List[str] = []
+        visited: Set[str] = set()
+        cur: Optional[str] = branch_name.strip()
+        while cur and len(chain) <= max_depth:
+            if cur in visited:
+                break
+            visited.add(cur)
+            chain.append(cur)
+            if self.is_root_branch(cur):
+                break
+            parent = parent_map.get(cur)
+            if not parent or parent.strip() == cur:
+                break
+            cur = parent.strip()
+        if not chain or not self.is_root_branch(chain[-1]):
+            chain.append(self.root_branch)
+        chain.reverse()
+        return chain
+
+    def _resolve_multi_level_subgraph(
+        self,
+        project_id: str,
+        branch_name: str,
+        lineage: List[str],
+        files: Optional[List[str]] = None,
+        limit: int = 1000,
+    ) -> Dict[str, Any]:
+        """Resolve multi-level branch lineage by applying overlays sequentially over canonical root."""
+        base = self.get_resolved_subgraph(project_id, self.root_branch, files=None, limit=1_000_000)
+        nodes_map: Dict[str, Dict[str, Any]] = {n["id"]: dict(n) for n in base.get("nodes", [])}
+        edges_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {
+            (e["source"], e["target"], e["relation"]): dict(e) for e in base.get("edges", [])
+        }
+        hyperedges_map: Dict[str, Dict[str, Any]] = {h["id"]: dict(h) for h in base.get("hyperedges", [])}
+
+        for b_name in lineage[1:]:
+            overlay = self._get_branch_overlay(project_id, b_name)
+            for tid in overlay.get("node_tombstones", set()):
+                nodes_map.pop(tid, None)
+            for nid, nd in overlay.get("node_upserts", {}).items():
+                nodes_map[nid] = dict(nd)
+            for ekey in overlay.get("edge_tombstones", set()):
+                edges_map.pop(ekey, None)
+            for ekey, ed in overlay.get("edge_upserts", {}).items():
+                edges_map[ekey] = dict(ed)
+            for htid in overlay.get("hyperedge_tombstones", set()):
+                hyperedges_map.pop(htid, None)
+            for hid, hd in overlay.get("hyperedge_upserts", {}).items():
+                hyperedges_map[hid] = dict(hd)
+
+        resolved_nodes = list(nodes_map.values())
+        if files:
+            file_set = set(files)
+            resolved_nodes = [n for n in resolved_nodes if n.get("source_file") in file_set]
+        resolved_nodes = resolved_nodes[:limit]
+        surviving_ids = {n["id"] for n in resolved_nodes}
+        resolved_edges = [
+            e for e in edges_map.values()
+            if e["source"] in surviving_ids and e["target"] in surviving_ids
+        ]
+        resolved_hyperedges = list(hyperedges_map.values())
+        return {
+            "project_id": project_id,
+            "branch": branch_name,
+            "nodes": resolved_nodes,
+            "edges": resolved_edges,
+            "hyperedges": resolved_hyperedges,
+        }
+
+    def _diff_resolved_subgraphs(
+        self,
+        project_id: str,
+        base_branch: str,
+        target_branch: str,
+        file_filter: Optional[str] = None,
+        community: Optional[int] = None,
+    ) -> BranchDiffResult:
+        """Compute exact structural diff by comparing fully resolved subgraphs of base_branch and target_branch."""
+        sub_a = self.get_resolved_subgraph(project_id, base_branch, limit=1_000_000)
+        sub_b = self.get_resolved_subgraph(project_id, target_branch, limit=1_000_000)
+
+        nodes_a: Dict[str, Dict[str, Any]] = {n["id"]: n for n in sub_a.get("nodes", [])}
+        nodes_b: Dict[str, Dict[str, Any]] = {n["id"]: n for n in sub_b.get("nodes", [])}
+        edges_a: Dict[Tuple[str, str, str], Dict[str, Any]] = {
+            (e["source"], e["target"], e["relation"]): e for e in sub_a.get("edges", [])
+        }
+        edges_b: Dict[Tuple[str, str, str], Dict[str, Any]] = {
+            (e["source"], e["target"], e["relation"]): e for e in sub_b.get("edges", [])
+        }
+
+        new_nodes: List[Dict[str, Any]] = []
+        modified_nodes: List[Dict[str, Any]] = []
+        deleted_node_ids: List[str] = []
+
+        node_attrs = ["label", "file_type", "source_file", "source_location", "community", "metadata"]
+        for nid in set(nodes_a.keys()) | set(nodes_b.keys()):
+            state_a = nodes_a.get(nid)
+            state_b = nodes_b.get(nid)
+            if state_a is None and state_b is not None:
+                new_nodes.append(state_b)
+            elif state_a is not None and state_b is None:
+                deleted_node_ids.append(nid)
+            elif state_a is not None and state_b is not None:
+                if any(state_a.get(k) != state_b.get(k) for k in node_attrs):
+                    modified_nodes.append({
+                        "id": nid,
+                        "label": state_b.get("label"),
+                        "file_type": state_b.get("file_type"),
+                        "source_file": state_b.get("source_file"),
+                        "source_location": state_b.get("source_location"),
+                        "community": state_b.get("community"),
+                        "metadata": state_b.get("metadata"),
+                        "before": state_a,
+                        "after": state_b,
+                    })
+
+        new_edges: List[Dict[str, Any]] = []
+        deleted_edges: List[Dict[str, Any]] = []
+        edge_attrs = ["confidence", "confidence_score", "source_file", "source_location", "weight", "metadata"]
+        for ekey in set(edges_a.keys()) | set(edges_b.keys()):
+            edge_a = edges_a.get(ekey)
+            edge_b = edges_b.get(ekey)
+            if edge_a is None and edge_b is not None:
+                new_edges.append(edge_b)
+            elif edge_a is not None and edge_b is None:
+                deleted_edges.append({"project_id": project_id, "source": ekey[0], "target": ekey[1], "relation": ekey[2]})
+            elif edge_a is not None and edge_b is not None:
+                if any(
+                    (_parse_edge_metadata(edge_a.get(k)) != _parse_edge_metadata(edge_b.get(k)))
+                    if k == "metadata"
+                    else (edge_a.get(k) != edge_b.get(k))
+                    for k in edge_attrs
+                ):
+                    new_edges.append(edge_b)
+
+        if file_filter:
+            new_nodes = [n for n in new_nodes if (n.get("source_file") or "").startswith(file_filter)]
+            modified_nodes = [n for n in modified_nodes if (n.get("source_file") or "").startswith(file_filter)]
+            deleted_node_ids = [
+                nid for nid in deleted_node_ids
+                if nid in nodes_a and (nodes_a[nid].get("source_file") or "").startswith(file_filter)
+            ]
+            new_edges = [e for e in new_edges if (e.get("source_file") or "").startswith(file_filter)]
+            deleted_edges = [
+                e for e in deleted_edges
+                if (
+                    (edges_a.get((e["source"], e["target"], e["relation"]), {}).get("source_file") or "").startswith(file_filter)
+                    or e.get("source") in deleted_node_ids
+                    or e.get("target") in deleted_node_ids
+                )
+            ]
+
+        if community is not None:
+            new_nodes = [n for n in new_nodes if n.get("community") == community]
+            modified_nodes = [
+                n for n in modified_nodes
+                if n.get("community") == community or (n.get("before") and n["before"].get("community") == community)
+            ]
+            deleted_node_ids = [
+                nid for nid in deleted_node_ids
+                if nid in nodes_a and nodes_a[nid].get("community") == community
+            ]
+
+        summary = BranchDiffSummary(
+            new_nodes_count=len(new_nodes),
+            modified_nodes_count=len(modified_nodes),
+            deleted_nodes_count=len(deleted_node_ids),
+            new_edges_count=len(new_edges),
+            deleted_edges_count=len(deleted_edges),
+        )
+        return BranchDiffResult(
+            summary=summary,
+            new_nodes=new_nodes,
+            modified_nodes=modified_nodes,
+            deleted_node_ids=deleted_node_ids,
+            new_edges=new_edges,
+            deleted_edges=deleted_edges,
+        )
+
     @abstractmethod
     def ensure_root_schema(self) -> None:
         """Create root schema and base tables (pb_root or root_*) if not existing."""
         pass
 
     @abstractmethod
-    def ensure_branch_schema(self, project_id: str, branch_name: str, author: str = "system") -> str:
+    def ensure_branch_schema(
+        self,
+        project_id: str,
+        branch_name: str,
+        author: str = "system",
+        base_branch: Optional[str] = None,
+    ) -> str:
         """Create and register branch schema overlay. Returns schema name."""
         pass
 
@@ -122,6 +371,7 @@ class GraphStore(ABC):
         synced_files: Optional[List[str]] = None,
         deleted_files: Optional[List[str]] = None,
         author: str = "system",
+        base_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Apply full or partial graph delta into the target branch overlay schema."""
         pass
@@ -150,8 +400,13 @@ class GraphStore(ABC):
         pass
 
     @abstractmethod
-    def promote_branch_to_root(self, project_id: str, branch_name: str) -> Dict[str, Any]:
-        """Atomically merge branch overlay mutations into canonical root schema and drop schema."""
+    def promote_branch_to_root(
+        self,
+        project_id: str,
+        branch_name: str,
+        target_branch: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Atomically merge branch overlay mutations into canonical root or target parent branch and drop schema."""
         pass
 
     @abstractmethod
@@ -231,6 +486,11 @@ class GraphStore(ABC):
         """Unified O(Delta_A cup Delta_B) branch comparison algorithm."""
         if base_branch == target_branch:
             return BranchDiffResult(summary=BranchDiffSummary())
+
+        lineage_a = self.get_branch_lineage(project_id, base_branch)
+        lineage_b = self.get_branch_lineage(project_id, target_branch)
+        if len(lineage_a) > 2 or len(lineage_b) > 2:
+            return self._diff_resolved_subgraphs(project_id, base_branch, target_branch, file_filter, community)
 
         if self.is_root_branch(base_branch):
             return self.diff_branch_vs_root(project_id, target_branch, file_filter, community)
@@ -377,8 +637,13 @@ class GraphStore(ABC):
             elif edge_a is not None and edge_b is None:
                 deleted_edges.append({"project_id": project_id, "source": ekey[0], "target": ekey[1], "relation": ekey[2]})
             elif edge_a is not None and edge_b is not None:
-                attrs = ["confidence", "confidence_score", "source_file", "source_location", "weight"]
-                if any(edge_a.get(k) != edge_b.get(k) for k in attrs):
+                attrs = ["confidence", "confidence_score", "source_file", "source_location", "weight", "metadata"]
+                if any(
+                    (_parse_edge_metadata(edge_a.get(k)) != _parse_edge_metadata(edge_b.get(k)))
+                    if k == "metadata"
+                    else (edge_a.get(k) != edge_b.get(k))
+                    for k in attrs
+                ):
                     new_edges.append(edge_b)
 
         # Filters
@@ -463,6 +728,7 @@ class GraphStore(ABC):
                     "confidence": e.get("confidence", "EXTRACTED"),
                     "confidence_score": e.get("confidence_score", 1.0),
                     "weight": e.get("weight", 1.0),
+                    "metadata": _parse_edge_metadata(e.get("metadata")),
                 })
 
         return {
@@ -552,9 +818,15 @@ class SqliteOverlayGraphStore(GraphStore):
                 source_file TEXT,
                 source_location TEXT,
                 weight REAL DEFAULT 1.0,
+                metadata TEXT DEFAULT '{}',
                 created_at TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (project_id, source, target, relation)
             )""")
+            existing_edge_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(root_edges)").fetchall()
+            }
+            if "metadata" not in existing_edge_cols:
+                conn.execute("ALTER TABLE root_edges ADD COLUMN metadata TEXT DEFAULT '{}'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_root_edges_src ON root_edges(project_id, source)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_root_edges_tgt ON root_edges(project_id, target)")
 
@@ -584,11 +856,46 @@ class SqliteOverlayGraphStore(GraphStore):
                 PRIMARY KEY (project_id, branch_name)
             )""")
 
-    def ensure_branch_schema(self, project_id: str, branch_name: str, author: str = "system") -> str:
+    def get_branch_lineage(self, project_id: str, branch_name: str, max_depth: int = 8) -> List[str]:
+        if self.is_root_branch(branch_name):
+            return [self.root_branch]
+        conn = self.get_conn()
+        parent_map: Dict[str, str] = {}
+        try:
+            rows = conn.execute(
+                "SELECT branch_name, base_branch FROM graph_branches WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+            for r in rows:
+                if r["branch_name"] and r["base_branch"]:
+                    parent_map[r["branch_name"]] = r["base_branch"]
+        except sqlite3.OperationalError:
+            pass
+        return self._walk_lineage(branch_name, parent_map, max_depth=max_depth)
+
+    def ensure_branch_schema(
+        self,
+        project_id: str,
+        branch_name: str,
+        author: str = "system",
+        base_branch: Optional[str] = None,
+    ) -> str:
         self.ensure_root_schema()
         schema_name = sanitize_branch_schema_name(project_id, branch_name)
         clean_proj = project_id.replace("'", "''")
         conn = self.get_conn()
+
+        existing_rows = conn.execute(
+            "SELECT branch_name, base_branch FROM graph_branches WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+        existing_parents = {r["branch_name"]: r["base_branch"] for r in existing_rows if r["branch_name"]}
+
+        if base_branch and base_branch.strip() and base_branch.strip() != branch_name:
+            resolved_base = base_branch.strip()
+            self._validate_branch_hierarchy(branch_name, resolved_base, existing_parents, max_depth=8)
+        else:
+            resolved_base = existing_parents.get(branch_name) or self.root_branch
 
         with conn:
             # Upsert registry record
@@ -598,9 +905,10 @@ class SqliteOverlayGraphStore(GraphStore):
                 VALUES (?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT (project_id, branch_name) DO UPDATE SET
                     schema_name = excluded.schema_name,
+                    base_branch = excluded.base_branch,
                     updated_at = datetime('now')
                 """,
-                (project_id, branch_name, schema_name, self.root_branch, author),
+                (project_id, branch_name, schema_name, resolved_base, author),
             )
 
             # Overlay tables for delta storage
@@ -638,9 +946,15 @@ class SqliteOverlayGraphStore(GraphStore):
                 source_file TEXT,
                 source_location TEXT,
                 weight REAL DEFAULT 1.0,
+                metadata TEXT DEFAULT '{{}}',
                 created_at TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (project_id, source, target, relation)
             )""")
+            edge_upsert_cols = {
+                r[1] for r in conn.execute(f"PRAGMA table_info({schema_name}_edge_upserts)").fetchall()
+            }
+            if "metadata" not in edge_upsert_cols:
+                conn.execute(f"ALTER TABLE {schema_name}_edge_upserts ADD COLUMN metadata TEXT DEFAULT '{{}}'")
 
             conn.execute(f"""
             CREATE TABLE IF NOT EXISTS {schema_name}_edge_tombstones (
@@ -698,9 +1012,11 @@ class SqliteOverlayGraphStore(GraphStore):
             conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_edges")
             conn.execute(f"""
             CREATE VIEW {schema_name}_v_resolved_edges AS
-            SELECT * FROM {schema_name}_edge_upserts
+            SELECT project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata, created_at
+            FROM {schema_name}_edge_upserts
             UNION ALL
-            SELECT r.* FROM root_edges r
+            SELECT r.project_id, r.source, r.target, r.relation, r.confidence, r.confidence_score, r.source_file, r.source_location, r.weight, r.metadata, r.created_at
+            FROM root_edges r
             WHERE r.project_id = '{clean_proj}'
               AND (r.source, r.target, r.relation) NOT IN (
                   SELECT source, target, relation FROM {schema_name}_edge_tombstones WHERE project_id = '{clean_proj}'
@@ -732,6 +1048,7 @@ class SqliteOverlayGraphStore(GraphStore):
         synced_files: Optional[List[str]] = None,
         deleted_files: Optional[List[str]] = None,
         author: str = "system",
+        base_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         self.ensure_root_schema()
         conn = self.get_conn()
@@ -740,16 +1057,18 @@ class SqliteOverlayGraphStore(GraphStore):
             # Direct application into root schema
             return self._sync_to_root(project_id, delta, partial, synced_files, deleted_files)
 
-        schema_name = self.ensure_branch_schema(project_id, branch_name, author)
+        schema_name = self.ensure_branch_schema(project_id, branch_name, author, base_branch=base_branch)
+        lineage = self.get_branch_lineage(project_id, branch_name)
+        parent_branch = lineage[-2] if len(lineage) >= 2 else self.root_branch
 
         with conn:
             if not partial:
-                # Full sync on branch: compute delta relative to root
-                return self._sync_branch_full(conn, project_id, branch_name, schema_name, delta)
+                # Full sync on branch: compute delta relative to parent branch
+                return self._sync_branch_full(conn, project_id, branch_name, schema_name, delta, parent_branch=parent_branch)
             else:
                 # Partial sync on branch: scoped to synced_files & deleted_files
                 return self._sync_branch_partial(
-                    conn, project_id, branch_name, schema_name, delta, synced_files, deleted_files
+                    conn, project_id, branch_name, schema_name, delta, synced_files, deleted_files, parent_branch=parent_branch
                 )
 
     def _sync_to_root(
@@ -843,18 +1162,20 @@ class SqliteOverlayGraphStore(GraphStore):
 
             # Upsert edges
             for e in delta.edges:
+                edge_meta_json = _serialize_edge_metadata(e)
                 conn.execute(
                     """
-                    INSERT INTO root_edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO root_edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
                         confidence = excluded.confidence,
                         confidence_score = excluded.confidence_score,
                         source_file = excluded.source_file,
                         source_location = excluded.source_location,
-                        weight = excluded.weight
+                        weight = excluded.weight,
+                        metadata = excluded.metadata
                     """,
-                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                 )
                 edges_upserted += 1
 
@@ -898,19 +1219,40 @@ class SqliteOverlayGraphStore(GraphStore):
         branch_name: str,
         schema_name: str,
         delta: GraphDelta,
+        parent_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
-        # Fetch root state
-        root_nodes_rows = conn.execute("SELECT * FROM root_nodes WHERE project_id = ?", (project_id,)).fetchall()
-        root_nodes = {r["id"]: dict(r) for r in root_nodes_rows}
-        for r in root_nodes.values():
-            if isinstance(r["metadata"], str):
-                try:
-                    r["metadata"] = json.loads(r["metadata"])
-                except Exception:
-                    pass
+        # Fetch baseline state (fast root path or resolved parent branch state)
+        if parent_branch and not self.is_root_branch(parent_branch):
+            parent_state = self.get_resolved_subgraph(project_id, parent_branch, limit=1_000_000)
+            root_nodes = {n["id"]: dict(n) for n in parent_state.get("nodes", [])}
+            for r in root_nodes.values():
+                if isinstance(r.get("metadata"), str):
+                    try:
+                        r["metadata"] = json.loads(r["metadata"])
+                    except Exception:
+                        pass
+                elif r.get("metadata") is None:
+                    r["metadata"] = {}
+            root_edges = {
+                (e["source"], e["target"], e["relation"]): dict(e)
+                for e in parent_state.get("edges", [])
+            }
+        else:
+            root_nodes_rows = conn.execute("SELECT * FROM root_nodes WHERE project_id = ?", (project_id,)).fetchall()
+            root_nodes = {r["id"]: dict(r) for r in root_nodes_rows}
+            for r in root_nodes.values():
+                if isinstance(r["metadata"], str):
+                    try:
+                        r["metadata"] = json.loads(r["metadata"])
+                    except Exception:
+                        pass
 
-        root_edges_rows = conn.execute("SELECT * FROM root_edges WHERE project_id = ?", (project_id,)).fetchall()
-        root_edges = {(r["source"], r["target"], r["relation"]): dict(r) for r in root_edges_rows}
+            root_edges_rows = conn.execute("SELECT * FROM root_edges WHERE project_id = ?", (project_id,)).fetchall()
+            root_edges = {}
+            for row in root_edges_rows:
+                rd = dict(row)
+                rd["metadata"] = _parse_edge_metadata(rd.get("metadata"))
+                root_edges[(rd["source"], rd["target"], rd["relation"])] = rd
 
         # Clear existing branch overlay
         conn.execute(f"DELETE FROM {schema_name}_node_upserts WHERE project_id = ?", (project_id,))
@@ -979,15 +1321,17 @@ class SqliteOverlayGraphStore(GraphStore):
         for e in delta.edges:
             ekey = (e.source, e.target, e.relation)
             delta_edge_keys.add(ekey)
+            edge_meta_dict = _extract_edge_metadata_dict(e)
+            edge_meta_json = json.dumps(edge_meta_dict)
 
             if ekey not in root_edges:
                 conn.execute(
                     f"""
                     INSERT INTO {schema_name}_edge_upserts
-                    (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                 )
                 edges_upserted += 1
             else:
@@ -998,15 +1342,16 @@ class SqliteOverlayGraphStore(GraphStore):
                     or (r["source_file"] or None) != (e.source_file or None)
                     or (r["source_location"] or None) != (e.source_location or None)
                     or abs(r["weight"] - e.weight) > 1e-4
+                    or _parse_edge_metadata(r.get("metadata")) != edge_meta_dict
                 )
                 if differs:
                     conn.execute(
                         f"""
                         INSERT INTO {schema_name}_edge_upserts
-                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                     )
                     edges_upserted += 1
 
@@ -1073,6 +1418,7 @@ class SqliteOverlayGraphStore(GraphStore):
         delta: GraphDelta,
         synced_files: Optional[List[str]],
         deleted_files: Optional[List[str]],
+        parent_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         synced_file_set: Set[str] = set(synced_files or [
             sf["file_path"] if isinstance(sf, dict) else sf for sf in delta.synced_files
@@ -1086,24 +1432,53 @@ class SqliteOverlayGraphStore(GraphStore):
         edges_upserted = 0
         edges_tombstoned = 0
 
+        use_parent_state = bool(parent_branch and not self.is_root_branch(parent_branch))
+        parent_nodes_by_file: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        parent_edges_by_file: Dict[str, Dict[Tuple[str, str, str], Dict[str, Any]]] = {}
+        if use_parent_state and (deleted_file_set or synced_file_set):
+            parent_state = self.get_resolved_subgraph(project_id, parent_branch, limit=1_000_000)
+            all_target_files = deleted_file_set | synced_file_set
+            for n in parent_state.get("nodes", []):
+                sf = n.get("source_file")
+                if sf in all_target_files:
+                    nd = dict(n)
+                    if isinstance(nd.get("metadata"), str):
+                        try:
+                            nd["metadata"] = json.loads(nd["metadata"])
+                        except Exception:
+                            pass
+                    elif nd.get("metadata") is None:
+                        nd["metadata"] = {}
+                    parent_nodes_by_file.setdefault(sf, {})[nd["id"]] = nd
+            for e in parent_state.get("edges", []):
+                sf = e.get("source_file")
+                if sf in all_target_files:
+                    parent_edges_by_file.setdefault(sf, {})[(e["source"], e["target"], e["relation"])] = dict(e)
+
         # 1. Process deleted files
         for fpath in deleted_file_set:
             # Drop previous branch upserts for this file
             conn.execute(f"DELETE FROM {schema_name}_node_upserts WHERE project_id = ? AND source_file = ?", (project_id, fpath))
             conn.execute(f"DELETE FROM {schema_name}_edge_upserts WHERE project_id = ? AND source_file = ?", (project_id, fpath))
 
-            # Tombstone all root nodes belonging to this file
-            root_nodes = conn.execute("SELECT id FROM root_nodes WHERE project_id = ? AND source_file = ?", (project_id, fpath)).fetchall()
-            for r in root_nodes:
+            # Tombstone all baseline nodes belonging to this file
+            if use_parent_state:
+                base_del_nodes = list(parent_nodes_by_file.get(fpath, {}).values())
+            else:
+                base_del_nodes = conn.execute("SELECT id FROM root_nodes WHERE project_id = ? AND source_file = ?", (project_id, fpath)).fetchall()
+            for r in base_del_nodes:
                 conn.execute(
                     f"INSERT OR IGNORE INTO {schema_name}_node_tombstones (project_id, id) VALUES (?, ?)",
                     (project_id, r["id"]),
                 )
                 nodes_tombstoned += 1
 
-            # Tombstone all root edges belonging to this file
-            root_edges = conn.execute("SELECT source, target, relation FROM root_edges WHERE project_id = ? AND source_file = ?", (project_id, fpath)).fetchall()
-            for r in root_edges:
+            # Tombstone all baseline edges belonging to this file
+            if use_parent_state:
+                base_del_edges = list(parent_edges_by_file.get(fpath, {}).values())
+            else:
+                base_del_edges = conn.execute("SELECT source, target, relation FROM root_edges WHERE project_id = ? AND source_file = ?", (project_id, fpath)).fetchall()
+            for r in base_del_edges:
                 conn.execute(
                     f"INSERT OR IGNORE INTO {schema_name}_edge_tombstones (project_id, source, target, relation) VALUES (?, ?, ?, ?)",
                     (project_id, r["source"], r["target"], r["relation"]),
@@ -1118,17 +1493,25 @@ class SqliteOverlayGraphStore(GraphStore):
             conn.execute(f"DELETE FROM {schema_name}_node_upserts WHERE project_id = ? AND source_file = ?", (project_id, fpath))
             conn.execute(f"DELETE FROM {schema_name}_edge_upserts WHERE project_id = ? AND source_file = ?", (project_id, fpath))
 
-            root_nodes_rows = conn.execute("SELECT * FROM root_nodes WHERE project_id = ? AND source_file = ?", (project_id, fpath)).fetchall()
-            root_nodes = {r["id"]: dict(r) for r in root_nodes_rows}
-            for r in root_nodes.values():
-                if isinstance(r["metadata"], str):
-                    try:
-                        r["metadata"] = json.loads(r["metadata"])
-                    except Exception:
-                        pass
+            if use_parent_state:
+                root_nodes = parent_nodes_by_file.get(fpath, {})
+                root_edges = parent_edges_by_file.get(fpath, {})
+            else:
+                root_nodes_rows = conn.execute("SELECT * FROM root_nodes WHERE project_id = ? AND source_file = ?", (project_id, fpath)).fetchall()
+                root_nodes = {r["id"]: dict(r) for r in root_nodes_rows}
+                for r in root_nodes.values():
+                    if isinstance(r["metadata"], str):
+                        try:
+                            r["metadata"] = json.loads(r["metadata"])
+                        except Exception:
+                            pass
 
-            root_edges_rows = conn.execute("SELECT * FROM root_edges WHERE project_id = ? AND source_file = ?", (project_id, fpath)).fetchall()
-            root_edges = {(r["source"], r["target"], r["relation"]): dict(r) for r in root_edges_rows}
+                root_edges_rows = conn.execute("SELECT * FROM root_edges WHERE project_id = ? AND source_file = ?", (project_id, fpath)).fetchall()
+                root_edges = {}
+                for row in root_edges_rows:
+                    rd = dict(row)
+                    rd["metadata"] = _parse_edge_metadata(rd.get("metadata"))
+                    root_edges[(rd["source"], rd["target"], rd["relation"])] = rd
 
             # File scoped delta entities
             delta_file_nodes = [n for n in delta.nodes if n.source_file == fpath]
@@ -1200,6 +1583,8 @@ class SqliteOverlayGraphStore(GraphStore):
 
             for e in delta_file_edges:
                 ekey = (e.source, e.target, e.relation)
+                edge_meta_dict = _extract_edge_metadata_dict(e)
+                edge_meta_json = json.dumps(edge_meta_dict)
                 conn.execute(
                     f"DELETE FROM {schema_name}_edge_tombstones WHERE project_id = ? AND source = ? AND target = ? AND relation = ?",
                     (project_id, e.source, e.target, e.relation),
@@ -1208,10 +1593,10 @@ class SqliteOverlayGraphStore(GraphStore):
                     conn.execute(
                         f"""
                         INSERT INTO {schema_name}_edge_upserts
-                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                     )
                     edges_upserted += 1
                 else:
@@ -1221,15 +1606,16 @@ class SqliteOverlayGraphStore(GraphStore):
                         or abs(r["confidence_score"] - e.confidence_score) > 1e-4
                         or (r["source_location"] or None) != (e.source_location or None)
                         or abs(r["weight"] - e.weight) > 1e-4
+                        or _parse_edge_metadata(r.get("metadata")) != edge_meta_dict
                     )
                     if differs:
                         conn.execute(
                             f"""
                             INSERT INTO {schema_name}_edge_upserts
-                            (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
-                            (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                            (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                         )
                         edges_upserted += 1
 
@@ -1321,6 +1707,7 @@ class SqliteOverlayGraphStore(GraphStore):
         try:
             for r in conn.execute(f"SELECT * FROM {schema_name}_edge_upserts WHERE project_id = ?", (project_id,)).fetchall():
                 d = dict(r)
+                d["metadata"] = _parse_edge_metadata(d.get("metadata"))
                 edge_upserts[(d["source"], d["target"], d["relation"])] = d
         except sqlite3.OperationalError:
             pass
@@ -1395,7 +1782,9 @@ class SqliteOverlayGraphStore(GraphStore):
                 (project_id, s, t, rel),
             ).fetchone()
             if r:
-                res[(s, t, rel)] = dict(r)
+                d = dict(r)
+                d["metadata"] = _parse_edge_metadata(d.get("metadata"))
+                res[(s, t, rel)] = d
         return res
 
     def diff_branch_vs_root(
@@ -1407,6 +1796,10 @@ class SqliteOverlayGraphStore(GraphStore):
     ) -> BranchDiffResult:
         if self.is_root_branch(branch_name):
             return BranchDiffResult(summary=BranchDiffSummary())
+
+        lineage = self.get_branch_lineage(project_id, branch_name)
+        if len(lineage) > 2:
+            return self._diff_resolved_subgraphs(project_id, self.root_branch, branch_name, file_filter, community)
 
         overlay = self._get_branch_overlay(project_id, branch_name)
         upsert_ids = list(overlay["node_upserts"].keys())
@@ -1490,99 +1883,238 @@ class SqliteOverlayGraphStore(GraphStore):
     ) -> BranchDiffResult:
         return self._diff_branches_core(project_id, base_branch, target_branch, file_filter, community)
 
-    def promote_branch_to_root(self, project_id: str, branch_name: str) -> Dict[str, Any]:
+    def promote_branch_to_root(
+        self,
+        project_id: str,
+        branch_name: str,
+        target_branch: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if self.is_root_branch(branch_name):
             return {"status": "noop", "message": "Already root branch"}
+
+        effective_target = target_branch.strip() if (target_branch and target_branch.strip()) else self.root_branch
+        if effective_target == branch_name.strip():
+            return {"status": "noop", "message": "Source and target branch are identical"}
 
         overlay = self._get_branch_overlay(project_id, branch_name)
         schema_name = overlay["schema_name"]
         conn = self.get_conn()
 
-        with conn:
-            # 1. Apply node tombstones
-            for tid in overlay["node_tombstones"]:
-                conn.execute("DELETE FROM root_nodes WHERE project_id = ? AND id = ?", (project_id, tid))
+        if self.is_root_branch(effective_target):
+            with conn:
+                # 1. Apply node tombstones
+                for tid in overlay["node_tombstones"]:
+                    conn.execute("DELETE FROM root_nodes WHERE project_id = ? AND id = ?", (project_id, tid))
 
-            # 2. Apply node upserts
-            for nid, n in overlay["node_upserts"].items():
-                meta_json = json.dumps(n["metadata"]) if isinstance(n.get("metadata"), dict) else str(n.get("metadata", "{}"))
+                # 2. Apply node upserts
+                for nid, n in overlay["node_upserts"].items():
+                    meta_json = json.dumps(n["metadata"]) if isinstance(n.get("metadata"), dict) else str(n.get("metadata", "{}"))
+                    conn.execute(
+                        """
+                        INSERT INTO root_nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT (project_id, id) DO UPDATE SET
+                            label = excluded.label,
+                            file_type = excluded.file_type,
+                            source_file = excluded.source_file,
+                            source_location = excluded.source_location,
+                            community = excluded.community,
+                            metadata = excluded.metadata,
+                            updated_at = datetime('now')
+                        """,
+                        (n["id"], project_id, n["label"], n["file_type"], n["source_file"], n.get("source_location"), n.get("community"), meta_json),
+                    )
+
+                # 3. Apply edge tombstones
+                for s, t, rel in overlay["edge_tombstones"]:
+                    conn.execute("DELETE FROM root_edges WHERE project_id = ? AND source = ? AND target = ? AND relation = ?", (project_id, s, t, rel))
+
+                # 4. Apply edge upserts
+                for ekey, e in overlay["edge_upserts"].items():
+                    edge_meta_json = _serialize_edge_metadata(e.get("metadata"))
+                    conn.execute(
+                        """
+                        INSERT INTO root_edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
+                            confidence = excluded.confidence,
+                            confidence_score = excluded.confidence_score,
+                            source_file = excluded.source_file,
+                            source_location = excluded.source_location,
+                            weight = excluded.weight,
+                            metadata = excluded.metadata
+                        """,
+                        (project_id, e["source"], e["target"], e["relation"], e["confidence"], e["confidence_score"], e.get("source_file"), e.get("source_location"), e["weight"], edge_meta_json),
+                    )
+
+                # 4b. Apply hyperedge tombstones
+                for htid in overlay.get("hyperedge_tombstones", set()):
+                    conn.execute("DELETE FROM root_hyperedges WHERE project_id = ? AND id = ?", (project_id, htid))
+
+                # 4c. Apply hyperedge upserts
+                for hid, h in overlay.get("hyperedge_upserts", {}).items():
+                    nodes_val = json.dumps(h["nodes"]) if not isinstance(h.get("nodes"), str) else h["nodes"]
+                    conn.execute(
+                        """
+                        INSERT INTO root_hyperedges (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (project_id, id) DO UPDATE SET
+                            label = excluded.label,
+                            nodes = excluded.nodes,
+                            relation = excluded.relation,
+                            confidence = excluded.confidence,
+                            confidence_score = excluded.confidence_score,
+                            source_file = excluded.source_file
+                        """,
+                        (h["id"], project_id, h["label"], nodes_val, h["relation"], h["confidence"], h["confidence_score"], h.get("source_file")),
+                    )
+
+                # 5. Drop overlay tables & views
+                conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_nodes")
+                conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_edges")
+                conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_hyperedges")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_node_upserts")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_node_tombstones")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_edge_upserts")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_edge_tombstones")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_hyperedge_upserts")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_hyperedge_tombstones")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_synced_files")
+
+                # 6. Delete branch registration & reparent children to root
+                conn.execute("DELETE FROM graph_branches WHERE project_id = ? AND branch_name = ?", (project_id, branch_name))
                 conn.execute(
-                    """
-                    INSERT INTO root_nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                    ON CONFLICT (project_id, id) DO UPDATE SET
-                        label = excluded.label,
-                        file_type = excluded.file_type,
-                        source_file = excluded.source_file,
-                        source_location = excluded.source_location,
-                        community = excluded.community,
-                        metadata = excluded.metadata,
-                        updated_at = datetime('now')
-                    """,
-                    (n["id"], project_id, n["label"], n["file_type"], n["source_file"], n.get("source_location"), n.get("community"), meta_json),
+                    "UPDATE graph_branches SET base_branch = ?, updated_at = datetime('now') WHERE project_id = ? AND base_branch = ?",
+                    (self.root_branch, project_id, branch_name),
                 )
+        else:
+            target_schema = self.ensure_branch_schema(project_id, effective_target)
+            target_lineage = self.get_branch_lineage(project_id, effective_target)
+            target_parent = target_lineage[-2] if len(target_lineage) >= 2 else self.root_branch
+            target_parent_state = self.get_resolved_subgraph(project_id, target_parent, limit=1_000_000)
+            target_parent_node_ids = {n["id"] for n in target_parent_state.get("nodes", [])}
+            target_parent_edge_keys = {(e["source"], e["target"], e["relation"]) for e in target_parent_state.get("edges", [])}
+            target_parent_hyperedge_ids = {h["id"] for h in target_parent_state.get("hyperedges", [])}
 
-            # 3. Apply edge tombstones
-            for s, t, rel in overlay["edge_tombstones"]:
-                conn.execute("DELETE FROM root_edges WHERE project_id = ? AND source = ? AND target = ? AND relation = ?", (project_id, s, t, rel))
+            with conn:
+                # 1. Node tombstones into target_branch overlay
+                for tid in overlay["node_tombstones"]:
+                    conn.execute(f"DELETE FROM {target_schema}_node_upserts WHERE project_id = ? AND id = ?", (project_id, tid))
+                    if tid in target_parent_node_ids:
+                        conn.execute(
+                            f"INSERT OR IGNORE INTO {target_schema}_node_tombstones (project_id, id) VALUES (?, ?)",
+                            (project_id, tid),
+                        )
 
-            # 4. Apply edge upserts
-            for ekey, e in overlay["edge_upserts"].items():
+                # 2. Node upserts into target_branch overlay
+                for nid, n in overlay["node_upserts"].items():
+                    meta_json = json.dumps(n["metadata"]) if isinstance(n.get("metadata"), dict) else str(n.get("metadata", "{}"))
+                    conn.execute(f"DELETE FROM {target_schema}_node_tombstones WHERE project_id = ? AND id = ?", (project_id, nid))
+                    conn.execute(
+                        f"""
+                        INSERT INTO {target_schema}_node_upserts
+                        (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT (project_id, id) DO UPDATE SET
+                            label = excluded.label,
+                            file_type = excluded.file_type,
+                            source_file = excluded.source_file,
+                            source_location = excluded.source_location,
+                            community = excluded.community,
+                            metadata = excluded.metadata,
+                            updated_at = datetime('now')
+                        """,
+                        (n["id"], project_id, n["label"], n["file_type"], n["source_file"], n.get("source_location"), n.get("community"), meta_json),
+                    )
+
+                # 3. Edge tombstones into target_branch overlay
+                for s, t, rel in overlay["edge_tombstones"]:
+                    conn.execute(
+                        f"DELETE FROM {target_schema}_edge_upserts WHERE project_id = ? AND source = ? AND target = ? AND relation = ?",
+                        (project_id, s, t, rel),
+                    )
+                    if (s, t, rel) in target_parent_edge_keys:
+                        conn.execute(
+                            f"INSERT OR IGNORE INTO {target_schema}_edge_tombstones (project_id, source, target, relation) VALUES (?, ?, ?, ?)",
+                            (project_id, s, t, rel),
+                        )
+
+                # 4. Edge upserts into target_branch overlay
+                for ekey, e in overlay["edge_upserts"].items():
+                    edge_meta_json = _serialize_edge_metadata(e.get("metadata"))
+                    conn.execute(
+                        f"DELETE FROM {target_schema}_edge_tombstones WHERE project_id = ? AND source = ? AND target = ? AND relation = ?",
+                        (project_id, e["source"], e["target"], e["relation"]),
+                    )
+                    conn.execute(
+                        f"""
+                        INSERT INTO {target_schema}_edge_upserts
+                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
+                            confidence = excluded.confidence,
+                            confidence_score = excluded.confidence_score,
+                            source_file = excluded.source_file,
+                            source_location = excluded.source_location,
+                            weight = excluded.weight,
+                            metadata = excluded.metadata
+                        """,
+                        (project_id, e["source"], e["target"], e["relation"], e["confidence"], e["confidence_score"], e.get("source_file"), e.get("source_location"), e["weight"], edge_meta_json),
+                    )
+
+                # 4b. Hyperedge tombstones into target_branch overlay
+                for htid in overlay.get("hyperedge_tombstones", set()):
+                    conn.execute(f"DELETE FROM {target_schema}_hyperedge_upserts WHERE project_id = ? AND id = ?", (project_id, htid))
+                    if htid in target_parent_hyperedge_ids:
+                        conn.execute(
+                            f"INSERT OR IGNORE INTO {target_schema}_hyperedge_tombstones (project_id, id) VALUES (?, ?)",
+                            (project_id, htid),
+                        )
+
+                # 4c. Hyperedge upserts into target_branch overlay
+                for hid, h in overlay.get("hyperedge_upserts", {}).items():
+                    nodes_val = json.dumps(h["nodes"]) if not isinstance(h.get("nodes"), str) else h["nodes"]
+                    conn.execute(f"DELETE FROM {target_schema}_hyperedge_tombstones WHERE project_id = ? AND id = ?", (project_id, hid))
+                    conn.execute(
+                        f"""
+                        INSERT INTO {target_schema}_hyperedge_upserts
+                        (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (project_id, id) DO UPDATE SET
+                            label = excluded.label,
+                            nodes = excluded.nodes,
+                            relation = excluded.relation,
+                            confidence = excluded.confidence,
+                            confidence_score = excluded.confidence_score,
+                            source_file = excluded.source_file
+                        """,
+                        (h["id"], project_id, h["label"], nodes_val, h["relation"], h["confidence"], h["confidence_score"], h.get("source_file")),
+                    )
+
+                # 5. Drop source overlay tables & views
+                conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_nodes")
+                conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_edges")
+                conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_hyperedges")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_node_upserts")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_node_tombstones")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_edge_upserts")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_edge_tombstones")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_hyperedge_upserts")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_hyperedge_tombstones")
+                conn.execute(f"DROP TABLE IF EXISTS {schema_name}_synced_files")
+
+                # 6. Delete source branch registration & reparent children to target_branch
+                conn.execute("DELETE FROM graph_branches WHERE project_id = ? AND branch_name = ?", (project_id, branch_name))
                 conn.execute(
-                    """
-                    INSERT INTO root_edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
-                        confidence = excluded.confidence,
-                        confidence_score = excluded.confidence_score,
-                        source_file = excluded.source_file,
-                        source_location = excluded.source_location,
-                        weight = excluded.weight
-                    """,
-                    (project_id, e["source"], e["target"], e["relation"], e["confidence"], e["confidence_score"], e.get("source_file"), e.get("source_location"), e["weight"]),
+                    "UPDATE graph_branches SET base_branch = ?, updated_at = datetime('now') WHERE project_id = ? AND base_branch = ? AND branch_name != ?",
+                    (effective_target, project_id, branch_name, effective_target),
                 )
-
-            # 4b. Apply hyperedge tombstones
-            for htid in overlay.get("hyperedge_tombstones", set()):
-                conn.execute("DELETE FROM root_hyperedges WHERE project_id = ? AND id = ?", (project_id, htid))
-
-            # 4c. Apply hyperedge upserts
-            for hid, h in overlay.get("hyperedge_upserts", {}).items():
-                nodes_val = json.dumps(h["nodes"]) if not isinstance(h.get("nodes"), str) else h["nodes"]
-                conn.execute(
-                    """
-                    INSERT INTO root_hyperedges (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (project_id, id) DO UPDATE SET
-                        label = excluded.label,
-                        nodes = excluded.nodes,
-                        relation = excluded.relation,
-                        confidence = excluded.confidence,
-                        confidence_score = excluded.confidence_score,
-                        source_file = excluded.source_file
-                    """,
-                    (h["id"], project_id, h["label"], nodes_val, h["relation"], h["confidence"], h["confidence_score"], h.get("source_file")),
-                )
-
-            # 5. Drop overlay tables & views
-            conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_nodes")
-            conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_edges")
-            conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_hyperedges")
-            conn.execute(f"DROP TABLE IF EXISTS {schema_name}_node_upserts")
-            conn.execute(f"DROP TABLE IF EXISTS {schema_name}_node_tombstones")
-            conn.execute(f"DROP TABLE IF EXISTS {schema_name}_edge_upserts")
-            conn.execute(f"DROP TABLE IF EXISTS {schema_name}_edge_tombstones")
-            conn.execute(f"DROP TABLE IF EXISTS {schema_name}_hyperedge_upserts")
-            conn.execute(f"DROP TABLE IF EXISTS {schema_name}_hyperedge_tombstones")
-            conn.execute(f"DROP TABLE IF EXISTS {schema_name}_synced_files")
-
-            # 6. Delete branch registration
-            conn.execute("DELETE FROM graph_branches WHERE project_id = ? AND branch_name = ?", (project_id, branch_name))
 
         return {
             "status": "promoted",
             "project_id": project_id,
             "branch": branch_name,
+            "target_branch": effective_target,
             "upserted_nodes": len(overlay["node_upserts"]),
             "deleted_nodes": len(overlay["node_tombstones"]),
             "upserted_edges": len(overlay["edge_upserts"]),
@@ -1614,6 +2146,11 @@ class SqliteOverlayGraphStore(GraphStore):
             edges_rows = conn.execute("SELECT * FROM root_edges WHERE project_id = ?", (project_id,)).fetchall()
             hyperedges_rows = conn.execute("SELECT * FROM root_hyperedges WHERE project_id = ?", (project_id,)).fetchall()
         else:
+            lineage = self.get_branch_lineage(project_id, branch_name)
+            if len(lineage) > 2:
+                return self._resolve_multi_level_subgraph(
+                    project_id, branch_name, lineage, files=files, limit=limit
+                )
             schema_name = sanitize_branch_schema_name(project_id, branch_name)
             # Query resolved views
             try:
@@ -1649,6 +2186,7 @@ class SqliteOverlayGraphStore(GraphStore):
         for r in edges_rows:
             d = dict(r)
             if d["source"] in node_id_set and d["target"] in node_id_set:
+                d["metadata"] = _parse_edge_metadata(d.get("metadata"))
                 edges.append(d)
 
         hyperedges: List[Dict[str, Any]] = []
@@ -1845,10 +2383,12 @@ class PostgresSchemaGraphStore(GraphStore):
                 source_file TEXT,
                 source_location TEXT,
                 weight FLOAT DEFAULT 1.0,
+                metadata JSONB DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (project_id, source, target, relation)
             );
             """),
+            psql.SQL("ALTER TABLE pb_root.edges ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;"),
             psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_edges_src ON pb_root.edges(project_id, source);"),
             psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_edges_tgt ON pb_root.edges(project_id, target);"),
             psql.SQL("""
@@ -1922,10 +2462,12 @@ class PostgresSchemaGraphStore(GraphStore):
                 source_file TEXT,
                 source_location TEXT,
                 weight FLOAT DEFAULT 1.0,
+                metadata JSONB DEFAULT '{{}}'::jsonb,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (project_id, source, target, relation)
             );
             """).format(schema=schema_id),
+            psql.SQL("ALTER TABLE {schema}.edge_upserts ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{{}}'::jsonb;").format(schema=schema_id),
             psql.SQL("""
             CREATE TABLE IF NOT EXISTS {schema}.edge_tombstones (
                 project_id VARCHAR(100) NOT NULL,
@@ -1978,9 +2520,11 @@ class PostgresSchemaGraphStore(GraphStore):
             """).format(schema=schema_id, proj=proj_lit),
             psql.SQL("""
             CREATE OR REPLACE VIEW {schema}.v_resolved_edges AS
-            SELECT * FROM {schema}.edge_upserts
+            SELECT project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata, created_at
+            FROM {schema}.edge_upserts
             UNION ALL
-            SELECT r.* FROM pb_root.edges r
+            SELECT r.project_id, r.source, r.target, r.relation, r.confidence, r.confidence_score, r.source_file, r.source_location, r.weight, r.metadata, r.created_at
+            FROM pb_root.edges r
             WHERE r.project_id = {proj}
               AND (r.project_id, r.source, r.target, r.relation) NOT IN (
                   SELECT project_id, source, target, relation FROM {schema}.edge_tombstones
@@ -2007,10 +2551,50 @@ class PostgresSchemaGraphStore(GraphStore):
             for stmt in self.generate_root_schema_ddl():
                 cur.execute(stmt)
 
-    def ensure_branch_schema(self, project_id: str, branch_name: str, author: str = "system") -> str:
+    def get_branch_lineage(self, project_id: str, branch_name: str, max_depth: int = 8) -> List[str]:
+        if self.is_root_branch(branch_name):
+            return [self.root_branch]
+        conn = self.get_conn()
+        parent_map: Dict[str, str] = {}
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT branch_name, base_branch FROM pb_root.graph_branches WHERE project_id = %s",
+                    (project_id,),
+                )
+                for r in cur.fetchall():
+                    if r["branch_name"] and r["base_branch"]:
+                        parent_map[r["branch_name"]] = r["base_branch"]
+        except psycopg2.Error:
+            pass
+        return self._walk_lineage(branch_name, parent_map, max_depth=max_depth)
+
+    def ensure_branch_schema(
+        self,
+        project_id: str,
+        branch_name: str,
+        author: str = "system",
+        base_branch: Optional[str] = None,
+    ) -> str:
         self.ensure_root_schema()
         schema_name = sanitize_branch_schema_name(project_id, branch_name)
         conn = self.get_conn()
+
+        existing_parents: Dict[str, str] = {}
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT branch_name, base_branch FROM pb_root.graph_branches WHERE project_id = %s",
+                (project_id,),
+            )
+            for r in cur.fetchall():
+                if r["branch_name"]:
+                    existing_parents[r["branch_name"]] = r["base_branch"]
+
+        if base_branch and base_branch.strip() and base_branch.strip() != branch_name:
+            resolved_base = base_branch.strip()
+            self._validate_branch_hierarchy(branch_name, resolved_base, existing_parents, max_depth=8)
+        else:
+            resolved_base = existing_parents.get(branch_name) or self.root_branch
 
         with conn.cursor() as cur:
             # Register branch
@@ -2020,9 +2604,10 @@ class PostgresSchemaGraphStore(GraphStore):
                 VALUES (%s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (project_id, branch_name) DO UPDATE SET
                     schema_name = EXCLUDED.schema_name,
+                    base_branch = EXCLUDED.base_branch,
                     updated_at = NOW()
                 """,
-                (project_id, branch_name, schema_name, self.root_branch, author),
+                (project_id, branch_name, schema_name, resolved_base, author),
             )
 
             # Apply DDL
@@ -2040,6 +2625,7 @@ class PostgresSchemaGraphStore(GraphStore):
         synced_files: Optional[List[str]] = None,
         deleted_files: Optional[List[str]] = None,
         author: str = "system",
+        base_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         self.ensure_root_schema()
         conn = self.get_conn()
@@ -2047,12 +2633,14 @@ class PostgresSchemaGraphStore(GraphStore):
         if self.is_root_branch(branch_name):
             return self._sync_to_root_pg(conn, project_id, delta, partial, synced_files, deleted_files)
 
-        schema_name = self.ensure_branch_schema(project_id, branch_name, author)
+        schema_name = self.ensure_branch_schema(project_id, branch_name, author, base_branch=base_branch)
+        lineage = self.get_branch_lineage(project_id, branch_name)
+        parent_branch = lineage[-2] if len(lineage) >= 2 else self.root_branch
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             if not partial:
-                return self._sync_branch_full_pg(cur, project_id, branch_name, schema_name, delta)
+                return self._sync_branch_full_pg(cur, project_id, branch_name, schema_name, delta, parent_branch=parent_branch)
             else:
-                return self._sync_branch_partial_pg(cur, project_id, branch_name, schema_name, delta, synced_files, deleted_files)
+                return self._sync_branch_partial_pg(cur, project_id, branch_name, schema_name, delta, synced_files, deleted_files, parent_branch=parent_branch)
 
     def _sync_to_root_pg(
         self,
@@ -2135,18 +2723,20 @@ class PostgresSchemaGraphStore(GraphStore):
 
             # Upsert edges
             for e in delta.edges:
+                edge_meta_json = _serialize_edge_metadata(e)
                 cur.execute(
                     """
-                    INSERT INTO pb_root.edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO pb_root.edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
                         confidence = EXCLUDED.confidence,
                         confidence_score = EXCLUDED.confidence_score,
                         source_file = EXCLUDED.source_file,
                         source_location = EXCLUDED.source_location,
-                        weight = EXCLUDED.weight
+                        weight = EXCLUDED.weight,
+                        metadata = EXCLUDED.metadata
                     """,
-                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                 )
                 edges_upserted += 1
 
@@ -2185,6 +2775,7 @@ class PostgresSchemaGraphStore(GraphStore):
         branch_name: str,
         schema_name: str,
         delta: GraphDelta,
+        parent_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         schema_id = psql.Identifier(schema_name)
 
@@ -2192,11 +2783,20 @@ class PostgresSchemaGraphStore(GraphStore):
         for tbl in ["node_upserts", "node_tombstones", "edge_upserts", "edge_tombstones", "hyperedge_upserts", "hyperedge_tombstones", "synced_files"]:
             cur.execute(psql.SQL("DELETE FROM {schema}.{table} WHERE project_id = %s;").format(schema=schema_id, table=psql.Identifier(tbl)), (project_id,))
 
-        cur.execute("SELECT * FROM pb_root.nodes WHERE project_id = %s", (project_id,))
-        root_nodes = {r["id"]: dict(r) for r in cur.fetchall()}
+        if parent_branch and not self.is_root_branch(parent_branch):
+            parent_state = self.get_resolved_subgraph(project_id, parent_branch, limit=1_000_000)
+            root_nodes = {n["id"]: dict(n) for n in parent_state.get("nodes", [])}
+            root_edges = {(e["source"], e["target"], e["relation"]): dict(e) for e in parent_state.get("edges", [])}
+        else:
+            cur.execute("SELECT * FROM pb_root.nodes WHERE project_id = %s", (project_id,))
+            root_nodes = {r["id"]: dict(r) for r in cur.fetchall()}
 
-        cur.execute("SELECT * FROM pb_root.edges WHERE project_id = %s", (project_id,))
-        root_edges = {(r["source"], r["target"], r["relation"]): dict(r) for r in cur.fetchall()}
+            cur.execute("SELECT * FROM pb_root.edges WHERE project_id = %s", (project_id,))
+            root_edges = {}
+            for row in cur.fetchall():
+                rd = dict(row)
+                rd["metadata"] = _parse_edge_metadata(rd.get("metadata"))
+                root_edges[(rd["source"], rd["target"], rd["relation"])] = rd
 
         nodes_upserted = 0
         nodes_tombstoned = 0
@@ -2250,14 +2850,16 @@ class PostgresSchemaGraphStore(GraphStore):
         for e in delta.edges:
             ekey = (e.source, e.target, e.relation)
             delta_edge_keys.add(ekey)
+            edge_meta_dict = _extract_edge_metadata_dict(e)
+            edge_meta_json = json.dumps(edge_meta_dict)
             if ekey not in root_edges:
                 cur.execute(
                     psql.SQL("""
                     INSERT INTO {schema}.edge_upserts
-                    (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                    (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                     """).format(schema=schema_id),
-                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                 )
                 edges_upserted += 1
             else:
@@ -2268,15 +2870,16 @@ class PostgresSchemaGraphStore(GraphStore):
                     or (r["source_file"] or None) != (e.source_file or None)
                     or (r["source_location"] or None) != (e.source_location or None)
                     or abs(r["weight"] - e.weight) > 1e-4
+                    or _parse_edge_metadata(r.get("metadata")) != edge_meta_dict
                 )
                 if differs:
                     cur.execute(
                         psql.SQL("""
                         INSERT INTO {schema}.edge_upserts
-                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                         """).format(schema=schema_id),
-                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                     )
                     edges_upserted += 1
 
@@ -2344,6 +2947,7 @@ class PostgresSchemaGraphStore(GraphStore):
         delta: GraphDelta,
         synced_files: Optional[List[str]],
         deleted_files: Optional[List[str]],
+        parent_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         schema_id = psql.Identifier(schema_name)
         synced_file_set: Set[str] = set(synced_files or [
@@ -2358,20 +2962,43 @@ class PostgresSchemaGraphStore(GraphStore):
         edges_upserted = 0
         edges_tombstoned = 0
 
+        use_parent_state = bool(parent_branch and not self.is_root_branch(parent_branch))
+        parent_nodes_by_file: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        parent_edges_by_file: Dict[str, Dict[Tuple[str, str, str], Dict[str, Any]]] = {}
+        if use_parent_state and (deleted_file_set or synced_file_set):
+            parent_state = self.get_resolved_subgraph(project_id, parent_branch, limit=1_000_000)
+            all_target_files = deleted_file_set | synced_file_set
+            for n in parent_state.get("nodes", []):
+                sf = n.get("source_file")
+                if sf in all_target_files:
+                    parent_nodes_by_file.setdefault(sf, {})[n["id"]] = dict(n)
+            for e in parent_state.get("edges", []):
+                sf = e.get("source_file")
+                if sf in all_target_files:
+                    parent_edges_by_file.setdefault(sf, {})[(e["source"], e["target"], e["relation"])] = dict(e)
+
         for fpath in deleted_file_set:
             cur.execute(psql.SQL("DELETE FROM {schema}.node_upserts WHERE project_id = %s AND source_file = %s;").format(schema=schema_id), (project_id, fpath))
             cur.execute(psql.SQL("DELETE FROM {schema}.edge_upserts WHERE project_id = %s AND source_file = %s;").format(schema=schema_id), (project_id, fpath))
 
-            cur.execute("SELECT id FROM pb_root.nodes WHERE project_id = %s AND source_file = %s", (project_id, fpath))
-            for r in cur.fetchall():
+            if use_parent_state:
+                base_del_nodes = list(parent_nodes_by_file.get(fpath, {}).values())
+            else:
+                cur.execute("SELECT id FROM pb_root.nodes WHERE project_id = %s AND source_file = %s", (project_id, fpath))
+                base_del_nodes = cur.fetchall()
+            for r in base_del_nodes:
                 cur.execute(
                     psql.SQL("INSERT INTO {schema}.node_tombstones (project_id, id) VALUES (%s, %s) ON CONFLICT DO NOTHING;").format(schema=schema_id),
                     (project_id, r["id"]),
                 )
                 nodes_tombstoned += 1
 
-            cur.execute("SELECT source, target, relation FROM pb_root.edges WHERE project_id = %s AND source_file = %s", (project_id, fpath))
-            for r in cur.fetchall():
+            if use_parent_state:
+                base_del_edges = list(parent_edges_by_file.get(fpath, {}).values())
+            else:
+                cur.execute("SELECT source, target, relation FROM pb_root.edges WHERE project_id = %s AND source_file = %s", (project_id, fpath))
+                base_del_edges = cur.fetchall()
+            for r in base_del_edges:
                 cur.execute(
                     psql.SQL("INSERT INTO {schema}.edge_tombstones (project_id, source, target, relation) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING;").format(schema=schema_id),
                     (project_id, r["source"], r["target"], r["relation"]),
@@ -2384,11 +3011,19 @@ class PostgresSchemaGraphStore(GraphStore):
             cur.execute(psql.SQL("DELETE FROM {schema}.node_upserts WHERE project_id = %s AND source_file = %s;").format(schema=schema_id), (project_id, fpath))
             cur.execute(psql.SQL("DELETE FROM {schema}.edge_upserts WHERE project_id = %s AND source_file = %s;").format(schema=schema_id), (project_id, fpath))
 
-            cur.execute("SELECT * FROM pb_root.nodes WHERE project_id = %s AND source_file = %s", (project_id, fpath))
-            root_nodes = {r["id"]: dict(r) for r in cur.fetchall()}
+            if use_parent_state:
+                root_nodes = parent_nodes_by_file.get(fpath, {})
+                root_edges = parent_edges_by_file.get(fpath, {})
+            else:
+                cur.execute("SELECT * FROM pb_root.nodes WHERE project_id = %s AND source_file = %s", (project_id, fpath))
+                root_nodes = {r["id"]: dict(r) for r in cur.fetchall()}
 
-            cur.execute("SELECT * FROM pb_root.edges WHERE project_id = %s AND source_file = %s", (project_id, fpath))
-            root_edges = {(r["source"], r["target"], r["relation"]): dict(r) for r in cur.fetchall()}
+                cur.execute("SELECT * FROM pb_root.edges WHERE project_id = %s AND source_file = %s", (project_id, fpath))
+                root_edges = {}
+                for row in cur.fetchall():
+                    rd = dict(row)
+                    rd["metadata"] = _parse_edge_metadata(rd.get("metadata"))
+                    root_edges[(rd["source"], rd["target"], rd["relation"])] = rd
 
             delta_file_nodes = [n for n in delta.nodes if n.source_file == fpath]
             delta_node_ids = {n.id for n in delta_file_nodes}
@@ -2455,6 +3090,8 @@ class PostgresSchemaGraphStore(GraphStore):
 
             for e in delta_file_edges:
                 ekey = (e.source, e.target, e.relation)
+                edge_meta_dict = _extract_edge_metadata_dict(e)
+                edge_meta_json = json.dumps(edge_meta_dict)
                 cur.execute(
                     psql.SQL("DELETE FROM {schema}.edge_tombstones WHERE project_id = %s AND source = %s AND target = %s AND relation = %s;").format(schema=schema_id),
                     (project_id, e.source, e.target, e.relation),
@@ -2463,10 +3100,10 @@ class PostgresSchemaGraphStore(GraphStore):
                     cur.execute(
                         psql.SQL("""
                         INSERT INTO {schema}.edge_upserts
-                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                         """).format(schema=schema_id),
-                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                     )
                     edges_upserted += 1
                 else:
@@ -2476,15 +3113,16 @@ class PostgresSchemaGraphStore(GraphStore):
                         or abs(r["confidence_score"] - e.confidence_score) > 1e-4
                         or (r["source_location"] or None) != (e.source_location or None)
                         or abs(r["weight"] - e.weight) > 1e-4
+                        or _parse_edge_metadata(r.get("metadata")) != edge_meta_dict
                     )
                     if differs:
                         cur.execute(
                             psql.SQL("""
                             INSERT INTO {schema}.edge_upserts
-                            (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                            (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                             """).format(schema=schema_id),
-                            (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight),
+                            (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                         )
                         edges_upserted += 1
 
@@ -2577,7 +3215,9 @@ class PostgresSchemaGraphStore(GraphStore):
             try:
                 cur.execute(psql.SQL("SELECT * FROM {schema}.edge_upserts WHERE project_id = %s;").format(schema=schema_id), (project_id,))
                 for r in cur.fetchall():
-                    edge_upserts[(r["source"], r["target"], r["relation"])] = dict(r)
+                    d = dict(r)
+                    d["metadata"] = _parse_edge_metadata(d.get("metadata"))
+                    edge_upserts[(d["source"], d["target"], d["relation"])] = d
             except psycopg2.Error:
                 pass
 
@@ -2637,7 +3277,9 @@ class PostgresSchemaGraphStore(GraphStore):
                 )
                 r = cur.fetchone()
                 if r:
-                    res[(s, t, rel)] = dict(r)
+                    d = dict(r)
+                    d["metadata"] = _parse_edge_metadata(d.get("metadata"))
+                    res[(s, t, rel)] = d
         return res
 
     def diff_branch_vs_root(
@@ -2649,6 +3291,10 @@ class PostgresSchemaGraphStore(GraphStore):
     ) -> BranchDiffResult:
         if self.is_root_branch(branch_name):
             return BranchDiffResult(summary=BranchDiffSummary())
+
+        lineage = self.get_branch_lineage(project_id, branch_name)
+        if len(lineage) > 2:
+            return self._diff_resolved_subgraphs(project_id, self.root_branch, branch_name, file_filter, community)
 
         overlay = self._get_branch_overlay(project_id, branch_name)
         upsert_ids = list(overlay["node_upserts"].keys())
@@ -2727,9 +3373,18 @@ class PostgresSchemaGraphStore(GraphStore):
     ) -> BranchDiffResult:
         return self._diff_branches_core(project_id, base_branch, target_branch, file_filter, community)
 
-    def promote_branch_to_root(self, project_id: str, branch_name: str) -> Dict[str, Any]:
+    def promote_branch_to_root(
+        self,
+        project_id: str,
+        branch_name: str,
+        target_branch: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if self.is_root_branch(branch_name):
             return {"status": "noop", "message": "Already root branch"}
+
+        effective_target = target_branch.strip() if (target_branch and target_branch.strip()) else self.root_branch
+        if effective_target == branch_name.strip():
+            return {"status": "noop", "message": "Source and target branch are identical"}
 
         overlay = self._get_branch_overlay(project_id, branch_name)
         schema_name = overlay["schema_name"]
@@ -2737,109 +3392,237 @@ class PostgresSchemaGraphStore(GraphStore):
         conn = self.get_conn()
         is_autocommit = getattr(conn, "autocommit", False)
 
-        try:
-            with conn.cursor() as cur:
-                if is_autocommit:
-                    cur.execute("BEGIN;")
-
-                # 1. Apply node tombstones
-                if overlay["node_tombstones"]:
-                    cur.execute(
-                        "DELETE FROM pb_root.nodes WHERE project_id = %s AND id = ANY(%s)",
-                        (project_id, list(overlay["node_tombstones"])),
-                    )
-
-                # 2. Apply node upserts
-                for nid, n in overlay["node_upserts"].items():
-                    cur.execute(
-                        """
-                        INSERT INTO pb_root.nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                        ON CONFLICT (project_id, id) DO UPDATE SET
-                            label = EXCLUDED.label,
-                            file_type = EXCLUDED.file_type,
-                            source_file = EXCLUDED.source_file,
-                            source_location = EXCLUDED.source_location,
-                            community = EXCLUDED.community,
-                            metadata = EXCLUDED.metadata,
-                            updated_at = NOW()
-                        """,
-                        (n["id"], project_id, n["label"], n["file_type"], n["source_file"], n.get("source_location"), n.get("community"), json.dumps(n.get("metadata", {}))),
-                    )
-
-                # 3. Apply edge tombstones
-                for s, t, rel in overlay["edge_tombstones"]:
-                    cur.execute(
-                        "DELETE FROM pb_root.edges WHERE project_id = %s AND source = %s AND target = %s AND relation = %s",
-                        (project_id, s, t, rel),
-                    )
-
-                # 4. Apply edge upserts
-                for ekey, e in overlay["edge_upserts"].items():
-                    cur.execute(
-                        """
-                        INSERT INTO pb_root.edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
-                            confidence = EXCLUDED.confidence,
-                            confidence_score = EXCLUDED.confidence_score,
-                            source_file = EXCLUDED.source_file,
-                            source_location = EXCLUDED.source_location,
-                            weight = EXCLUDED.weight
-                        """,
-                        (project_id, e["source"], e["target"], e["relation"], e["confidence"], e["confidence_score"], e.get("source_file"), e.get("source_location"), e["weight"]),
-                    )
-
-                # 4b. Apply hyperedge tombstones
-                if overlay.get("hyperedge_tombstones"):
-                    cur.execute(
-                        "DELETE FROM pb_root.hyperedges WHERE project_id = %s AND id = ANY(%s)",
-                        (project_id, list(overlay["hyperedge_tombstones"])),
-                    )
-
-                # 4c. Apply hyperedge upserts
-                for hid, h in overlay.get("hyperedge_upserts", {}).items():
-                    nodes_list = h["nodes"] if isinstance(h["nodes"], list) else json.loads(h["nodes"])
-                    cur.execute(
-                        """
-                        INSERT INTO pb_root.hyperedges (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (project_id, id) DO UPDATE SET
-                            label = EXCLUDED.label,
-                            nodes = EXCLUDED.nodes,
-                            relation = EXCLUDED.relation,
-                            confidence = EXCLUDED.confidence,
-                            confidence_score = EXCLUDED.confidence_score,
-                            source_file = EXCLUDED.source_file
-                        """,
-                        (h["id"], project_id, h["label"], nodes_list, h["relation"], h["confidence"], h["confidence_score"], h.get("source_file")),
-                    )
-
-                # 5. Drop schema
-                cur.execute(psql.SQL("DROP SCHEMA IF EXISTS {schema} CASCADE;").format(schema=schema_id))
-
-                # 6. Delete branch registration
-                cur.execute("DELETE FROM pb_root.graph_branches WHERE project_id = %s AND branch_name = %s", (project_id, branch_name))
-
-                if is_autocommit:
-                    cur.execute("COMMIT;")
-                elif hasattr(conn, "commit"):
-                    conn.commit()
-        except Exception:
+        if self.is_root_branch(effective_target):
             try:
-                if is_autocommit:
-                    with conn.cursor() as cur:
-                        cur.execute("ROLLBACK;")
-                elif hasattr(conn, "rollback"):
-                    conn.rollback()
+                with conn.cursor() as cur:
+                    if is_autocommit:
+                        cur.execute("BEGIN;")
+
+                    # 1. Apply node tombstones
+                    if overlay["node_tombstones"]:
+                        cur.execute(
+                            "DELETE FROM pb_root.nodes WHERE project_id = %s AND id = ANY(%s)",
+                            (project_id, list(overlay["node_tombstones"])),
+                        )
+
+                    # 2. Apply node upserts
+                    for nid, n in overlay["node_upserts"].items():
+                        cur.execute(
+                            """
+                            INSERT INTO pb_root.nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                            ON CONFLICT (project_id, id) DO UPDATE SET
+                                label = EXCLUDED.label,
+                                file_type = EXCLUDED.file_type,
+                                source_file = EXCLUDED.source_file,
+                                source_location = EXCLUDED.source_location,
+                                community = EXCLUDED.community,
+                                metadata = EXCLUDED.metadata,
+                                updated_at = NOW()
+                            """,
+                            (n["id"], project_id, n["label"], n["file_type"], n["source_file"], n.get("source_location"), n.get("community"), json.dumps(n.get("metadata", {}))),
+                        )
+
+                    # 3. Apply edge tombstones
+                    for s, t, rel in overlay["edge_tombstones"]:
+                        cur.execute(
+                            "DELETE FROM pb_root.edges WHERE project_id = %s AND source = %s AND target = %s AND relation = %s",
+                            (project_id, s, t, rel),
+                        )
+
+                    # 4. Apply edge upserts
+                    for ekey, e in overlay["edge_upserts"].items():
+                        edge_meta_json = _serialize_edge_metadata(e.get("metadata"))
+                        cur.execute(
+                            """
+                            INSERT INTO pb_root.edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
+                                confidence = EXCLUDED.confidence,
+                                confidence_score = EXCLUDED.confidence_score,
+                                source_file = EXCLUDED.source_file,
+                                source_location = EXCLUDED.source_location,
+                                weight = EXCLUDED.weight,
+                                metadata = EXCLUDED.metadata
+                            """,
+                            (project_id, e["source"], e["target"], e["relation"], e["confidence"], e["confidence_score"], e.get("source_file"), e.get("source_location"), e["weight"], edge_meta_json),
+                        )
+
+                    # 4b. Apply hyperedge tombstones
+                    if overlay.get("hyperedge_tombstones"):
+                        cur.execute(
+                            "DELETE FROM pb_root.hyperedges WHERE project_id = %s AND id = ANY(%s)",
+                            (project_id, list(overlay["hyperedge_tombstones"])),
+                        )
+
+                    # 4c. Apply hyperedge upserts
+                    for hid, h in overlay.get("hyperedge_upserts", {}).items():
+                        nodes_list = h["nodes"] if isinstance(h["nodes"], list) else json.loads(h["nodes"])
+                        cur.execute(
+                            """
+                            INSERT INTO pb_root.hyperedges (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (project_id, id) DO UPDATE SET
+                                label = EXCLUDED.label,
+                                nodes = EXCLUDED.nodes,
+                                relation = EXCLUDED.relation,
+                                confidence = EXCLUDED.confidence,
+                                confidence_score = EXCLUDED.confidence_score,
+                                source_file = EXCLUDED.source_file
+                            """,
+                            (h["id"], project_id, h["label"], nodes_list, h["relation"], h["confidence"], h["confidence_score"], h.get("source_file")),
+                        )
+
+                    # 5. Drop schema
+                    cur.execute(psql.SQL("DROP SCHEMA IF EXISTS {schema} CASCADE;").format(schema=schema_id))
+
+                    # 6. Delete branch registration & reparent children to root
+                    cur.execute("DELETE FROM pb_root.graph_branches WHERE project_id = %s AND branch_name = %s", (project_id, branch_name))
+                    cur.execute(
+                        "UPDATE pb_root.graph_branches SET base_branch = %s, updated_at = NOW() WHERE project_id = %s AND base_branch = %s",
+                        (self.root_branch, project_id, branch_name),
+                    )
+
+                    if is_autocommit:
+                        cur.execute("COMMIT;")
+                    elif hasattr(conn, "commit"):
+                        conn.commit()
             except Exception:
-                pass
-            raise
+                try:
+                    if is_autocommit:
+                        with conn.cursor() as cur:
+                            cur.execute("ROLLBACK;")
+                    elif hasattr(conn, "rollback"):
+                        conn.rollback()
+                except Exception:
+                    pass
+                raise
+        else:
+            target_schema = self.ensure_branch_schema(project_id, effective_target)
+            target_schema_id = psql.Identifier(target_schema)
+            target_lineage = self.get_branch_lineage(project_id, effective_target)
+            target_parent = target_lineage[-2] if len(target_lineage) >= 2 else self.root_branch
+            target_parent_state = self.get_resolved_subgraph(project_id, target_parent, limit=1_000_000)
+            target_parent_node_ids = {n["id"] for n in target_parent_state.get("nodes", [])}
+            target_parent_edge_keys = {(e["source"], e["target"], e["relation"]) for e in target_parent_state.get("edges", [])}
+            target_parent_hyperedge_ids = {h["id"] for h in target_parent_state.get("hyperedges", [])}
+
+            try:
+                with conn.cursor() as cur:
+                    if is_autocommit:
+                        cur.execute("BEGIN;")
+
+                    for tid in overlay["node_tombstones"]:
+                        cur.execute(psql.SQL("DELETE FROM {schema}.node_upserts WHERE project_id = %s AND id = %s;").format(schema=target_schema_id), (project_id, tid))
+                        if tid in target_parent_node_ids:
+                            cur.execute(
+                                psql.SQL("INSERT INTO {schema}.node_tombstones (project_id, id) VALUES (%s, %s) ON CONFLICT DO NOTHING;").format(schema=target_schema_id),
+                                (project_id, tid),
+                            )
+
+                    for nid, n in overlay["node_upserts"].items():
+                        cur.execute(psql.SQL("DELETE FROM {schema}.node_tombstones WHERE project_id = %s AND id = %s;").format(schema=target_schema_id), (project_id, nid))
+                        cur.execute(
+                            psql.SQL("""
+                            INSERT INTO {schema}.node_upserts (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                            ON CONFLICT (project_id, id) DO UPDATE SET
+                                label = EXCLUDED.label,
+                                file_type = EXCLUDED.file_type,
+                                source_file = EXCLUDED.source_file,
+                                source_location = EXCLUDED.source_location,
+                                community = EXCLUDED.community,
+                                metadata = EXCLUDED.metadata,
+                                updated_at = NOW();
+                            """).format(schema=target_schema_id),
+                            (n["id"], project_id, n["label"], n["file_type"], n["source_file"], n.get("source_location"), n.get("community"), json.dumps(n.get("metadata", {}))),
+                        )
+
+                    for s, t, rel in overlay["edge_tombstones"]:
+                        cur.execute(
+                            psql.SQL("DELETE FROM {schema}.edge_upserts WHERE project_id = %s AND source = %s AND target = %s AND relation = %s;").format(schema=target_schema_id),
+                            (project_id, s, t, rel),
+                        )
+                        if (s, t, rel) in target_parent_edge_keys:
+                            cur.execute(
+                                psql.SQL("INSERT INTO {schema}.edge_tombstones (project_id, source, target, relation) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING;").format(schema=target_schema_id),
+                                (project_id, s, t, rel),
+                            )
+
+                    for ekey, e in overlay["edge_upserts"].items():
+                        edge_meta_json = _serialize_edge_metadata(e.get("metadata"))
+                        cur.execute(
+                            psql.SQL("DELETE FROM {schema}.edge_tombstones WHERE project_id = %s AND source = %s AND target = %s AND relation = %s;").format(schema=target_schema_id),
+                            (project_id, e["source"], e["target"], e["relation"]),
+                        )
+                        cur.execute(
+                            psql.SQL("""
+                            INSERT INTO {schema}.edge_upserts (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
+                                confidence = EXCLUDED.confidence,
+                                confidence_score = EXCLUDED.confidence_score,
+                                source_file = EXCLUDED.source_file,
+                                source_location = EXCLUDED.source_location,
+                                weight = EXCLUDED.weight,
+                                metadata = EXCLUDED.metadata;
+                            """).format(schema=target_schema_id),
+                            (project_id, e["source"], e["target"], e["relation"], e["confidence"], e["confidence_score"], e.get("source_file"), e.get("source_location"), e["weight"], edge_meta_json),
+                        )
+
+                    for htid in overlay.get("hyperedge_tombstones", set()):
+                        cur.execute(psql.SQL("DELETE FROM {schema}.hyperedge_upserts WHERE project_id = %s AND id = %s;").format(schema=target_schema_id), (project_id, htid))
+                        if htid in target_parent_hyperedge_ids:
+                            cur.execute(
+                                psql.SQL("INSERT INTO {schema}.hyperedge_tombstones (project_id, id) VALUES (%s, %s) ON CONFLICT DO NOTHING;").format(schema=target_schema_id),
+                                (project_id, htid),
+                            )
+
+                    for hid, h in overlay.get("hyperedge_upserts", {}).items():
+                        nodes_list = h["nodes"] if isinstance(h["nodes"], list) else json.loads(h["nodes"])
+                        cur.execute(psql.SQL("DELETE FROM {schema}.hyperedge_tombstones WHERE project_id = %s AND id = %s;").format(schema=target_schema_id), (project_id, hid))
+                        cur.execute(
+                            psql.SQL("""
+                            INSERT INTO {schema}.hyperedge_upserts (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (project_id, id) DO UPDATE SET
+                                label = EXCLUDED.label,
+                                nodes = EXCLUDED.nodes,
+                                relation = EXCLUDED.relation,
+                                confidence = EXCLUDED.confidence,
+                                confidence_score = EXCLUDED.confidence_score,
+                                source_file = EXCLUDED.source_file;
+                            """).format(schema=target_schema_id),
+                            (h["id"], project_id, h["label"], nodes_list, h["relation"], h["confidence"], h["confidence_score"], h.get("source_file")),
+                        )
+
+                    cur.execute(psql.SQL("DROP SCHEMA IF EXISTS {schema} CASCADE;").format(schema=schema_id))
+                    cur.execute("DELETE FROM pb_root.graph_branches WHERE project_id = %s AND branch_name = %s", (project_id, branch_name))
+                    cur.execute(
+                        "UPDATE pb_root.graph_branches SET base_branch = %s, updated_at = NOW() WHERE project_id = %s AND base_branch = %s AND branch_name != %s",
+                        (effective_target, project_id, branch_name, effective_target),
+                    )
+
+                    if is_autocommit:
+                        cur.execute("COMMIT;")
+                    elif hasattr(conn, "commit"):
+                        conn.commit()
+            except Exception:
+                try:
+                    if is_autocommit:
+                        with conn.cursor() as cur:
+                            cur.execute("ROLLBACK;")
+                    elif hasattr(conn, "rollback"):
+                        conn.rollback()
+                except Exception:
+                    pass
+                raise
 
         return {
             "status": "promoted",
             "project_id": project_id,
             "branch": branch_name,
+            "target_branch": effective_target,
             "upserted_nodes": len(overlay["node_upserts"]),
             "deleted_nodes": len(overlay["node_tombstones"]),
             "upserted_edges": len(overlay["edge_upserts"]),
@@ -2855,6 +3638,12 @@ class PostgresSchemaGraphStore(GraphStore):
         files: Optional[List[str]] = None,
         limit: int = 1000,
     ) -> Dict[str, Any]:
+        if not self.is_root_branch(branch_name):
+            lineage = self.get_branch_lineage(project_id, branch_name)
+            if len(lineage) > 2:
+                return self._resolve_multi_level_subgraph(
+                    project_id, branch_name, lineage, files=files, limit=limit
+                )
         conn = self.get_conn()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             if self.is_root_branch(branch_name):
@@ -2894,7 +3683,12 @@ class PostgresSchemaGraphStore(GraphStore):
 
         nodes = [dict(r) for r in nodes_rows]
         node_id_set = {n["id"] for n in nodes}
-        edges = [dict(r) for r in edges_rows if r["source"] in node_id_set and r["target"] in node_id_set]
+        edges: List[Dict[str, Any]] = []
+        for r in edges_rows:
+            if r["source"] in node_id_set and r["target"] in node_id_set:
+                d = dict(r)
+                d["metadata"] = _parse_edge_metadata(d.get("metadata"))
+                edges.append(d)
         hyperedges = [dict(r) for r in hyperedges_rows]
 
         return {
@@ -2989,16 +3783,46 @@ class PostgresSchemaGraphStore(GraphStore):
 # GraphStore Factory
 # =====================================================================
 
+def _map_graph_backend_to_plugin_id(backend_name: str) -> str:
+    norm = (backend_name or "").strip().lower()
+    aliases = {
+        "sqlite": "graph.sqlite_overlay",
+        "sqlite_overlay": "graph.sqlite_overlay",
+        "postgres": "graph.postgres_schema",
+        "postgresql": "graph.postgres_schema",
+        "postgres_schema": "graph.postgres_schema",
+        "neo4j": "graph.neo4j",
+    }
+    return aliases.get(norm, backend_name.strip())
+
+
 def get_graph_store(
     db_path: Optional[str] = None,
     backend: Optional[str] = None,
     connection_url: Optional[str] = None,
-    root_branch: str = "main",
+    root_branch: Optional[str] = None,
+    project_id: Optional[str] = None,
+    registry: Optional[Any] = None,
 ) -> GraphStore:
-    """Factory creating configured GraphStore instance based on environment or parameters."""
+    """Factory creating configured GraphStore instance based on environment, PluginRegistry, or parameters."""
+    caller_root_branch = root_branch
+    if root_branch is None:
+        resolved_root = os.getenv("PB_ROOT_BRANCH") or os.getenv("OM_ROOT_BRANCH")
+        if not resolved_root:
+            try:
+                from ..core.config import env
+                resolved_root = getattr(env, "root_branch", None)
+            except Exception:
+                resolved_root = None
+        root_branch = resolved_root or "main"
+
+    caller_db_path = db_path
     if not db_path:
         db_path = os.getenv("OM_DB_PATH") or os.getenv("PB_DB_PATH") or None
-    backend_val = (backend or "").lower()
+
+    explicit_backend = (backend or "").strip()
+    env_graph_backend = (os.getenv("PB_GRAPH_BACKEND") or "").strip()
+    backend_val = (explicit_backend or env_graph_backend).lower()
     if not backend_val:
         backend_val = (
             os.getenv("PB_METADATA_BACKEND")
@@ -3011,6 +3835,84 @@ def get_graph_store(
                 backend_val = (getattr(env, "db_backend", None) or "sqlite").lower()
             except Exception:
                 backend_val = "sqlite"
+
+    import sys
+
+    reg_mod = sys.modules.get("projectbrain.plugins.registry")
+    has_active_default_reg = bool(
+        reg_mod is not None and getattr(reg_mod, "_DEFAULT_REGISTRY", None) is not None
+    )
+
+    should_consult_registry = (
+        registry is not None
+        or project_id is not None
+        or has_active_default_reg
+        or bool(env_graph_backend)
+        or (
+            bool(explicit_backend)
+            and explicit_backend.lower() not in ("sqlite", "postgres", "postgresql")
+        )
+        or bool(os.getenv("PB_DISABLED_PLUGINS") or os.getenv("PB_ENABLED_PLUGINS"))
+    )
+
+    if should_consult_registry:
+        try:
+            active_reg = registry
+            if active_reg is None:
+                from ..plugins.registry import get_default_registry
+                active_reg = get_default_registry()
+
+            preferred_id: Optional[str] = None
+            if explicit_backend:
+                preferred_id = _map_graph_backend_to_plugin_id(explicit_backend)
+            elif env_graph_backend:
+                preferred_id = _map_graph_backend_to_plugin_id(env_graph_backend)
+            elif backend_val in ("postgres", "postgresql"):
+                has_project_override = False
+                if project_id and hasattr(active_reg, "_project_overrides"):
+                    has_project_override = bool(active_reg._project_overrides.get(project_id))
+                if not has_project_override:
+                    top_candidates = active_reg.resolve_all("graph_backend", project_id=project_id)
+                    if not top_candidates or top_candidates[0].metadata.plugin_id == "graph.sqlite_overlay":
+                        preferred_id = "graph.postgres_schema"
+
+            plugin = active_reg.resolve(
+                "graph_backend",
+                preferred_id=preferred_id,
+                project_id=project_id,
+            )
+
+            if preferred_id and preferred_id not in ("graph.sqlite_overlay", "graph.postgres_schema"):
+                if plugin.metadata.plugin_id != preferred_id:
+                    raise LookupError(
+                        f"Requested graph_backend plugin '{preferred_id}' is not enabled or registered"
+                    )
+
+            store_cfg: Dict[str, Any] = {}
+            if hasattr(active_reg, "get_effective_config"):
+                store_cfg.update(
+                    active_reg.get_effective_config(
+                        plugin.metadata.plugin_id,
+                        project_id=project_id,
+                    )
+                )
+            if caller_db_path is not None:
+                store_cfg["db_path"] = caller_db_path
+            elif "db_path" not in store_cfg and db_path is not None:
+                store_cfg["db_path"] = db_path
+            if connection_url is not None:
+                store_cfg["connection_url"] = connection_url
+            if caller_root_branch is not None:
+                store_cfg["root_branch"] = caller_root_branch
+            else:
+                store_cfg.setdefault("root_branch", root_branch)
+
+            return plugin.create_store(store_cfg)
+        except LookupError:
+            if explicit_backend and explicit_backend.lower() not in ("sqlite", "postgres", "postgresql"):
+                raise
+        except ImportError:
+            pass
 
     if backend_val in ("postgres", "postgresql"):
         return PostgresSchemaGraphStore(

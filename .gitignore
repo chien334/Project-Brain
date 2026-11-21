@@ -31,3 +31,7 @@ cloned_repos/
 tmp_test.db
 projectbrain.db-shm
 graphify-out/
+.projectbrain/
+.pytest_cache/
+*.sqlite
+*.sqlite3

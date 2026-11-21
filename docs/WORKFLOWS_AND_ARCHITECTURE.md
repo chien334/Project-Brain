@@ -22,6 +22,7 @@
    - [Diagram 7 — Workflow 6: Legacy Codegraph Bridge](#diagram-7--workflow-6-legacy-codegraph-bridge)
    - [Diagram 8 — Workflow 7: Unified Knowledge Base & Office Export](#diagram-8--workflow-7-unified-knowledge-base--office-export)
    - [Diagram 9 — Workflow 8: PM RAG Copilot, Dynamic Extensions Loader & MCP Security Gate](#diagram-9--workflow-8-pm-rag-copilot-dynamic-extensions-loader--mcp-security-gate)
+   - [Diagram 10 — Workflow 9: Multi-Branch Code/Memory Overlay (`develop -> feat/*`) & Document Versioning Delta Engine (`v1.0 -> v1.1`)](#diagram-10--workflow-9-multi-branch-codememory-overlay-develop---feat--document-versioning-delta-engine-v10---v11)
 4. [Module & Interface Quick-Reference Matrix](#4-module--interface-quick-reference-matrix)
 
 ---
@@ -541,17 +542,68 @@ flowchart TB
 
 ---
 
+### Diagram 10 — Workflow 9: Multi-Branch Code/Memory Overlay (`develop -> feat/*`) & Document Versioning Delta Engine (`v1.0 -> v1.1`)
+
+End-to-end architecture for dynamic root-branch hierarchies (`PB_ROOT_BRANCH`), Git-diff auto-delta code & memory synchronization, ancestor-aware HSG overlay inheritance with tombstones, and content-addressed pre-OCR/pre-embedding document versioning.
+
+```mermaid
+flowchart TD
+    subgraph CodeBranchOverlay["1. Multi-Level Code Graph Overlay (PB_ROOT_BRANCH & graph_branches)"]
+        RootCfg["Dynamic 'PB_ROOT_BRANCH' (e.g. 'main' or 'develop')"]
+        GitDiff["Git-Diff Auto-Delta: 'git diff --name-status <base_branch>...HEAD' + Dirty Workspace"]
+        DeltaSync["'GraphifyExtractor.extract_workspace(..., base_branch=...)' -> Partial 'sync_branch_delta'"]
+        MultiLevel["Multi-Level 'graph_branches' Hierarchy ('main -> develop -> feat/x', Cycle & Depth <= 8 Guards)"]
+        Promote["'promote_branch_to_root(..., target_branch=develop)' -> Merge Delta, Drop Source & Reparent Children"]
+        RootCfg --> MultiLevel
+        GitDiff --> DeltaSync --> MultiLevel --> Promote
+    end
+
+    subgraph MemOverlay["2. HSG Memory Ancestor Overlay & Tombstones (008_memory_branch_overlay.sql)"]
+        MemLinks["'memory_branch_links' ('register_memory_branch' & 'get_memory_branch_lineage')"]
+        MemTombs["'memory_overlay_tombstones' ('record_memory_tombstone' for Modified/Deleted 'file' & 'doc' Keys)"]
+        MemSync["'sync_codebase_memories(..., base_branch=...)' -> 0 Re-Embeds on Unchanged Base Files"]
+        HSGResolve["Ancestor-Aware 'hsg_query' ('inherit_base=True'): Merge Lineage, Shadow Overridden & Prune Tombstoned Chunks"]
+        MemSync --> MemLinks
+        MemSync --> MemTombs
+        MemLinks --> HSGResolve
+        MemTombs --> HSGResolve
+    end
+
+    subgraph DocVersioning["3. Document Versioning & Pre-OCR Delta Engine (009_document_versioning.sql)"]
+        DocUpload["Upload 'v1.0 -> v1.1' ('POST /sources/upload', 'POST /sources/push-processed', 'projectbrain_upload_document')"]
+        PreOCR["Pre-OCR Unit Fingerprinting ('inspect_pdf_pages_pre_ocr', 'inspect_pptx_slides_pre_ocr', 'inspect_excel_sheets_raw', 'split_markdown_sections')"]
+        HashLookup{"Match 'unit_sha256' in Parent 'document_units' (Same Branch or 'base_branch')?"}
+        ReuseClone["Cache Hit: 'clone_memory_with_vectors' (0 OCR Calls, 0 Embedding Calls)"]
+        MissParse["Cache Miss: Parse/OCR Single Unit & 'add_hsg_memory' Only on Changed Units"]
+        BranchMode{"Same-Branch Update or Cross-Branch ('base_branch')?"}
+        Supersede["Same Branch: Mark Prior 'document_versions.status=superseded' & Delete Old Memories"]
+        Isolate["Cross Branch: Keep Parent Branch Intact, Register 'memory_branch_links' & Record 'doc' Tombstone"]
+        DocDiff["Version Inspection & Diff: 'GET /sources/documents/{doc_key}/diff' & 'projectbrain_diff_document_versions'"]
+
+        DocUpload --> PreOCR --> HashLookup
+        HashLookup -->|"Hit (Unchanged Unit)"| ReuseClone --> BranchMode
+        HashLookup -->|"Miss (New / Modified Unit)"| MissParse --> BranchMode
+        BranchMode -->|"Same Branch"| Supersede --> DocDiff
+        BranchMode -->|"Cross Branch"| Isolate --> DocDiff
+    end
+
+    MultiLevel -.->|"Shared Branch Lineage"| MemLinks
+    Isolate -.->|"Doc Shadowing"| MemTombs
+```
+
+---
+
 ## 4. Module & Interface Quick-Reference Matrix
 
 | Architectural Plane | Primary Files | Key Symbols / Endpoints | Storage / State |
 | :--- | :--- | :--- | :--- |
 | **CLI & Python SDK** | `src/projectbrain/main.py` | `Memory`, `run_server`, `run_mcp`, `run_graphify_sync`, `run_graphify_diff`, `run_upload_doc`, `run_codegraph_sync`, `run_build_kb`, `run_kb_trace`, `run_kb_coverage`, `_get_positional_args` | Local SQLite/PostgreSQL or Remote HTTP (`PB_MODE=remote`) |
 | **FastAPI Gateway & Auth** | `src/projectbrain/server/api.py`, `server/routes/auth.py`, `server/routes/mcp_registry.py` | `create_app`, `rest_auth_middleware`, `mcp_auth_middleware`, `SSEFilter`, `_is_write_tool`, `_redact_database_url`, `_sanitize_mcp_config_for_response`, `/auth/*`, `/memory/mcp/*` | `mcp_accounts` table & Claude Desktop JSON config |
-| **Cognitive HSG & Maintenance** | `src/projectbrain/memory/{hsg,embed,decay,reflect,user_summary}.py`, `ops/dynamics.py` | `add_hsg_memory`, `hsg_query`, `compute_simhash`, `invalidate_query_cache`, `apply_decay`, `run_reflection`, `/memory/*` | `memories`, `vectors`, `waypoints`, `users`, `stats` |
+| **Cognitive HSG & Branch Memory Overlay** | `src/projectbrain/memory/{hsg,embed,decay,reflect,user_summary}.py`, `core/db.py`, `ops/dynamics.py`, `migrations/008_memory_branch_overlay.sql` | `add_hsg_memory`, `hsg_query` (`inherit_base`), `register_memory_branch`, `record_memory_tombstone`, `get_memory_branch_lineage`, `compute_simhash`, `invalidate_query_cache`, `apply_decay`, `run_reflection`, `/memory/*` | `memories`, `vectors`, `waypoints`, `users`, `stats`, `memory_branch_links`, `memory_overlay_tombstones` |
 | **Vector Backends** | `src/projectbrain/core/vector_store.py`, `core/vector/{postgres,valkey}.py` | `SQLiteVectorStore`, `PostgresVectorStore`, `ValkeyVectorStore`, `storeVector`, `getVectorsBySector`, `deleteVectors`, `search` | SQLite BLOB, PostgreSQL `pgvector` `(id, sector)` HNSW, Valkey `{prefix}{id}:{sector}` |
 | **Temporal Knowledge Graph** | `src/projectbrain/temporal_graph/{store,query,timeline}.py` | `insert_fact`, `query_facts_at_time`, `query_facts_in_range`, `invalidate_fact` | `temporal_facts`, `temporal_edges` |
-| **Multimodal Ingestion & Connectors** | `src/projectbrain/utils/doc_parser.py`, `ops/{ingest,extract}.py`, `graphify_engine/doc_pipeline.py`, `server/routes/sources.py`, `connectors/*.py` | `parse_document`, `DocumentPipeline`, `ingest_document`, `_validate_public_url`, `_safe_fetch_with_redirects`, `/sources/upload`, `/sources/push-processed`, `/sources/{source}/ingest`, `/sources/webhook/{github,notion}` | HSG `memories` + `GraphStore` overlays |
-| **Hybrid Graphify Engine** | `src/projectbrain/graphify_engine/{extractor,store,hybrid_resolver,models}.py`, `server/routes/graphify.py` | `GraphifyExtractor`, `SqliteOverlayGraphStore`, `PostgresSchemaGraphStore`, `HybridResolver`, `sync_branch_delta`, `diff_branch_vs_root`, `promote_branch_to_root`, `/graphify/*` | `.projectbrain/local_graph/partial_graph.json`, `pb_root` / `root_*`, `pb_br_*` |
+| **Document Versioning & Multimodal Ingestion** | `src/projectbrain/graphify_engine/{doc_versioning,doc_pipeline}.py`, `utils/doc_parser.py`, `ops/{ingest,extract}.py`, `server/routes/sources.py`, `connectors/*.py`, `migrations/009_document_versioning.sql` | `derive_doc_key`, `ingest_document_versioned`, `clone_memory_with_vectors`, `list_documents`, `list_document_versions`, `diff_document_versions`, `inspect_pdf_pages_pre_ocr`, `inspect_pptx_slides_pre_ocr`, `inspect_excel_sheets_raw`, `split_markdown_sections`, `DocumentPipeline`, `/sources/upload`, `/sources/push-processed`, `/sources/documents*`, `/sources/{source}/ingest`, `/sources/webhook/{github,notion}` | `document_versions`, `document_units`, HSG `memories` + `GraphStore` overlays |
+| **Hybrid Graphify Engine** | `src/projectbrain/graphify_engine/{extractor,store,hybrid_resolver,models}.py`, `server/routes/graphify.py`, `core/config.py` | `PB_ROOT_BRANCH`, `GraphifyExtractor` (`base_branch` git-diff auto-delta), `SqliteOverlayGraphStore`, `PostgresSchemaGraphStore`, `HybridResolver`, `sync_branch_delta`, `diff_branch_vs_root`, `diff_branches`, `promote_branch_to_root` (`target_branch`), `/graphify/*` | `.projectbrain/local_graph/partial_graph.json`, `pb_root` / `root_*`, `graph_branches`, `pb_br_*` |
 | **Legacy Codegraph Bridge** | `src/projectbrain/server/routes/codegraph.py`, `extensions_mcp/codebase_migration_helper/python_codegraph.py` | `sync_codegraph_data`, `upload_codegraph_db`, `get_codegraph_data`, `diff_projects`, `/codegraph/*` | `.codegraph/codegraph.db`, `projects`, `project_nodes`, `project_edges`, `GraphStore` |
 | **Unified KB & Office Synthesis** | `src/projectbrain/graphify_engine/{kb_linker,doc_synthesizer}.py`, `server/routes/kb.py` | `UnifiedKBBuilder`, `CodeDocLinker`, `WorkspaceASTIntrospector`, `ProjectDocSynthesizer`, `/kb/build`, `/kb/trace`, `/kb/coverage`, `/kb/export` | `docs/kb/wiki/*.md`, `docs/kb/GRAPH_REPORT.md`, `.docx`, `.xlsx`, `.pptx`, `kb_manifest.json` |
-| **FastMCP & Extensions** | `src/projectbrain/ai/{mcp,gemini}.py`, `extensions_mcp/loader.py`, `extensions_mcp/*/server*.py` | `mcp_server`, `resolve_mcp_user_id`, `load_extensions`, `GeminiAdapter`, `_sanitize_error_message`, `/pm/search`, `/pm/generate-doc` | STDIO, `/mcp` SSE, `/mcp-http` Streamable HTTP |
+| **FastMCP & Extensions** | `src/projectbrain/ai/{mcp,gemini}.py`, `extensions_mcp/loader.py`, `extensions_mcp/*/server*.py` | `mcp_server`, `resolve_mcp_user_id`, `sync_codebase_memories`, `projectbrain_list_document_versions`, `projectbrain_diff_document_versions`, `load_extensions`, `GeminiAdapter`, `_sanitize_error_message`, `/pm/search`, `/pm/generate-doc` | STDIO, `/mcp` SSE, `/mcp-http` Streamable HTTP |

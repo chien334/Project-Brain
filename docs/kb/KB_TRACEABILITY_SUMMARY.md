@@ -209,4 +209,26 @@ The live Knowledge Base engine and all generated artifacts are verified through 
 - **Repository Full Test Suite:** `pytest -v` across all test suites passes with 100% success rate (0 failures).
 
 ---
+
+## 6. v3.0 Plugin Microkernel & Testing KB Summary
+
+Project-Brain v3.0 extends the Unified Knowledge Base into a **Plugin Microkernel** serving as **Layer 1** of the 5-Layer AI Multi-Device & Embedded Testing Architecture (bridging Layer 0 specs, legacy testcases, CI/CD MR gates, and QA portals with Layer 2 cognitive consumers for planning, oracle verification, and RCA triage).
+
+### Key v3.0 Capabilities & Surface Area
+
+| Dimension | Coverage | Details |
+| :--- | :--- | :--- |
+| **Built-In Plugins** | **25 plugins / 9 active categories** | `graph_backend` (3), `vector_backend` (2), `etl_parser` (6), `knowledge_linker` (2), `doc_exporter` (4), `script_cache` (2), `artifact_store` (2), `brain_consumer` (3), `webhook` (1); `source_connector` reserved for external connectors. |
+| **Plugin Discovery & Lifecycle** | **3-tier discovery + hot-reload** | Built-ins, directory manifests (`./plugins/<name>/`, `~/.projectbrain/plugins/`, `PB_PLUGINS_DIR`), and `pyproject.toml` `entry_points(group="projectbrain.plugins")`; per-project overrides via `plugin_project_configs` and `projectbrain.toml`. |
+| **Persistence & Migration** | **ANSI SQL (`010_v3_plugin_microkernel.sql`)** | `plugin_project_configs`, `udcp_script_cache` (auto-invalidation at `fallback_rate > 0.25` after `min_samples=4`), `telemetry_artifacts` (8 NTP-aligned stream types, 30–90d TTL), and `v3_rca_incidents` using SQLite/PostgreSQL-compatible `INSERT ... ON CONFLICT ... DO UPDATE`. |
+| **REST API** | **18 new routes** | 5 `/plugins/*` management routes + 13 `/v3/*` ETL, flow-graph, script-cache, artifact, planner, oracle, RCA, and HMAC-verified webhook routes; RBAC protected via `_PROTECTED_REST_PREFIXES`, `_READ_ONLY_POST_ROUTES`, and `_validate_safe_path`. |
+| **FastMCP Agent Tools** | **10 new tools** | 5 read-only (`list_plugins`, `script_cache_lookup`, `query_evidence_window`, `plan_test_dag`, `oracle_context`) and 5 write-guarded (`toggle_plugin`, `ingest_etl`, `script_cache_store`, `index_artifact`, `rca_triage`) supporting both local and `PB_MODE=remote` execution. |
+| **CLI Commands** | **7 new subcommands** | `plugins`, `v3-etl`, `v3-cache`, `v3-artifacts`, `v3-plan`, `v3-oracle`, and `v3-rca`. |
+
+### Traceability References
+- **Developer & Architect Guide:** [`docs/kb/PLUGIN_ARCHITECTURE_GUIDE.md`](./PLUGIN_ARCHITECTURE_GUIDE.md)
+- **Gap Audit Specification:** [`docs/specs/v3-testing-kb-gap-audit.spec.md`](../specs/v3-testing-kb-gap-audit.spec.md)
+- **Implementation Plan:** [`docs/plans/plugin-microkernel-kb-v3.plan.md`](../plans/plugin-microkernel-kb-v3.plan.md)
+
+---
 *Generated automatically by ProjectBrain Unified KB Engine on 2026-11-12.*

@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from ..core.config import env
-from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth, graphify, kb
+from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth, graphify, kb, plugins_v3
 
 logger = logging.getLogger("server")
 
@@ -37,6 +37,14 @@ _WRITE_TOOL_KEYWORDS = (
     "ocr_image",
     "ocr_pdf",
     "img2md_extract",
+    "enable",
+    "disable",
+    "reload",
+    "invalidate",
+    "purge",
+    "index",
+    "triage",
+    "toggle",
 )
 
 _EXPLICIT_WRITE_TOOLS = {
@@ -53,6 +61,10 @@ _EXPLICIT_WRITE_TOOLS = {
     "migration_plan_execution_phases",
 }
 
+_ADMIN_MCP_TOOLS = {
+    "projectbrain_toggle_plugin",
+}
+
 _READ_ONLY_POST_ROUTES = {
     "/memory/search",
     "/codegraph/query",
@@ -60,6 +72,9 @@ _READ_ONLY_POST_ROUTES = {
     "/graphify/hybrid-query",
     "/graphify/local-diff",
     "/pm/search",
+    "/v3/script-cache/lookup",
+    "/v3/planner/test-dag",
+    "/v3/oracle/context",
 }
 
 _PROTECTED_REST_PREFIXES = (
@@ -69,6 +84,8 @@ _PROTECTED_REST_PREFIXES = (
     "/kb",
     "/sources",
     "/pm",
+    "/plugins",
+    "/v3",
 )
 
 
@@ -115,6 +132,21 @@ def _is_write_tool(tool_name: str, tool_obj: Optional[Dict[str, Any]] = None) ->
         return True
 
     return False
+
+
+def _is_admin_tool(tool_name: str) -> bool:
+    """Return True if a FastMCP tool requires the admin role."""
+    name_lower = (tool_name or "").lower().strip()
+    if not name_lower:
+        return False
+
+    short_name = name_lower.split("-", 1)[1] if "-" in name_lower else name_lower
+    tail_name = name_lower.rsplit("-", 1)[-1] if "-" in name_lower else name_lower
+    return (
+        name_lower in _ADMIN_MCP_TOOLS
+        or short_name in _ADMIN_MCP_TOOLS
+        or tail_name in _ADMIN_MCP_TOOLS
+    )
 
 
 def _redact_database_url(db_url: Optional[str]) -> str:
@@ -172,6 +204,8 @@ class SSEFilter:
                                         continue
                                 if self.role == "reader" and _is_write_tool(tool_name, tool):
                                     continue
+                                if self.role != "admin" and _is_admin_tool(tool_name):
+                                    continue
                                 filtered_tools.append(tool)
                             res_json["result"]["tools"] = filtered_tools
                             line = f"data: {json.dumps(res_json)}"
@@ -221,11 +255,16 @@ def create_app() -> FastAPI:
         ):
             return await call_next(request)
 
+        is_admin_plugin_route = (
+            method in ("POST", "PUT", "PATCH", "DELETE")
+            and (normalized_path == "/plugins" or path.startswith("/plugins/"))
+        )
         is_admin_route = (
             normalized_path == "/auth"
             or path.startswith("/auth/")
             or normalized_path == "/memory/mcp"
             or path.startswith("/memory/mcp/")
+            or is_admin_plugin_route
         )
         is_protected_route = is_admin_route or any(
             normalized_path == prefix or path.startswith(prefix + "/")
@@ -309,7 +348,7 @@ def create_app() -> FastAPI:
                                     pass
 
                                 # Then filter tools list
-                                if role == "reader" or allowed_tools_str != "*":
+                                if role != "admin" or allowed_tools_str != "*":
                                     chunk = sse_filter.process_chunk(chunk)
                             yield chunk
 
@@ -356,78 +395,106 @@ def create_app() -> FastAPI:
             role = account["role"]
             allowed_tools_str = account["allowed_tools"] or "*"
 
-            if method == "tools/call":
-                params = payload.get("params", {})
-                tool_name = params.get("name", "")
+            role_token = None
+            try:
+                from ..ai.mcp import mcp_request_role
+                role_token = mcp_request_role.set(role)
+            except Exception:
+                pass
 
-                # Check allowed tools list
-                if allowed_tools_str != "*":
-                    allowed_list = [t.strip() for t in allowed_tools_str.split(",") if t.strip()]
-                    short_tool_name = tool_name.split("-", 1)[1] if "-" in tool_name else tool_name
-                    if tool_name not in allowed_list and short_tool_name not in allowed_list:
+            try:
+                if method == "tools/call":
+                    params = payload.get("params", {})
+                    tool_name = params.get("name", "")
+
+                    # Check allowed tools list
+                    if allowed_tools_str != "*":
+                        allowed_list = [t.strip() for t in allowed_tools_str.split(",") if t.strip()]
+                        short_tool_name = tool_name.split("-", 1)[1] if "-" in tool_name else tool_name
+                        if tool_name not in allowed_list and short_tool_name not in allowed_list:
+                            return JSONResponse(status_code=403, content={
+                                "jsonrpc": "2.0",
+                                "error": {
+                                    "code": -32003,
+                                    "message": f"Permission denied: Your account is not authorized to call tool '{tool_name}'."
+                                },
+                                "id": payload.get("id")
+                            })
+
+                    # Check read-only operations for reader role
+                    if role == "reader" and _is_write_tool(tool_name):
                         return JSONResponse(status_code=403, content={
                             "jsonrpc": "2.0",
                             "error": {
                                 "code": -32003,
-                                "message": f"Permission denied: Your account is not authorized to call tool '{tool_name}'."
+                                "message": f"Permission denied: Read-only accounts cannot execute modifying tool '{tool_name}'."
                             },
                             "id": payload.get("id")
                         })
 
-                # Check read-only operations for reader role
-                if role == "reader" and _is_write_tool(tool_name):
-                    return JSONResponse(status_code=403, content={
-                        "jsonrpc": "2.0",
-                        "error": {
-                            "code": -32003,
-                            "message": f"Permission denied: Read-only accounts cannot execute modifying tool '{tool_name}'."
-                        },
-                        "id": payload.get("id")
-                    })
+                    # Check admin-only tools (e.g. plugin control plane)
+                    if _is_admin_tool(tool_name) and role != "admin":
+                        return JSONResponse(status_code=403, content={
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": -32003,
+                                "message": f"Permission denied: Admin role required to execute tool '{tool_name}'."
+                            },
+                            "id": payload.get("id")
+                        })
 
-            if method == "tools/list" and (allowed_tools_str != "*" or role == "reader"):
-                response = await call_next(request)
-                if response.status_code == 200:
-                    response_body = b""
-                    async for chunk in response.body_iterator:
-                        response_body += chunk
-                    try:
-                        res_json = json.loads(response_body)
-                        if "result" in res_json and "tools" in res_json["result"]:
-                            tools = res_json["result"]["tools"]
-                            filtered_tools = []
-                            allowed_list = []
-                            if allowed_tools_str != "*":
-                                allowed_list = [t.strip() for t in allowed_tools_str.split(",") if t.strip()]
-                            for tool in tools:
-                                tool_name = tool.get("name", "")
-                                short_tool_name = tool_name.split("-", 1)[1] if "-" in tool_name else tool_name
+                if method == "tools/list" and (allowed_tools_str != "*" or role != "admin"):
+                    response = await call_next(request)
+                    if response.status_code == 200:
+                        response_body = b""
+                        async for chunk in response.body_iterator:
+                            response_body += chunk
+                        try:
+                            res_json = json.loads(response_body)
+                            if "result" in res_json and "tools" in res_json["result"]:
+                                tools = res_json["result"]["tools"]
+                                filtered_tools = []
+                                allowed_list = []
                                 if allowed_tools_str != "*":
-                                    if tool_name not in allowed_list and short_tool_name not in allowed_list:
+                                    allowed_list = [t.strip() for t in allowed_tools_str.split(",") if t.strip()]
+                                for tool in tools:
+                                    tool_name = tool.get("name", "")
+                                    short_tool_name = tool_name.split("-", 1)[1] if "-" in tool_name else tool_name
+                                    if allowed_tools_str != "*":
+                                        if tool_name not in allowed_list and short_tool_name not in allowed_list:
+                                            continue
+                                    if role == "reader" and _is_write_tool(tool_name, tool):
                                         continue
-                                if role == "reader" and _is_write_tool(tool_name, tool):
-                                    continue
-                                filtered_tools.append(tool)
-                            res_json["result"]["tools"] = filtered_tools
-                            new_body = json.dumps(res_json).encode("utf-8")
-                            headers = dict(response.headers)
-                            headers["content-length"] = str(len(new_body))
+                                    if role != "admin" and _is_admin_tool(tool_name):
+                                        continue
+                                    filtered_tools.append(tool)
+                                res_json["result"]["tools"] = filtered_tools
+                                new_body = json.dumps(res_json).encode("utf-8")
+                                headers = dict(response.headers)
+                                headers["content-length"] = str(len(new_body))
+                                return Response(
+                                    content=new_body,
+                                    status_code=response.status_code,
+                                    headers=headers,
+                                    media_type=response.media_type,
+                                )
+                        except Exception:
                             return Response(
-                                content=new_body,
+                                content=response_body,
                                 status_code=response.status_code,
-                                headers=headers,
+                                headers=dict(response.headers),
                                 media_type=response.media_type,
                             )
-                    except Exception:
-                        return Response(
-                            content=response_body,
-                            status_code=response.status_code,
-                            headers=dict(response.headers),
-                            media_type=response.media_type,
-                        )
-                return response
+                    return response
 
-        return await call_next(request)
+                return await call_next(request)
+            finally:
+                if role_token is not None:
+                    try:
+                        from ..ai.mcp import mcp_request_role
+                        mcp_request_role.reset(role_token)
+                    except Exception:
+                        pass
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
@@ -465,6 +532,7 @@ def create_app() -> FastAPI:
     app.include_router(sources.router)
     app.include_router(graphify.router)
     app.include_router(kb.router)
+    app.include_router(plugins_v3.router)
     app.include_router(pm.router, prefix="/pm", tags=["pm"])
 
     # Mount FastMCP SSE app and Streamable HTTP app
