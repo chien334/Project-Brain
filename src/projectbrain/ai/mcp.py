@@ -3143,6 +3143,32 @@ async def projectbrain_v3_rca_triage(
         return f"Error executing projectbrain_v3_rca_triage: {str(e)}"
 
 
+@mcp_server.tool(
+    name="projectbrain_database_topology",
+    description="Inspect read-only Master DB -> Project DB -> Branch Schema topology and node/doc/memory counts.",
+)
+async def projectbrain_database_topology(
+    project_id: Optional[str] = None,
+) -> str:
+    """Return read-only Master -> Project DB -> Branch Schema database topology."""
+    try:
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request(
+                "GET",
+                "/master/topology",
+                params={"project_id": project_id} if project_id else None,
+            )
+            return json.dumps(res, default=str, indent=2)
+
+        from ..server.routes.master_topology import collect_master_topology
+
+        topo = collect_master_topology(project_id=project_id)
+        return json.dumps(topo, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_database_topology: {str(e)}"
+
+
 # Dynamically register custom extensions
 try:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))

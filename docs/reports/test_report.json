@@ -1,26 +1,55 @@
 {
-  "report_id": "TEST-REPORT-GPU-CPU-LOCAL-AI-03",
-  "generated_at": "2026-11-21T14:25:17Z",
+  "report_id": "TEST-REPORT-MULTI-DB-3TIER-05",
+  "generated_at": "2026-11-22T04:49:00Z",
   "test_framework": "pytest-9.0.3",
   "python_version": "3.14.4",
   "platform": "darwin",
   "command": "pytest -q",
-  "command_summary": "302 passed, 5 skipped, 81 warnings in 39.27s",
+  "command_summary": "316 passed, 5 skipped, 115 warnings in 41.19s",
   "summary": {
-    "total_tests": 307,
-    "passed": 302,
+    "total_tests": 321,
+    "passed": 316,
     "failed": 0,
     "skipped": 5,
     "pass_rate_percentage": 100.0,
-    "duration_seconds": 39.27
+    "duration_seconds": 41.19
   },
   "rtk_audit": {
     "command": "rg -i '\\brtk\\b' --hidden -g '!.git' /Users/macbbook/SourceCodes/Project-Brain",
     "matches": 0,
     "status": "PASSED"
   },
+  "ui_api_contract_check": {
+    "status": "ALIGNED",
+    "checked_endpoints": [
+      "GET /master/topology",
+      "GET /codegraph/projects"
+    ],
+    "checked_ui_functions": [
+      "fetchMergedTopology",
+      "renderTopologySummary",
+      "loadProjectsList",
+      "openNewBranchSchemaDialog",
+      "sanitizeProjectDbName",
+      "sanitizeBranchSchemaName",
+      "formatEpochTimestamp"
+    ],
+    "findings": [
+      "All structural JSON keys match 100% between master_topology.py and app.js (status, multi_db_enabled, backend_type, master_database.{descriptor,project_count,branch_schema_count}, projects[].{project_id,name,description,db_name,backend_type,root_branch,root_schema,branches[]}, branches[].{branch_name,schema_name,base_branch,is_root,has_graph_schema,has_doc_schema,node_count,doc_count,memory_count}).",
+      "Timestamp normalization resolved: app.js formatEpochTimestamp() detects epoch seconds vs epoch milliseconds (raw > 1e11) before constructing Date()."
+    ]
+  },
   "open_defects_escalated": [],
   "contract_fixes_applied": [
+    {
+      "files": [
+        "src/projectbrain/core/tenant_manager.py",
+        "src/projectbrain/plugins/builtins/brain_consumer_plugins.py",
+        "src/projectbrain/server/static/app.js"
+      ],
+      "issue": "TASK-31E: Missing sqlite3.Row row_factory in _query_branch_counts, direct graph_plugin.create_store() bypassing MultiProjectGraphStore in ImpactTestDAGPlannerPlugin & OracleKnowledgeJudgePlugin, and epoch-ms multiplication by 1000 in app.js.",
+      "resolution": "Set gconn.row_factory = sqlite3.Row in tenant_manager.py; routed default SQLite/Postgres graph store resolution through get_graph_store() in brain_consumer_plugins.py while preserving custom graph plugins; added formatEpochTimestamp() in app.js."
+    },
     {
       "files": [
         "src/projectbrain/server/routes/plugins_v3.py",
@@ -149,6 +178,24 @@
       "failed": 0,
       "skipped": 0
     },
+    "tests/test_full_auth_system.py": {
+      "total": 9,
+      "passed": 9,
+      "failed": 0,
+      "skipped": 0,
+      "description": "Full IAM Auth System: /auth/config, /auth/register, /auth/login (username/email/token), /auth/verify (Bearer & cookie), brute-force lockout & admin unlock, /auth/me, /auth/change-password, /auth/sessions, /auth/api-keys (privilege ceiling, project scope, revocation), admin governance/settings/audit-logs, and static /dashboard/ assets",
+      "tests": [
+        "test_public_auth_config_returns_policy_flags",
+        "test_self_service_register_success_cookie_hash_and_validations",
+        "test_login_all_modes_and_verify_bearer_and_cookie",
+        "test_bruteforce_lockout_and_admin_unlock",
+        "test_self_service_profile_and_change_password_lifecycle",
+        "test_session_listing_revocation_and_logout",
+        "test_personal_api_keys_ceiling_project_scope_and_revocation",
+        "test_admin_governance_settings_and_audit_logs",
+        "test_static_workbench_assets_integrity"
+      ]
+    },
     "tests/test_gpu_cpu_and_local_ai.py": {
       "total": 27,
       "passed": 27,
@@ -257,6 +304,20 @@
       "passed": 24,
       "failed": 0,
       "skipped": 3
+    },
+    "tests/test_multi_db_and_branch_schema.py": {
+      "total": 5,
+      "passed": 5,
+      "failed": 0,
+      "skipped": 0,
+      "description": "3-Tier Multi-DB & Per-Branch Schema Isolation verification (Master DB -> Project DB pb_proj_* -> Branch Schema pb_root / pb_br_*, PG DDL mock, FastMCP & REST RBAC)",
+      "tests": [
+        "test_master_catalog_and_per_project_physical_databases",
+        "test_per_branch_schema_isolation_graphify_and_documents",
+        "test_branch_schema_drop_and_project_database_drop_lifecycle",
+        "test_postgres_ddl_create_database_schema_views_and_search_path",
+        "test_fastmcp_topology_tool_and_rest_rbac"
+      ]
     },
     "tests/test_multilingual_dedup.py": {
       "total": 4,

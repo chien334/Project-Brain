@@ -3,234 +3,584 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ProjectBrain - Premium Cognitive Control Panel</title>
-    <!-- Google Fonts: Outfit -->
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <meta name="color-scheme" content="light dark">
+    <script>
+        try { document.querySelector('meta[name="color-scheme"]').content = localStorage.getItem("pb-color-scheme") ?? "light dark"; } catch (_) {}
+    </script>
+    <title>ProjectBrain v3.0 — Engineering Workbench</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
-    <!-- FontAwesome for Premium Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <!-- Vis.js Standalone for network graph rendering -->
     <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
 </head>
 <body>
-    <div class="glass-bg"></div>
+    <div class="workbench-backdrop" aria-hidden="true"></div>
 
-    <!-- Login Screen overlay -->
+    <!-- Enterprise Auth Gate -->
     <div id="loginScreen" class="login-overlay">
-        <div class="login-card">
-            <div class="login-header">
-                <i class="fa-solid fa-brain-circuit login-icon"></i>
-                <h2>ProjectBrain</h2>
-                <p class="login-subtitle">Enter your authorization token to access the dashboard</p>
-            </div>
-            <form id="loginForm" class="login-form">
-                <div class="form-group">
-                    <label for="loginToken">Authorization Token</label>
-                    <div class="input-with-icon">
-                        <i class="fa-solid fa-key"></i>
-                        <input type="password" id="loginToken" placeholder="pb_tok_..." required autocomplete="current-password">
+        <div class="login-shell">
+            <aside class="login-telemetry-aside" aria-label="Workbench Architecture">
+                <div class="brand-lockup">
+                    <span class="brand-glyph" aria-hidden="true">
+                        <i class="fa-solid fa-diagram-project"></i>
+                    </span>
+                    <div class="brand-copy">
+                        <span class="brand-name">ProjectBrain</span>
+                        <span class="brand-version">v3.0 Workbench</span>
                     </div>
                 </div>
-                <div id="loginError" class="login-error" style="display: none;">
-                    <i class="fa-solid fa-circle-xmark"></i>
-                    <span id="loginErrorMsg">Invalid token. Please try again.</span>
+                <p class="login-aside-lead">
+                    Precision cognitive storage, unified code-to-doc knowledge graphs, and deterministic v3.0 verification telemetry.
+                </p>
+                <dl class="login-spec-list">
+                    <div class="login-spec-row">
+                        <dt>Microkernel</dt>
+                        <dd class="mono-num">26 Plugins</dd>
+                    </div>
+                    <div class="login-spec-row">
+                        <dt>Storage Engine</dt>
+                        <dd class="mono-num">PostgreSQL / SQLite</dd>
+                    </div>
+                    <div class="login-spec-row">
+                        <dt>Auth Boundary</dt>
+                        <dd class="mono-num">RBAC + PAT + Session</dd>
+                    </div>
+                </dl>
+            </aside>
+
+            <section class="login-card" aria-labelledby="loginCardTitle">
+                <div class="login-header">
+                    <h2 id="loginCardTitle">Authenticate Session</h2>
+                    <p class="login-subtitle">Select a credential method to unlock the workspace</p>
                 </div>
-                <button type="submit" class="btn btn-primary btn-block" id="btnLoginSubmit">
-                    <span>Log In to Dashboard</span>
-                    <i class="fa-solid fa-right-to-bracket"></i>
-                </button>
-            </form>
+
+                <div class="auth-mode-tabs" role="tablist" aria-label="Sign-in methods">
+                    <button type="button" role="tab" id="tabAuthPassword" aria-selected="true" class="auth-mode-tab">Password</button>
+                    <button type="button" role="tab" id="tabAuthToken" aria-selected="false" class="auth-mode-tab">Token / API Key</button>
+                    <button type="button" role="tab" id="tabAuthRegister" aria-selected="false" class="auth-mode-tab" hidden>Create Account</button>
+                </div>
+
+                <div id="loginError" class="login-error" role="alert">
+                    <i class="fa-solid fa-circle-xmark" aria-hidden="true"></i>
+                    <span id="loginErrorMsg">Invalid credentials. Please try again.</span>
+                </div>
+
+                <!-- Mode 1: Password Sign In (default) -->
+                <div id="authModePasswordPane" role="tabpanel" aria-labelledby="tabAuthPassword" class="auth-mode-pane">
+                    <form id="passwordLoginForm" class="login-form">
+                        <div class="form-group">
+                            <label for="loginIdentifier">Username or Email</label>
+                            <div class="input-with-icon">
+                                <i class="fa-solid fa-user-check" aria-hidden="true"></i>
+                                <input type="text" id="loginIdentifier" name="username" autocomplete="username" spellcheck="false" autocapitalize="none" autocorrect="off" enterkeyhint="next" required placeholder="admin or you@company.com">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="loginPassword">Password</label>
+                            <div class="input-with-icon password-field-wrap">
+                                <i class="fa-solid fa-lock" aria-hidden="true"></i>
+                                <input type="password" id="loginPassword" name="password" autocomplete="current-password" enterkeyhint="done" required placeholder="Enter your password">
+                                <button type="button" id="btnToggleLoginPassword" class="btn-password-toggle" aria-label="Show password" aria-pressed="false">
+                                    <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <label class="checkbox-row" for="loginRememberMe">
+                            <input type="checkbox" id="loginRememberMe">
+                            <span>Keep me signed in for 30 days</span>
+                        </label>
+                        <button type="submit" id="btnPasswordLoginSubmit" class="btn btn-primary btn-block">
+                            <span>Sign In</span>
+                            <i class="fa-solid fa-right-to-bracket" aria-hidden="true"></i>
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Mode 2: Token / API Key Sign In -->
+                <div id="authModeTokenPane" role="tabpanel" aria-labelledby="tabAuthToken" class="auth-mode-pane" hidden>
+                    <form id="loginForm" class="login-form">
+                        <div class="form-group">
+                            <label for="loginToken">Authorization Token</label>
+                            <div class="input-with-icon password-field-wrap">
+                                <i class="fa-solid fa-key" aria-hidden="true"></i>
+                                <input type="password" id="loginToken" name="token" autocomplete="current-password" spellcheck="false" autocapitalize="none" autocorrect="off" enterkeyhint="done" placeholder="pb_tok_... or pb_pat_..." required>
+                                <button type="button" id="btnToggleTokenInput" class="btn-password-toggle" aria-label="Show token" aria-pressed="false">
+                                    <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                                </button>
+                            </div>
+                            <p class="field-hint">First-time local setup seed token: <code class="code-font">pb_tok_admin</code></p>
+                        </div>
+                        <button type="submit" id="btnLoginSubmit" class="btn btn-primary btn-block">
+                            <span>Sign In with Token</span>
+                            <i class="fa-solid fa-key" aria-hidden="true"></i>
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Mode 3: Create Account (shown when allow_registration is enabled) -->
+                <div id="authModeRegisterPane" role="tabpanel" aria-labelledby="tabAuthRegister" class="auth-mode-pane" hidden>
+                    <form id="registerForm" class="login-form">
+                        <div class="form-group field">
+                            <label for="regUsername">Username</label>
+                            <span id="regUsernameHint" class="hint">3–48 characters: letters, numbers, <code>_</code>, <code>.</code>, or <code>-</code></span>
+                            <input type="text" id="regUsername" name="username" autocomplete="username" spellcheck="false" autocapitalize="none" autocorrect="off" enterkeyhint="next" pattern="[a-zA-Z0-9_.\-]{3,48}" required placeholder="e.g. alex.engineer" aria-describedby="regUsernameHint" data-error="regUsernameError">
+                            <div id="regUsernameError" class="error-msg">
+                                <span role="img" aria-label="Error">!</span> Use 3–48 letters, numbers, dots, underscores, or hyphens.
+                            </div>
+                        </div>
+                        <div class="form-group field">
+                            <label for="regDisplayName">Full Name</label>
+                            <input type="text" id="regDisplayName" name="name" autocomplete="name" enterkeyhint="next" placeholder="Alex Rivera">
+                        </div>
+                        <div class="form-group field">
+                            <label for="regEmail">Email Address</label>
+                            <span id="regEmailHint" class="hint">Format: you@company.com</span>
+                            <input type="email" id="regEmail" name="email" autocomplete="email" spellcheck="false" enterkeyhint="next" placeholder="alex@company.com" aria-describedby="regEmailHint" data-error="regEmailError">
+                            <div id="regEmailError" class="error-msg">
+                                <span role="img" aria-label="Error">!</span> Enter a valid email address in the format you@company.com.
+                            </div>
+                        </div>
+                        <div class="form-group field">
+                            <label for="regPassword">Password</label>
+                            <ul id="regPasswordRules" class="rules-list">
+                                <li>At least 8 characters</li>
+                            </ul>
+                            <div class="password-field-wrap">
+                                <input type="password" id="regPassword" name="new-password" autocomplete="new-password" enterkeyhint="done" minlength="8" required placeholder="Choose a strong password" aria-describedby="regPasswordRules" data-error="regPasswordError">
+                                <button type="button" id="btnToggleRegPassword" class="btn-password-toggle" aria-label="Show password" aria-pressed="false">
+                                    <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                                </button>
+                            </div>
+                            <div id="regPasswordError" class="error-msg">
+                                <span role="img" aria-label="Error">!</span> Password must be at least 8 characters long.
+                            </div>
+                        </div>
+                        <button type="submit" id="btnRegisterSubmit" class="btn btn-primary btn-block">
+                            <span>Create Account</span>
+                            <i class="fa-solid fa-user-plus" aria-hidden="true"></i>
+                        </button>
+                    </form>
+                </div>
+            </section>
         </div>
     </div>
-    
+
+    <!-- Sticky Top Workbench Bar -->
     <header class="app-header">
-        <div class="header-logo">
-            <i class="fa-solid fa-brain-circuit brain-icon"></i>
-            <div>
-                <h1>ProjectBrain</h1>
-                <span class="subtitle">Cognitive Storage System</span>
+        <div class="header-left">
+            <button type="button" id="btnToggleSidebar" class="btn-icon-only" aria-label="Toggle navigation sidebar" aria-expanded="true" title="Toggle Sidebar">
+                <i class="fa-solid fa-bars-staggered" aria-hidden="true"></i>
+            </button>
+            <div class="view-breadcrumb">
+                <span class="breadcrumb-domain" id="activeViewDomain">Workspace &amp; Memory</span>
+                <h1 id="activeViewTitle">Overview</h1>
             </div>
         </div>
-        
-        <div class="project-selector-wrapper" style="display: flex; gap: 16px; align-items: center;">
-            <div style="display: flex; align-items: center; gap: 6px;">
-                <label for="currentProject" style="margin: 0;"><i class="fa-solid fa-folder-tree"></i> Project:</label>
+
+        <div class="project-selector-wrapper workspace-context-pill" role="group" aria-label="Workspace context">
+            <div class="context-segment">
+                <label for="currentProject"><i class="fa-solid fa-folder-tree" aria-hidden="true"></i> Project</label>
                 <select id="currentProject" class="project-select">
                     <option value="default">default</option>
                 </select>
             </div>
-            <div id="branchSelectorContainer" style="display: flex; align-items: center; gap: 6px; border-left: 1px solid rgba(255, 255, 255, 0.1); padding-left: 16px;">
-                <label for="currentBranch" style="margin: 0;"><i class="fa-solid fa-code-branch"></i> Branch:</label>
-                <select id="currentBranch" class="project-select" style="min-width: 100px;">
+            <div id="branchSelectorContainer" class="context-segment context-segment-divider">
+                <label for="currentBranch"><i class="fa-solid fa-code-branch" aria-hidden="true"></i> Branch</label>
+                <select id="currentBranch" class="project-select project-select-branch">
                     <option value="%">All Branches</option>
                 </select>
             </div>
-            <div style="display: flex; align-items: center; gap: 6px; border-left: 1px solid rgba(255, 255, 255, 0.1); padding-left: 16px;">
-                <button id="btnAddProject" class="btn-icon-only" title="Add New Project"><i class="fa-solid fa-plus"></i></button>
-            </div>
-            <div style="display: flex; align-items: center; gap: 6px; border-left: 1px solid rgba(255, 255, 255, 0.1); padding-left: 16px;">
-                <label for="currentUser" style="margin: 0;"><i class="fa-solid fa-user"></i> Your Name:</label>
-                <input type="text" id="currentUser" placeholder="Enter your name..." style="width: 150px; padding: 6px 12px; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.15); background: rgba(255, 255, 255, 0.05); color: #fff; font-size: 13px; font-family: 'Outfit', sans-serif; outline: none; transition: border 0.2s;" onfocus="this.style.borderColor='#818cf8'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'">
+            <div class="context-segment context-segment-divider">
+                <button type="button" id="btnAddProject" class="btn-context-add" command="show-modal" commandfor="newProjectDialog" title="Create New Project">
+                    <i class="fa-solid fa-plus" aria-hidden="true"></i>
+                    <span>New Project</span>
+                </button>
             </div>
         </div>
 
-        <div style="display: flex; align-items: center; gap: 12px;">
-            <div class="connection-status">
-                <span class="status-dot online"></span>
+        <div class="header-right">
+            <button type="button" id="btnOpenCommandPalette" class="btn-cmd-palette" command="show-modal" commandfor="commandPaletteDialog" title="Open Command Palette (Cmd+K)">
+                <i class="fa-solid fa-terminal" aria-hidden="true"></i>
+                <span class="cmd-label">Search</span>
+                <kbd class="kbd-chip">⌘K</kbd>
+            </button>
+
+            <span id="headerHardwareBadge" class="compute-pill" title="Active compute acceleration">
+                <i class="fa-solid fa-microchip" aria-hidden="true"></i>
+                <span>CPU / MPS Ready</span>
+            </span>
+
+            <div class="connection-status" title="Server health">
+                <span class="status-dot online" aria-hidden="true"></span>
                 <span id="backendStatus">Connected</span>
             </div>
-            <div class="user-profile-widget" id="userProfileWidget" style="display: none;">
-                <i class="fa-solid fa-user-shield widget-role-icon"></i>
+
+            <button type="button" id="btnThemeToggle" class="btn-icon-only theme-toggle-btn" aria-label="Switch color theme" title="Toggle System / Light / Dark Theme">
+                <i class="fa-solid fa-sun theme-icon-light" aria-hidden="true"></i>
+                <i class="fa-solid fa-moon theme-icon-dark" aria-hidden="true"></i>
+            </button>
+
+            <div class="user-profile-widget" id="userProfileWidget">
+                <span class="avatar-initials" id="userAvatarInitials" aria-hidden="true">PB</span>
                 <div class="widget-details">
                     <span class="widget-username" id="userProfileName"></span>
                     <span class="widget-role" id="userProfileRole"></span>
                 </div>
-                <button id="btnLogout" title="Logout"><i class="fa-solid fa-right-from-bracket"></i></button>
+                <input type="text" id="currentUser" class="visually-hidden" aria-label="Current user identifier">
+                <button type="button" id="btnQuickProfile" class="btn-icon-only" data-tab-jump="profileTab" title="My Profile &amp; API Keys" aria-label="My Profile and API Keys">
+                    <i class="fa-solid fa-id-badge" aria-hidden="true"></i>
+                </button>
+                <button type="button" id="btnLogout" title="Sign Out" aria-label="Sign Out">
+                    <i class="fa-solid fa-right-from-bracket" aria-hidden="true"></i>
+                </button>
             </div>
         </div>
     </header>
 
-    <main class="dashboard-container" style="display: none;">
-        <!-- Left Sidebar Navigation Menu -->
-        <aside class="sidebar-panel navigation-sidebar">
+    <!-- Main Workbench Shell -->
+    <main class="dashboard-container">
+        <!-- Unified Left-Rail Sidebar -->
+        <aside class="sidebar-panel navigation-sidebar" aria-label="Primary workbench navigation">
             <div class="sidebar-logo">
-                <i class="fa-solid fa-brain brain-logo-icon" style="font-size: 1.5rem; background: linear-gradient(135deg, var(--primary-color), var(--secondary-color)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; filter: drop-shadow(0 0 5px var(--primary-glow));"></i>
-                <span style="font-weight: 700; letter-spacing: -0.02em; font-size: 1.1rem; background: linear-gradient(to right, #ffffff, #e0e7ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">ProjectBrain</span>
+                <span class="brand-glyph brand-glyph-sm" aria-hidden="true">
+                    <i class="fa-solid fa-diagram-project"></i>
+                </span>
+                <div class="sidebar-brand-text">
+                    <span class="sidebar-brand-name">ProjectBrain</span>
+                    <span class="sidebar-brand-tag">v3.0 Studio</span>
+                </div>
             </div>
-            <nav class="nav-menu" style="display: flex; flex-direction: column; gap: 6px; margin-top: 15px;">
-                <button class="menu-link active" data-tab="dashboardTab"><i class="fa-solid fa-chart-line"></i> Dashboard</button>
-                <button class="menu-link" data-tab="memoriesTab"><i class="fa-solid fa-memory"></i> Memory Feed</button>
-                <button class="menu-link" data-tab="searchTab"><i class="fa-solid fa-magnifying-glass"></i> Smart Search</button>
-                <button class="menu-link" data-tab="copilotTab"><i class="fa-solid fa-file-invoice"></i> PM Copilot</button>
-                <button class="menu-link" data-tab="mcpTab"><i class="fa-solid fa-network-wired"></i> MCP Integration</button>
-                <button class="menu-link" data-tab="codeGraphTab" id="btnTabCodeGraph"><i class="fa-solid fa-diagram-project"></i> Code Graph</button>
-                <button class="menu-link" data-tab="compareTab" id="btnTabCompare"><i class="fa-solid fa-code-compare"></i> Version Compare</button>
-                <button class="menu-link" data-tab="projectRegistryTab" id="btnTabProjectRegistry"><i class="fa-solid fa-folder-tree"></i> Project Registry</button>
-                <button class="menu-link" data-tab="authTab" id="btnTabAuth"><i class="fa-solid fa-user-shield"></i> Accounts & Auth</button>
+
+            <nav class="nav-menu" aria-label="Workbench domains">
+                <div class="nav-domain-group">
+                    <span class="nav-domain-label">Workspace &amp; Memory</span>
+                    <button type="button" class="menu-link active" data-tab="dashboardTab" data-domain="Workspace &amp; Memory">
+                        <i class="fa-solid fa-gauge-high" aria-hidden="true"></i>
+                        <span class="nav-label">Overview</span>
+                    </button>
+                    <button type="button" class="menu-link" data-tab="memoriesTab" data-domain="Workspace &amp; Memory">
+                        <i class="fa-solid fa-layer-group" aria-hidden="true"></i>
+                        <span class="nav-label">Memory &amp; Docs</span>
+                    </button>
+                    <button type="button" class="menu-link" data-tab="searchTab" data-domain="Workspace &amp; Memory">
+                        <i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i>
+                        <span class="nav-label">Semantic Search</span>
+                    </button>
+                </div>
+
+                <div class="nav-domain-group">
+                    <span class="nav-domain-label">Code &amp; Knowledge Graph</span>
+                    <button type="button" class="menu-link" data-tab="codeGraphTab" id="btnTabCodeGraph" data-domain="Code &amp; Knowledge Graph">
+                        <i class="fa-solid fa-circle-nodes" aria-hidden="true"></i>
+                        <span class="nav-label">Graph Explorer</span>
+                    </button>
+                    <button type="button" class="menu-link" data-tab="compareTab" id="btnTabCompare" data-domain="Code &amp; Knowledge Graph">
+                        <i class="fa-solid fa-code-compare" aria-hidden="true"></i>
+                        <span class="nav-label">Branch Diff</span>
+                    </button>
+                    <button type="button" class="menu-link" data-tab="kbTab" id="btnTabKb" data-domain="Code &amp; Knowledge Graph">
+                        <i class="fa-solid fa-book-atlas" aria-hidden="true"></i>
+                        <span class="nav-label">Unified KB &amp; Trace</span>
+                    </button>
+                    <button type="button" class="menu-link" data-tab="copilotTab" data-domain="Code &amp; Knowledge Graph">
+                        <i class="fa-solid fa-file-pen" aria-hidden="true"></i>
+                        <span class="nav-label">PM Copilot</span>
+                    </button>
+                </div>
+
+                <div class="nav-domain-group">
+                    <span class="nav-domain-label">Microkernel &amp; v3 QA</span>
+                    <button type="button" class="menu-link" data-tab="pluginsTab" id="btnTabPlugins" data-domain="Microkernel &amp; v3 QA">
+                        <i class="fa-solid fa-cubes" aria-hidden="true"></i>
+                        <span class="nav-label">Plugins &amp; Hardware</span>
+                        <span class="nav-badge mono-num">26</span>
+                    </button>
+                    <button type="button" class="menu-link" data-tab="v3TestingTab" id="btnTabV3" data-domain="Microkernel &amp; v3 QA">
+                        <i class="fa-solid fa-vial-circle-check" aria-hidden="true"></i>
+                        <span class="nav-label">v3.0 Testing Layer 1</span>
+                    </button>
+                    <button type="button" class="menu-link" data-tab="projectRegistryTab" id="btnTabProjectRegistry" data-domain="Microkernel &amp; v3 QA">
+                        <i class="fa-solid fa-folder-tree" aria-hidden="true"></i>
+                        <span class="nav-label">Projects &amp; Databases</span>
+                    </button>
+                    <button type="button" class="menu-link" data-tab="mcpTab" data-domain="Microkernel &amp; v3 QA">
+                        <i class="fa-solid fa-network-wired" aria-hidden="true"></i>
+                        <span class="nav-label">MCP Clients</span>
+                    </button>
+                </div>
+
+                <div class="nav-domain-group">
+                    <span class="nav-domain-label">Identity &amp; Security</span>
+                    <button type="button" class="menu-link" data-tab="profileTab" id="btnTabProfile" data-domain="Identity &amp; Security">
+                        <i class="fa-solid fa-id-card-clip" aria-hidden="true"></i>
+                        <span class="nav-label">My Profile &amp; API Keys</span>
+                    </button>
+                    <button type="button" class="menu-link" data-tab="authTab" id="btnTabAuth" data-domain="Identity &amp; Security">
+                        <i class="fa-solid fa-user-shield" aria-hidden="true"></i>
+                        <span class="nav-label">Identity &amp; RBAC Admin</span>
+                    </button>
+                </div>
             </nav>
         </aside>
 
         <!-- Main Content Area -->
-        <section class="main-content">
-            <!-- Tab 0: System Dashboard -->
+        <section class="main-content" aria-label="Active workbench panel">
+            <!-- Tab 0: Overview (System Dashboard) -->
             <div class="tab-content active" id="dashboardTab">
-                <h2>System Dashboard</h2>
-                <p class="description-text">Overview of stored cognitive memories, active sectors, and metadata tags in the knowledge graph.</p>
-                
-                <div class="dashboard-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; align-items: start;">
-                    <!-- Column 1: Statistics & Sectors -->
-                    <div class="card">
-                        <h3><i class="fa-solid fa-chart-simple"></i> System Statistics</h3>
-                        <div class="stats-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 15px;">
-                            <div class="stat-box" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--card-border); border-radius: 8px; padding: 12px; text-align: center;">
-                                <span class="stat-val" id="totalMemories" style="display: block; font-size: 1.5rem; font-weight: 700; color: var(--primary-color);">0</span>
-                                <span class="stat-lbl" style="font-size: 0.75rem; color: var(--text-secondary);">Memories</span>
+                <div class="view-header">
+                    <div>
+                        <h2>System Overview</h2>
+                        <p class="description-text">Telemetry snapshot of cognitive memory sectors, temporal facts, microkernel plugins, and local compute acceleration.</p>
+                    </div>
+                </div>
+
+                <div id="securitySeedBanner" class="alert-banner alert-warning" role="status" hidden>
+                    <div class="alert-banner-body">
+                        <i class="fa-solid fa-shield-exclamation" aria-hidden="true"></i>
+                        <div>
+                            <strong>Security Recommendation:</strong> Your account is using a default seed token or has no password configured. Set a password and rotate your seed token before deploying.
+                        </div>
+                    </div>
+                    <button type="button" id="btnBannerSetPassword" class="btn btn-amber btn-sm">
+                        <i class="fa-solid fa-key" aria-hidden="true"></i> Set Password &amp; Rotate Seed Token
+                    </button>
+                </div>
+
+                <div class="kpi-strip">
+                    <div class="kpi-card">
+                        <span class="kpi-label">Cognitive Memories</span>
+                        <span class="kpi-value mono-num" id="totalMemories">0</span>
+                        <span class="kpi-meta">Active project vectors</span>
+                    </div>
+                    <div class="kpi-card">
+                        <span class="kpi-label">Temporal Facts</span>
+                        <span class="kpi-value mono-num" id="totalFacts">0</span>
+                        <span class="kpi-meta">Graph edges &amp; relations</span>
+                    </div>
+                    <div class="kpi-card">
+                        <span class="kpi-label">Active Plugins</span>
+                        <span class="kpi-value mono-num" id="statActivePlugins">26</span>
+                        <span class="kpi-meta">Microkernel capabilities</span>
+                    </div>
+                    <div class="kpi-card">
+                        <span class="kpi-label">Compute Backend</span>
+                        <span class="kpi-value kpi-value-sm mono-num" id="statComputeBackend">Auto</span>
+                        <span class="kpi-meta">OCR &amp; Graphify runtime</span>
+                    </div>
+                </div>
+
+                <div class="dashboard-grid">
+                    <!-- Column 1: Hardware & Sectors -->
+                    <div class="stack-col">
+                        <div class="card" id="dashboardHardwareCard">
+                            <div class="card-title-row">
+                                <h3><i class="fa-solid fa-server" aria-hidden="true"></i> Live Hardware &amp; Local AI Acceleration</h3>
+                                <span class="status-tag info">Telemetry</span>
                             </div>
-                            <div class="stat-box" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--card-border); border-radius: 8px; padding: 12px; text-align: center;">
-                                <span class="stat-val" id="totalFacts" style="display: block; font-size: 1.5rem; font-weight: 700; color: var(--primary-color);">0</span>
-                                <span class="stat-lbl" style="font-size: 0.75rem; color: var(--text-secondary);">Temporal Facts</span>
+                            <div class="hardware-summary-grid">
+                                <div class="telemetry-kv">
+                                    <span class="telemetry-k">OCR Device</span>
+                                    <span class="telemetry-v mono-num" id="hwDashOcrDevice">Detecting...</span>
+                                </div>
+                                <div class="telemetry-kv">
+                                    <span class="telemetry-k">Graphify Backend</span>
+                                    <span class="telemetry-v mono-num" id="hwDashGraphBackend">Detecting...</span>
+                                </div>
+                                <div class="telemetry-kv">
+                                    <span class="telemetry-k">CPU / Accelerators</span>
+                                    <span class="telemetry-v mono-num" id="hwDashAccelerators">Detecting...</span>
+                                </div>
+                                <div class="telemetry-kv">
+                                    <span class="telemetry-k">Local AI Endpoints</span>
+                                    <span class="telemetry-v mono-num" id="hwDashLocalAi">Checking...</span>
+                                </div>
                             </div>
                         </div>
-                        
-                        <div class="sector-chart-section" style="margin-top: 25px;">
-                            <h3 style="font-size: 1rem; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-pie-chart"></i> Memory Sectors</h3>
-                            <div class="sector-list" id="sectorCounts" style="margin-top: 15px; display: flex; flex-direction: column; gap: 8px;">
+
+                        <div class="card">
+                            <div class="card-title-row">
+                                <h3><i class="fa-solid fa-chart-pie" aria-hidden="true"></i> Memory Sectors</h3>
+                            </div>
+                            <div class="sector-list" id="sectorCounts">
                                 <div class="sector-item placeholder-item">No data loaded</div>
                             </div>
                         </div>
                     </div>
-                    
-                    <!-- Column 2: Tags & Danger Zone -->
-                    <div class="card" style="display: flex; flex-direction: column; gap: 20px;">
-                        <div>
-                            <h3 style="font-size: 1rem; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-tags"></i> Active Tags</h3>
-                            <div class="tags-cloud" id="activeTags" style="margin-top: 15px; display: flex; flex-wrap: wrap; gap: 6px;">
+
+                    <!-- Column 2: Active Tags, Quick Actions & Danger Zone -->
+                    <div class="stack-col">
+                        <div class="card">
+                            <div class="card-title-row">
+                                <h3><i class="fa-solid fa-tags" aria-hidden="true"></i> Active Tags</h3>
+                            </div>
+                            <div class="tags-cloud" id="activeTags">
                                 <span class="placeholder-item">No tags</span>
                             </div>
                         </div>
-                        
-                        <div class="danger-zone" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(255, 255, 255, 0.05);">
-                            <h3 style="font-size: 1rem; color: var(--danger-color);"><i class="fa-solid fa-triangle-exclamation"></i> Danger Zone</h3>
-                            <p class="info-text" style="margin: 8px 0; font-size: 11px; color: var(--text-secondary);">Clearing all memories will permanently remove all cognitive nodes, temporal facts, and index elements from the active project space.</p>
-                            <button id="btnDeleteAll" class="btn btn-danger" style="width: 100%;"><i class="fa-solid fa-trash-can"></i> Clear All Memories</button>
+
+                        <div class="card">
+                            <div class="card-title-row">
+                                <h3><i class="fa-solid fa-bolt" aria-hidden="true"></i> Quick Workbench Actions</h3>
+                            </div>
+                            <div class="quick-actions-grid">
+                                <button type="button" class="btn btn-secondary" data-tab-jump="memoriesTab">
+                                    <i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i> Ingest Document
+                                </button>
+                                <button type="button" class="btn btn-secondary" data-tab-jump="kbTab">
+                                    <i class="fa-solid fa-book-atlas" aria-hidden="true"></i> Build Unified KB
+                                </button>
+                                <button type="button" class="btn btn-secondary" data-tab-jump="pluginsTab">
+                                    <i class="fa-solid fa-cubes" aria-hidden="true"></i> Inspect Plugins
+                                </button>
+                                <button type="button" class="btn btn-secondary" data-tab-jump="v3TestingTab">
+                                    <i class="fa-solid fa-vial-circle-check" aria-hidden="true"></i> v3.0 Layer 1 QA
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="card danger-zone">
+                            <h3><i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i> Danger Zone</h3>
+                            <p class="info-text">Clearing all memories will permanently remove all cognitive nodes, temporal facts, and index elements from the active project space.</p>
+                            <button type="button" id="btnDeleteAll" class="btn btn-danger btn-block">
+                                <i class="fa-solid fa-trash-can" aria-hidden="true"></i> Clear All Memories
+                            </button>
                         </div>
                     </div>
                 </div>
             </div>
 
-            <!-- Tab 1: Memories Feed -->
+            <!-- Tab 1: Memory & Docs -->
             <div class="tab-content" id="memoriesTab">
                 <div class="card-header-action">
-                    <h2>Recent Cognitive Nodes</h2>
-                    <button id="btnRefreshHistory" class="btn btn-secondary"><i class="fa-solid fa-rotate"></i> Refresh</button>
+                    <div>
+                        <h2>Memory &amp; Document Ingestion</h2>
+                        <p class="description-text">Store persistent cognitive observations or parse PDFs, Office suites, spreadsheets, and images with hardware-accelerated OCR.</p>
+                    </div>
+                    <button type="button" id="btnRefreshHistory" class="btn btn-secondary">
+                        <i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh
+                    </button>
                 </div>
-                
-                <div class="memory-input-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 2rem;">
+
+                <div class="memory-input-row">
                     <!-- Column 1: Store New Memory -->
-                    <div class="add-memory-box card" style="margin-bottom: 0; display: flex; flex-direction: column; height: 100%;">
-                        <h3><i class="fa-solid fa-plus-circle"></i> Store New Memory</h3>
-                        <div class="form-group" style="flex: 1; display: flex; flex-direction: column;">
-                            <textarea id="newMemoryContent" placeholder="Enter content to store (e.g. 'Client prefers dark mode UI and Outfit font')" style="flex: 1; min-height: 80px;"></textarea>
+                    <div class="add-memory-box card">
+                        <h3><i class="fa-solid fa-circle-plus" aria-hidden="true"></i> Store Cognitive Memory</h3>
+                        <div class="form-group flex-1">
+                            <label for="newMemoryContent">Memory Content</label>
+                            <textarea id="newMemoryContent" placeholder="Enter architectural decision, user preference, or system fact..."></textarea>
                         </div>
-                        <div class="form-row" style="margin-top: 10px; display: flex; align-items: flex-end; gap: 10px;">
-                            <div class="form-group" style="flex: 1;">
-                                <label>Tags (comma separated):</label>
-                                <input type="text" id="newMemoryTags" placeholder="e.g. preference, UI">
+                        <div class="form-row">
+                            <div class="form-group flex-1">
+                                <label for="newMemoryTags">Tags (comma separated)</label>
+                                <input type="text" id="newMemoryTags" placeholder="e.g. architecture, security, ui">
                             </div>
-                            <button id="btnSaveMemory" class="btn btn-primary" style="height: 38px;"><i class="fa-solid fa-floppy-disk"></i> Store Memory</button>
+                            <button type="button" id="btnSaveMemory" class="btn btn-primary">
+                                <i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Store Memory
+                            </button>
                         </div>
                     </div>
 
-                    <!-- Column 2: Upload Document -->
-                    <div class="upload-doc-box card" style="display: flex; flex-direction: column; height: 100%;">
-                        <h3><i class="fa-solid fa-cloud-arrow-up"></i> Upload Document</h3>
-                        <div class="form-group" style="flex: 1; justify-content: center; display: flex; flex-direction: column;">
-                            <label for="docUploadFile" style="cursor: pointer; border: 2px dashed rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 20px; text-align: center; background: rgba(255, 255, 255, 0.01); transition: all 0.2s;" id="uploadDropzone">
-                                <i class="fa-solid fa-file-arrow-up fa-2x" style="color: #818cf8; margin-bottom: 8px;"></i>
-                                <div style="font-size: 13px; font-weight: 500;" id="uploadStatusText">Click to select PDF, DOCX, XLSX, TXT</div>
-                                <div style="font-size: 11px; color: var(--text-secondary); margin-top: 4px;">File will parse locally to Markdown</div>
+                    <!-- Column 2: Upload & Parse Document -->
+                    <div class="upload-doc-box card">
+                        <h3><i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i> Upload &amp; Parse Document</h3>
+                        <div id="activeTenantStorageHint" class="tenant-storage-hint code-font" role="status" aria-live="polite">
+                            <i class="fa-solid fa-database" aria-hidden="true"></i>
+                            <span>Target Storage: DB pb_proj_default &rarr; Schema pb_root (Graph + Docs)</span>
+                        </div>
+                        <div class="form-group">
+                            <label for="docUploadFile" id="uploadDropzone" class="upload-dropzone">
+                                <i class="fa-solid fa-file-arrow-up fa-2x" aria-hidden="true"></i>
+                                <span id="uploadStatusText" class="dropzone-title">Click to select PDF, DOCX, XLSX, PPTX, CSV, MD, or Image</span>
+                                <span class="dropzone-sub">Document is parsed locally to structured Markdown and versioned</span>
                             </label>
-                            <input type="file" id="docUploadFile" style="display: none;" accept=".pdf,.docx,.xlsx,.xls,.txt,.md">
+                            <input type="file" id="docUploadFile" class="visually-hidden" accept=".pdf,.docx,.xlsx,.xls,.pptx,.csv,.txt,.md,.png,.jpg,.jpeg">
                         </div>
-                        <div class="form-row" style="margin-top: 10px; display: flex; align-items: flex-end; gap: 10px;">
-                            <div class="form-group" style="flex: 1;">
-                                <label>Tags (comma separated):</label>
-                                <input type="text" id="docUploadTags" placeholder="e.g. spec, architecture">
+                        <div class="form-row">
+                            <div class="form-group flex-1">
+                                <label for="docOcrEngine">OCR Engine</label>
+                                <select id="docOcrEngine">
+                                    <option value="auto" selected>Auto (Best Available)</option>
+                                    <option value="paddle">PaddleOCR</option>
+                                    <option value="rapidocr">RapidOCR</option>
+                                    <option value="tesseract">Tesseract</option>
+                                    <option value="ollama">Ollama Vision</option>
+                                    <option value="vllm">vLLM Vision</option>
+                                    <option value="hybrid_local">Hybrid Local Pipeline</option>
+                                </select>
                             </div>
-                            <button id="btnUploadDoc" class="btn btn-primary" style="height: 38px;"><i class="fa-solid fa-upload"></i> Upload</button>
+                            <div class="form-group flex-1">
+                                <label for="docOcrDevice">OCR Device</label>
+                                <select id="docOcrDevice">
+                                    <option value="auto" selected>Auto</option>
+                                    <option value="gpu">CUDA GPU</option>
+                                    <option value="mps">Apple MPS</option>
+                                    <option value="cpu">CPU</option>
+                                </select>
+                            </div>
                         </div>
+                        <div class="form-row">
+                            <div class="form-group flex-1">
+                                <label for="docUploadTags">Tags (comma separated)</label>
+                                <input type="text" id="docUploadTags" placeholder="e.g. spec, architecture, rfc">
+                            </div>
+                            <button type="button" id="btnUploadDoc" class="btn btn-primary">
+                                <i class="fa-solid fa-upload" aria-hidden="true"></i> Upload &amp; Parse
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="filter-bar card">
+                    <div class="search-input-group">
+                        <i class="fa-solid fa-filter search-icon" aria-hidden="true"></i>
+                        <input type="search" id="memoryFilterInput" placeholder="Filter visible memory feed by text, sector, or tag..." aria-label="Filter memory feed">
                     </div>
                 </div>
 
                 <div class="memories-feed" id="memoriesFeed">
-                    <div class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading memories...</div>
+                    <div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading memories...</div>
+                </div>
+
+                <div class="card section-spacer">
+                    <div class="card-header-action">
+                        <h3><i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i> Ingested Document Versions</h3>
+                        <button type="button" id="btnRefreshDocs" class="btn btn-secondary btn-sm">
+                            <i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh Docs
+                        </button>
+                    </div>
+                    <div id="ingestedDocsList" class="docs-version-list">
+                        <div class="placeholder-item">No versioned documents loaded yet.</div>
+                    </div>
                 </div>
             </div>
 
-            <!-- Tab 2: Smart Search -->
+            <!-- Tab 2: Semantic Search -->
             <div class="tab-content" id="searchTab">
-                <h2>AI Semantic & Fact Search</h2>
+                <h2>AI Semantic &amp; Fact Search</h2>
+                <p class="description-text">Query cognitive memory vectors with Gemini RAG synthesis or raw temporal context retrieval.</p>
                 <div class="search-box card">
                     <div class="search-input-group">
-                        <i class="fa-solid fa-magnifying-glass search-icon"></i>
-                        <input type="text" id="searchQuery" placeholder="Ask a question or search keywords...">
-                        <button id="btnSearch" class="btn btn-primary">Search</button>
+                        <i class="fa-solid fa-magnifying-glass search-icon" aria-hidden="true"></i>
+                        <input type="search" id="searchQuery" enterkeyhint="search" placeholder="Ask a question or search keywords..." aria-label="Semantic search query">
+                        <button type="button" id="btnSearch" class="btn btn-primary">Search</button>
                     </div>
                     <div class="search-modes">
                         <label class="radio-label">
                             <input type="radio" name="searchMode" value="rag" checked>
-                            <span><i class="fa-solid fa-wand-magic-sparkles"></i> Gemini RAG Search</span>
+                            <span><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Gemini RAG Search</span>
                         </label>
                         <label class="radio-label">
                             <input type="radio" name="searchMode" value="raw">
-                            <span><i class="fa-solid fa-database"></i> Raw Context Retrieval</span>
+                            <span><i class="fa-solid fa-database" aria-hidden="true"></i> Raw Context Retrieval</span>
                         </label>
                     </div>
                 </div>
 
                 <div id="searchResults" class="search-results-container">
                     <div class="empty-state">
-                        <i class="fa-solid fa-search"></i>
+                        <i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i>
                         <p>Enter a query above to explore ProjectBrain</p>
                     </div>
                 </div>
@@ -239,65 +589,67 @@
             <!-- Tab 3: PM Copilot -->
             <div class="tab-content" id="copilotTab">
                 <h2>Product Manager Documentation Copilot</h2>
-                <p class="description-text">Leverage Google Gemini to automatically compile meeting notes, features, preferences, and details stored in memory into structured PM documentation.</p>
+                <p class="description-text">Compile meeting notes, features, architectural preferences, and project memories into structured PM documentation.</p>
 
                 <div class="copilot-form card">
                     <div class="form-group">
-                        <label for="docType">Document Type:</label>
+                        <label for="docType">Document Type</label>
                         <select id="docType">
-                            <option value="status_report">Project Status Update (Báo cáo tiến độ)</option>
+                            <option value="status_report">Project Status Update</option>
                             <option value="prd">Product Requirement Document (PRD)</option>
-                            <option value="user_story">User Stories & Acceptance Criteria</option>
-                            <option value="roadmap">Product Development Roadmap (Lộ trình)</option>
+                            <option value="user_story">User Stories &amp; Acceptance Criteria</option>
+                            <option value="roadmap">Product Development Roadmap</option>
                         </select>
                     </div>
-                    
+
                     <div class="form-group">
-                        <label for="copilotPrompt">Prompt / Guidance:</label>
+                        <label for="copilotPrompt">Prompt / Guidance</label>
                         <textarea id="copilotPrompt" placeholder="Provide context or instructions, e.g. 'Summarize all features completed this week and identify any blocking risks based on project memory'"></textarea>
                     </div>
 
-                    <button id="btnGenerateDoc" class="btn btn-primary"><i class="fa-solid fa-magic"></i> Generate Document</button>
+                    <div>
+                        <button type="button" id="btnGenerateDoc" class="btn btn-primary">
+                            <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Generate Document
+                        </button>
+                    </div>
                 </div>
 
-                <div id="copilotResults" class="copilot-results-container" style="display: none;">
+                <div id="copilotResults" class="copilot-results-container">
                     <div class="doc-viewer card">
                         <div class="doc-header">
-                            <h3><i class="fa-solid fa-file-lines"></i> Generated Document</h3>
-                            <button id="btnCopyDoc" class="btn btn-secondary btn-sm"><i class="fa-solid fa-copy"></i> Copy Markdown</button>
+                            <h3><i class="fa-solid fa-file-lines" aria-hidden="true"></i> Generated Document</h3>
+                            <button type="button" id="btnCopyDoc" class="btn btn-secondary btn-sm">
+                                <i class="fa-solid fa-copy" aria-hidden="true"></i> Copy Markdown
+                            </button>
                         </div>
-                        <div class="doc-body markdown-body" id="generatedDocContent">
-                            <!-- Generated markdown goes here -->
-                        </div>
+                        <div class="doc-body markdown-body" id="generatedDocContent"></div>
                     </div>
 
                     <div class="sources-list card">
-                        <h3><i class="fa-solid fa-link"></i> Utilized Source Memories</h3>
-                        <div id="docSourcesFeed">
-                            <!-- Memories used for doc generation -->
-                        </div>
+                        <h3><i class="fa-solid fa-link" aria-hidden="true"></i> Utilized Source Memories</h3>
+                        <div id="docSourcesFeed"></div>
                     </div>
                 </div>
             </div>
 
             <!-- Tab 4: MCP Integration -->
             <div class="tab-content" id="mcpTab">
-                <h2>Model Context Protocol (MCP) Local System Integration</h2>
-                <p class="description-text">Configure how local AI clients (like Claude Desktop) connect to ProjectBrain. You can choose to run MCP via local <strong>Stdio</strong> (spawning a process) or <strong>HTTP/SSE</strong> (server-sent events stream).</p>
+                <h2>Model Context Protocol (MCP) Client Integration</h2>
+                <p class="description-text">Configure how AI clients (Claude Desktop, Cursor, VS Code Copilot) connect to ProjectBrain via <strong>Stdio</strong> or <strong>HTTP/SSE</strong>.</p>
 
                 <div class="mcp-config-container card">
-                    <h3><i class="fa-solid fa-gears"></i> Integration Settings</h3>
-                    
+                    <h3><i class="fa-solid fa-gears" aria-hidden="true"></i> Integration Settings</h3>
+
                     <div class="form-group">
-                        <label>Connection Method (Transport Type):</label>
+                        <span class="field-group-label">Connection Method (Transport Type)</span>
                         <div class="radio-group">
                             <label class="radio-label">
                                 <input type="radio" name="mcpTransport" value="stdio" checked>
-                                <span><i class="fa-solid fa-terminal"></i> Stdio (Local Process)</span>
+                                <span><i class="fa-solid fa-terminal" aria-hidden="true"></i> Stdio (Local Process)</span>
                             </label>
                             <label class="radio-label">
                                 <input type="radio" name="mcpTransport" value="sse">
-                                <span><i class="fa-solid fa-cloud-arrow-down"></i> HTTP/SSE (Server Stream)</span>
+                                <span><i class="fa-solid fa-cloud-arrow-down" aria-hidden="true"></i> HTTP/SSE (Server Stream)</span>
                             </label>
                         </div>
                     </div>
@@ -305,200 +657,219 @@
                     <!-- Stdio specific config -->
                     <div id="mcpStdioConfig" class="mcp-sub-config">
                         <div class="form-row">
-                            <div class="form-group">
-                                <label for="mcpUserId">Default User ID:</label>
+                            <div class="form-group flex-1">
+                                <label for="mcpUserId">Default User ID</label>
                                 <input type="text" id="mcpUserId" value="default" placeholder="default">
                             </div>
-                            <div class="form-group">
-                                <label for="mcpTags">Default Tags:</label>
+                            <div class="form-group flex-1">
+                                <label for="mcpTags">Default Tags</label>
                                 <input type="text" id="mcpTags" value="source:mcp" placeholder="source:mcp">
                             </div>
                         </div>
-                        <p class="info-text"><i class="fa-solid fa-info-circle"></i> Stdio mode registers a command calling ProjectBrain's package on this python environment directly, setting these default tags and user ID in environment variables.</p>
+                        <p class="info-text"><i class="fa-solid fa-circle-info" aria-hidden="true"></i> Stdio mode registers a command calling ProjectBrain on this Python environment directly with these default environment variables.</p>
                     </div>
 
                     <!-- SSE specific config -->
-                    <div id="mcpSseConfig" class="mcp-sub-config" style="display: none;">
+                    <div id="mcpSseConfig" class="mcp-sub-config">
                         <div class="form-group">
-                            <label for="mcpSseUrl">SSE Endpoint URL:</label>
+                            <label for="mcpSseUrl">SSE Endpoint URL</label>
                             <input type="text" id="mcpSseUrl" value="http://localhost:8080/mcp/sse">
                         </div>
-                        <p class="info-text"><i class="fa-solid fa-info-circle"></i> SSE mode routes client queries to the running server. It registers a proxy connection using <code>mcp-remote</code> inside Claude Desktop.</p>
+                        <p class="info-text"><i class="fa-solid fa-circle-info" aria-hidden="true"></i> SSE mode routes client queries to the running server via <code>mcp-remote</code> inside Claude Desktop.</p>
                     </div>
 
                     <div class="action-buttons">
-                        <button id="btnRegisterMcp" class="btn btn-primary"><i class="fa-solid fa-circle-check"></i> Install & Apply Configuration</button>
-                        <button id="btnUnregisterMcp" class="btn btn-secondary"><i class="fa-solid fa-circle-xmark"></i> Remove Integration</button>
+                        <button type="button" id="btnRegisterMcp" class="btn btn-primary">
+                            <i class="fa-solid fa-circle-check" aria-hidden="true"></i> Install &amp; Apply Configuration
+                        </button>
+                        <button type="button" id="btnUnregisterMcp" class="btn btn-secondary">
+                            <i class="fa-solid fa-circle-xmark" aria-hidden="true"></i> Remove Integration
+                        </button>
                     </div>
                 </div>
 
                 <div class="mcp-status-panel card">
-                    <h3><i class="fa-solid fa-shield-halved"></i> Active System Status</h3>
+                    <h3><i class="fa-solid fa-shield-halved" aria-hidden="true"></i> Active System Status</h3>
                     <div class="status-indicator">
-                        <span class="status-label">Claude Desktop Config File:</span>
+                        <span class="status-label">Claude Desktop Config File</span>
                         <span id="mcpFileStatus" class="status-tag danger">Not Checked</span>
                     </div>
                     <div class="status-indicator">
-                        <span class="status-label">ProjectBrain Registered:</span>
+                        <span class="status-label">ProjectBrain Registered</span>
                         <span id="mcpRegisteredStatus" class="status-tag danger">No</span>
                     </div>
-                    <div class="form-group mt-15">
-                        <label>Config Path:</label>
+                    <div class="form-group">
+                        <label for="mcpConfigPath">Config Path</label>
                         <input type="text" id="mcpConfigPath" readonly class="code-font select-all">
                     </div>
                     <div class="form-group">
-                        <label>Active Configuration JSON in Claude Desktop:</label>
+                        <span class="field-group-label">Active Configuration JSON in Claude Desktop</span>
                         <pre class="code-block" id="mcpActiveConfig">{}</pre>
                     </div>
                 </div>
 
                 <!-- Local Project Config Generator -->
-                <div class="card mt-20" style="margin-top: 2rem;">
-                    <h2><i class="fa-solid fa-file-code"></i> Local Project Configuration (mcp.json)</h2>
-                    <p class="description-text">If you are using Cursor, Claude Code, or VS Code Copilot, you can configure the MCP server specifically for your current project workspace. Copy the JSON snippet below and save it as <code>.mcp.json</code> or <code>.vscode/mcp.json</code> inside your project root directory.</p>
-                    
-                    <div class="form-group mt-15">
-                        <label>Active Project Context:</label>
-                        <span id="activeProjectDisplay" style="color: var(--primary-color); font-weight: 600; font-family: monospace; font-size: 14px;">default</span>
-                    </div>
-                    
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px;">
-                        <!-- Col 1: HTTP/SSE Transports -->
-                        <div class="form-group">
-                            <label style="font-weight: 600;"><i class="fa-solid fa-code"></i> VS Code Copilot (<code>.vscode/mcp.json</code> - HTTP/SSE):</label>
-                            <pre class="code-block" id="mcpCopilotConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
-                        </div>
-                        <div class="form-group">
-                            <label style="font-weight: 600;"><i class="fa-solid fa-cloud"></i> Claude Code / Cursor (<code>.mcp.json</code> - HTTP/SSE):</label>
-                            <pre class="code-block" id="mcpClaudeConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
-                        </div>
+                <div class="card section-spacer">
+                    <h3><i class="fa-solid fa-file-code" aria-hidden="true"></i> Local Project Configuration (mcp.json)</h3>
+                    <p class="description-text">Save the snippet below as <code>.mcp.json</code> or <code>.vscode/mcp.json</code> inside your project workspace root.</p>
+
+                    <div class="active-context-line">
+                        <span>Active Project Context:</span>
+                        <code id="activeProjectDisplay" class="code-font context-badge">default</code>
                     </div>
 
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px;">
-                        <!-- Col 2: Stdio Transports -->
+                    <div class="two-col-grid">
                         <div class="form-group">
-                            <label style="font-weight: 600;"><i class="fa-solid fa-terminal"></i> Claude Code / Cursor (<code>.mcp.json</code> - Stdio Local):</label>
-                            <pre class="code-block" id="mcpStdioLocalConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
+                            <span class="field-group-label"><i class="fa-solid fa-code" aria-hidden="true"></i> VS Code Copilot (<code>.vscode/mcp.json</code> — HTTP/SSE)</span>
+                            <pre class="code-block code-block-copy" id="mcpCopilotConfig" title="Click to copy">Loading...</pre>
                         </div>
                         <div class="form-group">
-                            <label style="font-weight: 600;"><i class="fa-solid fa-network-wired"></i> Claude Code / Cursor (<code>.mcp.json</code> - Stdio Remote DB):</label>
-                            <pre class="code-block" id="mcpStdioRemoteConfig" style="user-select: all; cursor: pointer; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; overflow-x: auto; min-height: 120px;" title="Click to copy">Loading...</pre>
+                            <span class="field-group-label"><i class="fa-solid fa-cloud" aria-hidden="true"></i> Claude Code / Cursor (<code>.mcp.json</code> — HTTP/SSE)</span>
+                            <pre class="code-block code-block-copy" id="mcpClaudeConfig" title="Click to copy">Loading...</pre>
+                        </div>
+                        <div class="form-group">
+                            <span class="field-group-label"><i class="fa-solid fa-terminal" aria-hidden="true"></i> Claude Code / Cursor (<code>.mcp.json</code> — Stdio Local)</span>
+                            <pre class="code-block code-block-copy" id="mcpStdioLocalConfig" title="Click to copy">Loading...</pre>
+                        </div>
+                        <div class="form-group">
+                            <span class="field-group-label"><i class="fa-solid fa-network-wired" aria-hidden="true"></i> Claude Code / Cursor (<code>.mcp.json</code> — Stdio Remote DB)</span>
+                            <pre class="code-block code-block-copy" id="mcpStdioRemoteConfig" title="Click to copy">Loading...</pre>
                         </div>
                     </div>
                 </div>
 
                 <!-- External MCP Servers Manager -->
-                <div class="card mt-20" id="externalMcpCard" style="margin-top: 2rem;">
-                    <h2><i class="fa-solid fa-plug"></i> External MCP Servers Manager</h2>
-                    <p class="description-text">Extend your AI system by registering other MCP servers directly into your Claude Desktop configuration.</p>
-                    
-                    <div class="form-row" style="margin-top: 15px; margin-bottom: 15px;">
+                <div class="card section-spacer" id="externalMcpCard">
+                    <h3><i class="fa-solid fa-plug" aria-hidden="true"></i> External MCP Servers Manager</h3>
+                    <p class="description-text">Extend your workbench by registering external MCP servers directly into your Claude Desktop configuration.</p>
+
+                    <div class="form-row">
                         <div class="form-group flex-1">
-                            <label for="extMcpName">Server Name:</label>
+                            <label for="extMcpName">Server Name</label>
                             <input type="text" id="extMcpName" placeholder="e.g. postgres-mcp">
                         </div>
                         <div class="form-group flex-1">
-                            <label for="extMcpCommand">Command:</label>
-                            <input type="text" id="extMcpCommand" placeholder="e.g. npx or docker or node">
+                            <label for="extMcpCommand">Command</label>
+                            <input type="text" id="extMcpCommand" placeholder="e.g. npx, docker, or node">
                         </div>
                     </div>
-                    
+
                     <div class="form-group">
-                        <label for="extMcpArgs">Arguments (JSON Array, e.g. ["-y", "@modelcontextprotocol/server-postgres"]):</label>
-                        <input type="text" id="extMcpArgs" value="[]" placeholder='e.g. ["-y", "@modelcontextprotocol/server-postgres", "postgresql://..."]'>
+                        <label for="extMcpArgs">Arguments (JSON Array)</label>
+                        <input type="text" id="extMcpArgs" class="code-font" value="[]" placeholder='["-y", "@modelcontextprotocol/server-postgres", "postgresql://..."]'>
                     </div>
 
-                    <div class="form-group mt-15">
-                        <label for="extMcpEnv">Environment Variables (JSON Object, optional):</label>
-                        <input type="text" id="extMcpEnv" value="{}" placeholder='e.g. {"DB_URL": "...", "API_KEY": "..."}'>
+                    <div class="form-group">
+                        <label for="extMcpEnv">Environment Variables (JSON Object, optional)</label>
+                        <input type="text" id="extMcpEnv" class="code-font" value="{}" placeholder='{"DB_URL": "...", "API_KEY": "..."}'>
                     </div>
 
-                    <div style="margin-top: 15px; display: flex; justify-content: flex-end;">
-                        <button id="btnSaveExtMcp" class="btn btn-primary"><i class="fa-solid fa-save"></i> Save MCP Server</button>
+                    <div class="form-actions-end">
+                        <button type="button" id="btnSaveExtMcp" class="btn btn-primary">
+                            <i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save MCP Server
+                        </button>
                     </div>
 
-                    <h3 style="margin-top: 25px; margin-bottom: 10px;"><i class="fa-solid fa-list"></i> Registered External MCP Servers</h3>
+                    <h4 class="subsection-heading"><i class="fa-solid fa-list" aria-hidden="true"></i> Registered External MCP Servers</h4>
                     <div id="externalMcpList" class="external-mcp-list">
-                        <!-- Dynamic list of external servers -->
                         <div class="placeholder-item">No external MCP servers registered yet.</div>
                     </div>
                 </div>
             </div>
 
-            <!-- Tab 5: Code Graph -->
+            <!-- Tab 5: Graph Explorer (Code Graph) -->
             <div class="tab-content" id="codeGraphTab">
-                <h2>Codebase Structure Graph (Codegraph)</h2>
-                <p class="description-text">Visualizing code relationships, function calls, class inheritances, and imports indexed by Codegraph.</p>
-                
+                <h2>Codebase Structure Graph (CodeGraph)</h2>
+                <p class="description-text">Interactive topology of modules, classes, methods, PLC/LASAL servers, and call-graph edges.</p>
+
                 <div class="codegraph-controls card">
-                    <div class="form-row">
-                        <div class="form-group flex-1">
-                            <label for="cgProjectSelect">Active Project:</label>
+                    <div class="codegraph-toolbar-grid">
+                        <div class="form-group">
+                            <label for="cgProjectSelect">Active Project</label>
                             <select id="cgProjectSelect">
                                 <option value="">Local Codegraph (Default)</option>
                             </select>
                         </div>
-                        <div class="form-group flex-2">
-                            <label for="cgSearchInput">Search Symbols:</label>
-                            <input type="text" id="cgSearchInput" placeholder="Search by class name, function, or file...">
+                        <div class="form-group">
+                            <label for="cgSearchInput">Search Symbols</label>
+                            <input type="search" id="cgSearchInput" placeholder="Search by class name, function, or file...">
                         </div>
-                        <div class="form-group flex-1">
-                            <label for="cgKindSelect">Filter by Kind:</label>
+                        <div class="form-group">
+                            <label for="cgKindSelect">Filter by Kind</label>
                             <select id="cgKindSelect">
                                 <option value="class,function,method,file" selected>Standard View (Clean)</option>
-                                <option value="class,function,method,file,variable,server,client">PLC/LASAL View (with Servers & Clients)</option>
-                                <option value="all">All Kinds (with Imports & Variables)</option>
+                                <option value="class,function,method,file,variable,server,client">PLC/LASAL View (with Servers &amp; Clients)</option>
+                                <option value="all">All Kinds (with Imports &amp; Variables)</option>
                                 <option value="class">Classes Only</option>
-                                <option value="function,method">Functions & Methods</option>
+                                <option value="function,method">Functions &amp; Methods</option>
                                 <option value="file">Files Only</option>
                             </select>
                         </div>
-                        <div class="form-group align-end">
-                            <button id="btnLoadCodeGraph" class="btn btn-primary"><i class="fa-solid fa-sync"></i> Load Graph</button>
+                        <div class="form-group">
+                            <button type="button" id="btnLoadCodeGraph" class="btn btn-primary">
+                                <i class="fa-solid fa-rotate" aria-hidden="true"></i> Load Graph
+                            </button>
                         </div>
                     </div>
                 </div>
 
-
-
-                <div class="graph-layout" style="margin-top: 25px;">
-                    <div class="graph-container card" style="position: relative; height: 550px; overflow: hidden; padding: 0; flex: 1;">
-                        <div id="codegraphNetwork" style="width: 100%; height: 100%;"></div>
-                        <div id="graphLoader" class="loader" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); display: none;">
-                            <i class="fa-solid fa-spinner fa-spin fa-2x"></i>
-                            <p style="margin-top: 10px;">Rendering Code Graph...</p>
+                <div class="graph-layout" id="graphLayout">
+                    <div class="graph-container card" id="graphContainer">
+                        <div id="graphHudStats" class="graph-hud-stats" aria-live="polite">
+                            <span id="graphHudCount" class="graph-hud-count">0 nodes · 0 edges</span>
+                            <div class="graph-hud-legend" aria-label="Node kind legend">
+                                <span class="legend-chip"><span class="legend-dot legend-dot-class" aria-hidden="true"></span>Class</span>
+                                <span class="legend-chip"><span class="legend-dot legend-dot-function" aria-hidden="true"></span>Function</span>
+                                <span class="legend-chip"><span class="legend-dot legend-dot-file" aria-hidden="true"></span>File</span>
+                                <span class="legend-chip"><span class="legend-dot legend-dot-doc" aria-hidden="true"></span>Doc</span>
+                            </div>
                         </div>
-                        <div id="graphEmptyState" class="empty-state" style="display: none; height: 100%; justify-content: center; align-items: center; flex-direction: column;">
-                            <i class="fa-solid fa-circle-nodes" style="font-size: 3em; color: var(--text-secondary);"></i>
-                            <p style="margin-top: 15px;">No nodes match the filter or search. Try loading again.</p>
+                        <div class="graph-hud-controls" role="toolbar" aria-label="Graph canvas controls">
+                            <button type="button" id="btnGraphZoomIn" class="btn-icon-only" title="Zoom in" aria-label="Zoom in"><i class="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i></button>
+                            <button type="button" id="btnGraphZoomOut" class="btn-icon-only" title="Zoom out" aria-label="Zoom out"><i class="fa-solid fa-magnifying-glass-minus" aria-hidden="true"></i></button>
+                            <button type="button" id="btnGraphFit" class="btn-icon-only" title="Fit graph to view" aria-label="Fit graph to view"><i class="fa-solid fa-compress" aria-hidden="true"></i></button>
+                            <button type="button" id="btnGraphPhysics" class="btn-icon-only is-active" title="Toggle physics layout" aria-label="Toggle physics layout" aria-pressed="true"><i class="fa-solid fa-atom" aria-hidden="true"></i></button>
+                            <button type="button" id="btnGraphFullscreen" class="btn btn-secondary btn-sm" title="Toggle fullscreen graph (F)" aria-pressed="false"><i class="fa-solid fa-expand" aria-hidden="true"></i> <span>Fullscreen</span></button>
+                        </div>
+                        <div id="codegraphNetwork"></div>
+                        <div id="graphLoader" class="loader graph-overlay-state">
+                            <i class="fa-solid fa-spinner fa-spin fa-2x" aria-hidden="true"></i>
+                            <p>Rendering Code Graph...</p>
+                        </div>
+                        <div id="graphEmptyState" class="empty-state graph-overlay-state">
+                            <i class="fa-solid fa-circle-nodes" aria-hidden="true"></i>
+                            <p>No nodes match the filter or search. Try loading again.</p>
                         </div>
                     </div>
-                    
-                    <div class="node-details-panel card" id="nodeDetailsPanel" style="display: none; width: 300px;">
-                        <h3><i class="fa-solid fa-circle-info"></i> Symbol Details</h3>
+
+                    <div class="node-details-panel card" id="nodeDetailsPanel">
+                        <div class="node-details-header">
+                            <h3><i class="fa-solid fa-circle-info" aria-hidden="true"></i> Symbol Details</h3>
+                            <button type="button" id="btnCloseNodeDetails" class="btn-icon-only" aria-label="Close symbol details" title="Close symbol details"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
+                        </div>
                         <div class="node-details-content">
                             <div class="detail-item">
-                                <span class="detail-label">Name:</span>
+                                <span class="detail-label">Name</span>
                                 <span id="ndName" class="detail-value code-font font-bold"></span>
                             </div>
                             <div class="detail-item">
-                                <span class="detail-label">Kind:</span>
+                                <span class="detail-label">Kind</span>
                                 <span id="ndKind" class="status-tag info"></span>
                             </div>
                             <div class="detail-item">
-                                <span class="detail-label">File Path:</span>
+                                <span class="detail-label">File Path</span>
                                 <span id="ndFilePath" class="detail-value code-font"></span>
                             </div>
                             <div class="detail-item" id="ndLineRow">
-                                <span class="detail-label">Lines:</span>
-                                <span id="ndLines" class="detail-value"></span>
+                                <span class="detail-label">Lines</span>
+                                <span id="ndLines" class="detail-value mono-num"></span>
                             </div>
                             <div class="detail-item" id="ndSignatureRow">
-                                <span class="detail-label">Signature:</span>
-                                <pre id="ndSignature" class="code-block" style="font-size: 0.75rem; max-height: 120px;"></pre>
+                                <span class="detail-label">Signature</span>
+                                <pre id="ndSignature" class="code-block code-block-compact"></pre>
                             </div>
                             <div class="detail-item" id="ndDocstringRow">
-                                <span class="detail-label">Docstring:</span>
+                                <span class="detail-label">Docstring</span>
                                 <div id="ndDocstring" class="docstring-text"></div>
                             </div>
                         </div>
@@ -506,60 +877,59 @@
                 </div>
             </div>
 
-            <!-- Tab 6: Version Compare -->
+            <!-- Tab 6: Branch Diff (Version Compare) -->
             <div class="tab-content" id="compareTab">
-                <h2>Compare Codebase Versions & Branches</h2>
-                <p class="description-text">Select two versions of the project (e.g., main and a development/feature branch) to see structural code modifications (classes, methods, functions, files) alongside cognitive memory differences.</p>
-                
-                <!-- Version Comparison Panel -->
-                <div class="version-comparison-section card" style="margin-top: 20px;">
+                <h2>Compare Codebase Versions &amp; Branches</h2>
+                <p class="description-text">Diff two project snapshots or branches to inspect structural symbol changes alongside cognitive memory deltas.</p>
+
+                <div class="version-comparison-section card">
                     <div class="form-row">
                         <div class="form-group flex-1">
-                            <label for="diffBaseProject">Base Version (e.g. main):</label>
+                            <label for="diffBaseProject">Base Version (e.g. main)</label>
                             <select id="diffBaseProject">
                                 <option value="">Select Base Project...</option>
                             </select>
                         </div>
                         <div class="form-group flex-1">
-                            <label for="diffTargetProject">Target Version (e.g. branch):</label>
+                            <label for="diffTargetProject">Target Version (e.g. branch)</label>
                             <select id="diffTargetProject">
                                 <option value="">Select Target Project...</option>
                             </select>
                         </div>
                         <div class="form-group align-end">
-                            <button id="btnCompareVersions" class="btn btn-primary"><i class="fa-solid fa-arrow-right-arrow-left"></i> Run Comparison</button>
+                            <button type="button" id="btnCompareVersions" class="btn btn-primary">
+                                <i class="fa-solid fa-arrow-right-arrow-left" aria-hidden="true"></i> Run Comparison
+                            </button>
                         </div>
                     </div>
-                    
-                    <div id="diffResultsArea" class="diff-results-area" style="display: none; margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 20px;">
-                        <div class="diff-summary-banner" style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px;">
-                            <div style="display: flex; gap: 15px; align-items: center;">
-                                <span style="font-weight: 600; font-size: 13px; min-width: 140px; color: var(--text-secondary);"><i class="fa-solid fa-diagram-project" style="color: #6366f1;"></i> Codebase Symbols:</span>
-                                <span class="diff-badge added" style="background: rgba(16, 185, 129, 0.15); color: #34d399; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(16, 185, 129, 0.3);"><i class="fa-solid fa-circle-plus"></i> <span id="diffCountAdded">0</span> Added</span>
-                                <span class="diff-badge deleted" style="background: rgba(239, 68, 68, 0.15); color: #f87171; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(239, 68, 68, 0.3);"><i class="fa-solid fa-circle-minus"></i> <span id="diffCountDeleted">0</span> Deleted</span>
-                                <span class="diff-badge modified" style="background: rgba(245, 158, 11, 0.15); color: #fbbf24; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(245, 158, 11, 0.3);"><i class="fa-solid fa-circle-exclamation"></i> <span id="diffCountModified">0</span> Modified</span>
+
+                    <div id="diffResultsArea" class="diff-results-area">
+                        <div class="diff-summary-banner">
+                            <div class="diff-summary-row">
+                                <span class="diff-summary-label"><i class="fa-solid fa-circle-nodes" aria-hidden="true"></i> Codebase Symbols</span>
+                                <span class="diff-badge added"><i class="fa-solid fa-circle-plus" aria-hidden="true"></i> <span id="diffCountAdded" class="mono-num">0</span> Added</span>
+                                <span class="diff-badge deleted"><i class="fa-solid fa-circle-minus" aria-hidden="true"></i> <span id="diffCountDeleted" class="mono-num">0</span> Deleted</span>
+                                <span class="diff-badge modified"><i class="fa-solid fa-circle-exclamation" aria-hidden="true"></i> <span id="diffCountModified" class="mono-num">0</span> Modified</span>
                             </div>
-                            <div style="display: flex; gap: 15px; align-items: center;">
-                                <span style="font-weight: 600; font-size: 13px; min-width: 140px; color: var(--text-secondary);"><i class="fa-solid fa-brain" style="color: #ec4899;"></i> Memories & Rules:</span>
-                                <span class="diff-badge added" style="background: rgba(16, 185, 129, 0.15); color: #34d399; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(16, 185, 129, 0.3);"><i class="fa-solid fa-circle-plus"></i> <span id="memCountAdded">0</span> Added</span>
-                                <span class="diff-badge deleted" style="background: rgba(239, 68, 68, 0.15); color: #f87171; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(239, 68, 68, 0.3);"><i class="fa-solid fa-circle-minus"></i> <span id="memCountDeleted">0</span> Deleted</span>
-                                <span class="diff-badge modified" style="background: rgba(245, 158, 11, 0.15); color: #fbbf24; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; border: 1px solid rgba(245, 158, 11, 0.3);"><i class="fa-solid fa-circle-exclamation"></i> <span id="memCountModified">0</span> Modified</span>
+                            <div class="diff-summary-row">
+                                <span class="diff-summary-label"><i class="fa-solid fa-brain" aria-hidden="true"></i> Memories &amp; Rules</span>
+                                <span class="diff-badge added"><i class="fa-solid fa-circle-plus" aria-hidden="true"></i> <span id="memCountAdded" class="mono-num">0</span> Added</span>
+                                <span class="diff-badge deleted"><i class="fa-solid fa-circle-minus" aria-hidden="true"></i> <span id="memCountDeleted" class="mono-num">0</span> Deleted</span>
+                                <span class="diff-badge modified"><i class="fa-solid fa-circle-exclamation" aria-hidden="true"></i> <span id="memCountModified" class="mono-num">0</span> Modified</span>
                             </div>
                         </div>
-                        
-                        <div class="diff-columns" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                            <!-- Column 1: Codegraph Changes -->
+
+                        <div class="diff-columns">
                             <div class="diff-column">
-                                <h4 style="margin-bottom: 12px; font-size: 15px; color: var(--text-primary); border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-diagram-project" style="color: #6366f1;"></i> Codebase changes</h4>
-                                <div id="diffCgList" class="diff-item-list" style="max-height: 500px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
-                                    <div class="empty-placeholder" style="color: var(--text-secondary); font-size: 13px; font-style: italic;">No codebase changes.</div>
+                                <h4 class="diff-col-heading"><i class="fa-solid fa-circle-nodes" aria-hidden="true"></i> Codebase Changes</h4>
+                                <div id="diffCgList" class="diff-item-list">
+                                    <div class="empty-placeholder">No codebase changes.</div>
                                 </div>
                             </div>
-                            <!-- Column 2: ProjectBrain Changes -->
                             <div class="diff-column">
-                                <h4 style="margin-bottom: 12px; font-size: 15px; color: var(--text-primary); border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px;"><i class="fa-solid fa-brain" style="color: #ec4899;"></i> Memories & rules changes</h4>
-                                <div id="diffOmList" class="diff-item-list" style="max-height: 500px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
-                                    <div class="empty-placeholder" style="color: var(--text-secondary); font-size: 13px; font-style: italic;">No memory changes.</div>
+                                <h4 class="diff-col-heading"><i class="fa-solid fa-brain" aria-hidden="true"></i> Memories &amp; Rules Changes</h4>
+                                <div id="diffOmList" class="diff-item-list">
+                                    <div class="empty-placeholder">No memory changes.</div>
                                 </div>
                             </div>
                         </div>
@@ -567,91 +937,634 @@
                 </div>
             </div>
 
-            <!-- Tab 7: Accounts & Auth -->
-            <div class="tab-content" id="authTab">
-                <h2>Accounts & Permissions Management</h2>
-                <p class="description-text">Create and manage client accounts, authentication tokens, roles, and tool whitelists. Set permissions to control which tools each MCP client is authorized to execute.</p>
-                
-                <div class="auth-layout" style="display: grid; grid-template-columns: 1.2fr 1.8fr; gap: 20px; margin-top: 20px; align-items: start;">
-                    <!-- Column 1: Create/Update Account -->
+            <!-- Tab: Unified KB & Traceability (NEW) -->
+            <div class="tab-content" id="kbTab">
+                <div class="view-header">
+                    <div>
+                        <h2>Unified Knowledge Base &amp; Traceability</h2>
+                        <p class="description-text">Compile full-workspace Graphify + CodeGraph indexes, audit doc-to-code coverage drift, and trace bidirectional symbol references.</p>
+                    </div>
+                </div>
+
+                <div class="two-col-grid">
+                    <!-- Build Complete KB Card -->
                     <div class="card">
-                        <h3><i class="fa-solid fa-user-plus"></i> Create or Update Account</h3>
-                        <form id="authAccountForm" style="display: flex; flex-direction: column; gap: 15px; margin-top: 15px;">
+                        <h3><i class="fa-solid fa-hammer" aria-hidden="true"></i> Build Complete KB</h3>
+                        <div class="stack-form">
                             <div class="form-group">
-                                <label for="authUsername">Username:</label>
-                                <input type="text" id="authUsername" placeholder="e.g. claude_desktop_client" required>
+                                <label for="kbWorkspacePath">Workspace Path</label>
+                                <input type="text" id="kbWorkspacePath" class="code-font" placeholder="/path/to/repository">
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group flex-1">
+                                    <label for="kbBranchInput">Branch</label>
+                                    <input type="text" id="kbBranchInput" class="code-font" value="main" placeholder="main">
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="kbDeviceSelect">Compute Device</label>
+                                    <select id="kbDeviceSelect">
+                                        <option value="auto" selected>Auto</option>
+                                        <option value="gpu">CUDA GPU</option>
+                                        <option value="mps">Apple MPS</option>
+                                        <option value="cpu">CPU</option>
+                                    </select>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="kbWorkersInput">Workers</label>
+                                    <input type="number" id="kbWorkersInput" class="mono-num" min="1" max="32" value="4">
+                                </div>
+                            </div>
+                            <button type="button" id="btnRunBuildKb" class="btn btn-primary">
+                                <i class="fa-solid fa-play" aria-hidden="true"></i> Build Complete KB
+                            </button>
+                            <pre id="kbBuildResult" class="code-block">Ready to build unified knowledge base.</pre>
+                        </div>
+                    </div>
+
+                    <!-- KB Coverage & Drift Card -->
+                    <div class="card">
+                        <div class="card-header-action">
+                            <h3><i class="fa-solid fa-chart-area" aria-hidden="true"></i> KB Coverage &amp; Drift</h3>
+                            <button type="button" id="btnRefreshKbCoverage" class="btn btn-secondary btn-sm">
+                                <i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh Coverage
+                            </button>
+                        </div>
+                        <div id="kbCoveragePanel" class="telemetry-panel">
+                            <div class="placeholder-item">Click Refresh Coverage to inspect code-to-doc coverage ratios and stale drift warnings.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Bidirectional Code <-> Doc Trace Card -->
+                <div class="card section-spacer">
+                    <h3><i class="fa-solid fa-arrows-left-right" aria-hidden="true"></i> Bidirectional Code &lt;-&gt; Doc Trace</h3>
+                    <div class="form-row">
+                        <div class="form-group flex-1">
+                            <label for="kbTraceTarget">Symbol, File Path, or Document Title</label>
+                            <input type="text" id="kbTraceTarget" class="code-font" placeholder="e.g. AuthService.verify_token or docs/architecture.md">
+                        </div>
+                        <button type="button" id="btnRunKbTrace" class="btn btn-primary">
+                            <i class="fa-solid fa-diagram-next" aria-hidden="true"></i> Trace Links
+                        </button>
+                    </div>
+                    <div id="kbTraceResults" class="trace-results-panel">
+                        <div class="placeholder-item">Enter a symbol or document target to inspect bidirectional traceability edges.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Plugins & Hardware (NEW) -->
+            <div class="tab-content" id="pluginsTab">
+                <div class="card-header-action">
+                    <div>
+                        <h2>Microkernel Plugins &amp; Hardware Telemetry</h2>
+                        <p class="description-text">Inspect local GPU/MPS/CPU compute capabilities, local AI runtimes, and manage the 26 microkernel extension plugins.</p>
+                    </div>
+                    <button type="button" id="btnRefreshHardware" class="btn btn-secondary">
+                        <i class="fa-solid fa-microchip" aria-hidden="true"></i> Refresh Hardware
+                    </button>
+                </div>
+
+                <!-- GPU / CPU & Local AI Hardware Diagnostic Panel -->
+                <div class="card">
+                    <h3><i class="fa-solid fa-wave-square" aria-hidden="true"></i> GPU / CPU &amp; Local AI Hardware Diagnostics</h3>
+                    <div id="hardwareDetailGrid" class="hardware-detail-grid">
+                        <div class="placeholder-item">Probing hardware capabilities...</div>
+                    </div>
+                </div>
+
+                <!-- 26 Microkernel Plugins Directory -->
+                <div class="card section-spacer">
+                    <div class="card-header-action">
+                        <h3><i class="fa-solid fa-cubes" aria-hidden="true"></i> Microkernel Plugins Directory</h3>
+                        <button type="button" id="btnReloadPlugins" class="btn btn-secondary btn-sm">
+                            <i class="fa-solid fa-arrows-rotate" aria-hidden="true"></i> Reload Plugins
+                        </button>
+                    </div>
+
+                    <div class="plugins-toolbar">
+                        <div class="plugin-filter-pills" role="group" aria-label="Filter plugins by category">
+                            <button type="button" class="plugin-filter-pill active" data-category="all">All</button>
+                            <button type="button" class="plugin-filter-pill" data-category="graph_backend">graph_backend</button>
+                            <button type="button" class="plugin-filter-pill" data-category="vector_backend">vector_backend</button>
+                            <button type="button" class="plugin-filter-pill" data-category="etl_parser">etl_parser</button>
+                            <button type="button" class="plugin-filter-pill" data-category="knowledge_linker">knowledge_linker</button>
+                            <button type="button" class="plugin-filter-pill" data-category="doc_exporter">doc_exporter</button>
+                            <button type="button" class="plugin-filter-pill" data-category="script_cache">script_cache</button>
+                            <button type="button" class="plugin-filter-pill" data-category="artifact_store">artifact_store</button>
+                            <button type="button" class="plugin-filter-pill" data-category="brain_consumer">brain_consumer</button>
+                            <button type="button" class="plugin-filter-pill" data-category="webhook">webhook</button>
+                        </div>
+                        <div class="search-input-group plugin-search-wrap">
+                            <i class="fa-solid fa-magnifying-glass search-icon" aria-hidden="true"></i>
+                            <input type="search" id="pluginSearchInput" placeholder="Filter plugins by name or capability..." aria-label="Filter plugins">
+                        </div>
+                    </div>
+
+                    <div id="pluginsGrid" class="plugins-grid">
+                        <div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading microkernel plugins...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: v3.0 Testing Layer 1 (NEW) -->
+            <div class="tab-content" id="v3TestingTab">
+                <div class="view-header">
+                    <div>
+                        <h2>v3.0 Testing Layer 1 Workbench</h2>
+                        <p class="description-text">Impact-aware test DAG planning, Universal Driver Control Protocol (UDCP) script caching, bounded telemetry evidence windows, and AI Oracle RCA triage.</p>
+                    </div>
+                </div>
+
+                <div class="v3-tabs-shell">
+                    <div role="tablist" aria-label="v3.0 Testing Layer 1 Modules" class="sub-tabs-list">
+                        <button type="button" role="tab" id="v3TabPlan" aria-selected="true" class="sub-tab-btn">Impact Test DAG Planner</button>
+                        <button type="button" role="tab" id="v3TabCache" aria-selected="false" class="sub-tab-btn">UDCP Script Cache</button>
+                        <button type="button" role="tab" id="v3TabEvidence" aria-selected="false" class="sub-tab-btn">Telemetry Evidence Window</button>
+                        <button type="button" role="tab" id="v3TabRca" aria-selected="false" class="sub-tab-btn">AI Oracle &amp; RCA Triage</button>
+                    </div>
+
+                    <!-- Sub-panel 1: Impact Test DAG Planner -->
+                    <div role="tabpanel" aria-labelledby="v3TabPlan" class="sub-tab-panel" tabindex="0">
+                        <div class="card sub-tab-panel-inner">
+                            <h3><i class="fa-solid fa-sitemap" aria-hidden="true"></i> Impact Test DAG Planner</h3>
+                            <div class="stack-form">
+                                <div class="form-group">
+                                    <label for="v3PlanFiles">Changed File Paths (one per line or comma-separated)</label>
+                                    <textarea id="v3PlanFiles" class="code-font" placeholder="src/projectbrain/server/routes/auth.py&#10;src/projectbrain/core/memory.py"></textarea>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group flex-1">
+                                        <label for="v3PlanVersionTag">Version Tag</label>
+                                        <input type="text" id="v3PlanVersionTag" class="code-font" placeholder="e.g. v3.0.0-rc1">
+                                    </div>
+                                    <button type="button" id="btnRunV3Plan" class="btn btn-primary">
+                                        <i class="fa-solid fa-play" aria-hidden="true"></i> Generate Test Plan
+                                    </button>
+                                </div>
+                                <pre id="v3PlanOutput" class="code-block">Awaiting changed file inputs...</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Sub-panel 2: UDCP Script Cache -->
+                    <div role="tabpanel" aria-labelledby="v3TabCache" class="sub-tab-panel" hidden="until-found">
+                        <div class="card sub-tab-panel-inner">
+                            <h3><i class="fa-solid fa-bolt-lightning" aria-hidden="true"></i> UDCP Script Cache Lookup</h3>
+                            <div class="stack-form">
+                                <div class="form-row">
+                                    <div class="form-group flex-2">
+                                        <label for="v3CacheIntent">Test Intent / Action Signature</label>
+                                        <input type="text" id="v3CacheIntent" placeholder="e.g. authenticate_user_and_rotate_pat">
+                                    </div>
+                                    <div class="form-group flex-1">
+                                        <label for="v3CachePlatform">Target Platform</label>
+                                        <select id="v3CachePlatform">
+                                            <option value="web">Web (Playwright)</option>
+                                            <option value="api">REST / MCP API</option>
+                                            <option value="mobile">Mobile (Appium)</option>
+                                            <option value="desktop">Desktop UIA</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group flex-1">
+                                        <label for="v3CacheVersion">App Version</label>
+                                        <input type="text" id="v3CacheVersion" class="code-font" placeholder="e.g. 3.0.0">
+                                    </div>
+                                </div>
+                                <div>
+                                    <button type="button" id="btnLookupV3Cache" class="btn btn-primary">
+                                        <i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i> Lookup Cached Script
+                                    </button>
+                                </div>
+                                <pre id="v3CacheOutput" class="code-block">No script lookup executed yet.</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Sub-panel 3: Telemetry Evidence Window -->
+                    <div role="tabpanel" aria-labelledby="v3TabEvidence" class="sub-tab-panel" hidden="until-found">
+                        <div class="card sub-tab-panel-inner">
+                            <h3><i class="fa-solid fa-timeline" aria-hidden="true"></i> Telemetry Evidence Window</h3>
+                            <div class="stack-form">
+                                <div class="form-row">
+                                    <div class="form-group flex-2">
+                                        <label for="v3EvidenceRunId">Execution Run ID</label>
+                                        <input type="text" id="v3EvidenceRunId" class="code-font" placeholder="e.g. run_2026_11_21_001">
+                                    </div>
+                                    <div class="form-group flex-1">
+                                        <label for="v3EvidenceCenterTs">Center Timestamp (ISO or Epoch ms)</label>
+                                        <input type="text" id="v3EvidenceCenterTs" class="code-font" placeholder="e.g. 1763737200000">
+                                    </div>
+                                    <div class="form-group flex-1">
+                                        <label for="v3EvidenceWindowMs">Window (ms)</label>
+                                        <input type="number" id="v3EvidenceWindowMs" class="mono-num" value="5000" min="100" step="100">
+                                    </div>
+                                </div>
+                                <div>
+                                    <button type="button" id="btnQueryV3Evidence" class="btn btn-primary">
+                                        <i class="fa-solid fa-wave-square" aria-hidden="true"></i> Slice Evidence Window
+                                    </button>
+                                </div>
+                                <pre id="v3EvidenceOutput" class="code-block">No telemetry window sliced yet.</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Sub-panel 4: AI Oracle & RCA Triage -->
+                    <div role="tabpanel" aria-labelledby="v3TabRca" class="sub-tab-panel" hidden="until-found">
+                        <div class="card sub-tab-panel-inner">
+                            <h3><i class="fa-solid fa-stethoscope" aria-hidden="true"></i> AI Oracle &amp; RCA Triage</h3>
+                            <div class="stack-form">
+                                <div class="form-group">
+                                    <label for="v3RcaLogInput">Failure Log / Stacktrace / Assertion Diff</label>
+                                    <textarea id="v3RcaLogInput" class="code-font" placeholder="Paste failing test traceback, HTTP 500 payload, or assertion mismatch..."></textarea>
+                                </div>
+                                <div>
+                                    <button type="button" id="btnRunV3Rca" class="btn btn-primary">
+                                        <i class="fa-solid fa-magnifying-glass-chart" aria-hidden="true"></i> Run Root-Cause Triage
+                                    </button>
+                                </div>
+                                <pre id="v3RcaOutput" class="code-block">Awaiting failure trace for AI Oracle analysis...</pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: My Profile & Security (NEW, All Roles) -->
+            <div class="tab-content" id="profileTab">
+                <div class="view-header">
+                    <div>
+                        <h2>My Profile &amp; Security</h2>
+                        <p class="description-text">Manage your identity metadata, password credentials, personal API &amp; MCP keys (<code>pb_pat_...</code>), and active login sessions.</p>
+                    </div>
+                </div>
+
+                <div class="two-col-grid">
+                    <!-- Account Profile Card -->
+                    <div class="card">
+                        <h3><i class="fa-solid fa-id-card" aria-hidden="true"></i> Account Profile</h3>
+                        <form id="profileForm" class="stack-form">
+                            <div class="form-row">
+                                <div class="form-group flex-1">
+                                    <label for="profileUsername">Username</label>
+                                    <input type="text" id="profileUsername" class="code-font" readonly>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <span class="field-group-label">Assigned Role</span>
+                                    <div class="profile-badge-slot">
+                                        <span id="profileRoleBadge" class="account-role-badge collaborator">collaborator</span>
+                                    </div>
+                                </div>
                             </div>
                             <div class="form-group">
-                                <label for="authToken">Custom Token (optional, auto-generated if blank):</label>
-                                <input type="text" id="authToken" placeholder="e.g. pb_tok_custom_value">
+                                <label for="profileDisplayName">Display Name</label>
+                                <input type="text" id="profileDisplayName" autocomplete="name" placeholder="Your display name">
                             </div>
                             <div class="form-group">
-                                <label for="authRole">Role:</label>
-                                <select id="authRole">
-                                    <option value="admin">Admin (Full access, bypasses allowed tools validation)</option>
-                                    <option value="collaborator" selected>Collaborator (Can call any tool, subject to Allowed Tools list)</option>
-                                    <option value="reader">Reader (Read-only tools only, subject to Allowed Tools list)</option>
+                                <label for="profileEmail">Email Address</label>
+                                <input type="email" id="profileEmail" autocomplete="email" spellcheck="false" placeholder="you@company.com">
+                            </div>
+                            <div class="form-group">
+                                <label for="profileAllowedProjects">Allowed Projects Scope</label>
+                                <input type="text" id="profileAllowedProjects" class="code-font" readonly placeholder="*">
+                            </div>
+                            <button type="submit" id="btnSaveProfile" class="btn btn-primary">
+                                <i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save Profile
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Password & Sign-In Security Card -->
+                    <div class="card">
+                        <h3><i class="fa-solid fa-shield-halved" aria-hidden="true"></i> Password &amp; Sign-In Security</h3>
+                        <form id="changePasswordForm" class="stack-form">
+                            <div class="form-group">
+                                <label for="currentPasswordInput">Current Password (if already set)</label>
+                                <div class="password-field-wrap">
+                                    <input type="password" id="currentPasswordInput" autocomplete="current-password" placeholder="Enter current password">
+                                    <button type="button" id="btnToggleCurrentPassword" class="btn-password-toggle" aria-label="Show current password" aria-pressed="false">
+                                        <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="form-group field">
+                                <label for="newPasswordInput">New Password</label>
+                                <ul id="profilePasswordRules" class="rules-list">
+                                    <li>At least 8 characters</li>
+                                </ul>
+                                <div class="password-field-wrap">
+                                    <input type="password" id="newPasswordInput" autocomplete="new-password" minlength="8" required placeholder="At least 8 characters" aria-describedby="profilePasswordRules" data-error="newPasswordError">
+                                    <button type="button" id="btnToggleNewPassword" class="btn-password-toggle" aria-label="Show new password" aria-pressed="false">
+                                        <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                                    </button>
+                                </div>
+                                <div id="newPasswordError" class="error-msg">
+                                    <span role="img" aria-label="Error">!</span> New password must be at least 8 characters.
+                                </div>
+                            </div>
+                            <label class="checkbox-row" for="revokeOtherSessionsCheck">
+                                <input type="checkbox" id="revokeOtherSessionsCheck" checked>
+                                <span>Revoke all other active sessions after password change</span>
+                            </label>
+                            <button type="submit" id="btnChangePassword" class="btn btn-primary">
+                                <i class="fa-solid fa-key" aria-hidden="true"></i> Update Password
+                            </button>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Personal API & MCP Keys Card -->
+                <div class="card section-spacer">
+                    <h3><i class="fa-solid fa-key" aria-hidden="true"></i> Personal API &amp; MCP Keys (<code>pb_pat_...</code>)</h3>
+                    <p class="description-text">Mint scoped Personal Access Tokens for CI pipelines, IDE MCP clients, and automation scripts.</p>
+
+                    <form id="createApiKeyForm" class="stack-form">
+                        <div class="form-row">
+                            <div class="form-group flex-2">
+                                <label for="apiKeyName">Key Label</label>
+                                <input type="text" id="apiKeyName" required placeholder="e.g. cursor-macbook-pro">
+                            </div>
+                            <div class="form-group flex-1">
+                                <label for="apiKeyExpiryDays">Expiry (Days)</label>
+                                <input type="number" id="apiKeyExpiryDays" class="mono-num" min="1" max="3650" value="90">
+                            </div>
+                            <div class="form-group flex-1">
+                                <label for="apiKeyRoleScope">Role Scope</label>
+                                <select id="apiKeyRoleScope">
+                                    <option value="">Inherit Account Role</option>
+                                    <option value="reader">Reader</option>
+                                    <option value="collaborator">Collaborator</option>
+                                    <option value="admin">Admin</option>
                                 </select>
                             </div>
-                            <div class="form-group">
-                                <label for="authAllowedTools">Allowed Tools (comma-separated, or * for all):</label>
-                                <input type="text" id="authAllowedTools" value="*" placeholder="e.g. projectbrain_query, projectbrain_read">
-                                <p class="info-text" style="margin-top: 4px; font-size: 11px;"><i class="fa-solid fa-info-circle"></i> Readers are restricted from write tools (e.g. those containing store, delete, sync, ingest, register, reinforce) regardless of this setting.</p>
-                            </div>
-                            <div class="form-group">
-                                <label style="font-size: 12px; color: #ccc;">Select/toggle tools to authorize:</label>
-                                <div id="authAvailableToolsList" style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; max-height: 120px; overflow-y: auto; padding: 8px; border: 1px solid #444; border-radius: 4px; background: #1a1a1a;">
-                                    <span style="color: #777; font-size: 11px;">Loading available tools...</span>
-                                </div>
-                            </div>
-                            <button type="submit" class="btn btn-primary" style="margin-top: 10px;"><i class="fa-solid fa-save"></i> Save Account</button>
-                        </form>
-                    </div>
-
-                    <!-- Column 2: Active Accounts List -->
-                    <div class="card">
-                        <h3><i class="fa-solid fa-users"></i> Registered Accounts</h3>
-                        <div id="authAccountsList" class="accounts-list" style="margin-top: 15px; display: flex; flex-direction: column; gap: 12px; max-height: 500px; overflow-y: auto;">
-                            <!-- Dynamically loaded accounts -->
-                            <div class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading accounts...</div>
                         </div>
+                        <div class="form-row">
+                            <div class="form-group flex-1">
+                                <label for="apiKeyAllowedProjects">Allowed Projects (comma-separated or *)</label>
+                                <input type="text" id="apiKeyAllowedProjects" class="code-font" value="*" placeholder="*">
+                            </div>
+                            <div class="form-group flex-1">
+                                <label for="apiKeyAllowedTools">Allowed Tools (comma-separated or *)</label>
+                                <input type="text" id="apiKeyAllowedTools" class="code-font" value="*" placeholder="*">
+                            </div>
+                            <div class="form-group align-end">
+                                <button type="submit" id="btnCreateApiKey" class="btn btn-primary">
+                                    <i class="fa-solid fa-plus" aria-hidden="true"></i> Mint API Key
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+
+                    <div tabindex="0" role="region" aria-label="Personal API keys" class="table-wrapper section-spacer-sm">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Prefix</th>
+                                    <th>Scope</th>
+                                    <th>Projects</th>
+                                    <th>Expires</th>
+                                    <th>Last Used</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="personalApiKeysList">
+                                <tr>
+                                    <td colspan="7" class="placeholder-item">No personal API keys created yet.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Active Login Sessions Card -->
+                <div class="card section-spacer">
+                    <div class="card-header-action">
+                        <h3><i class="fa-solid fa-desktop" aria-hidden="true"></i> Active Login Sessions</h3>
+                        <button type="button" id="btnRevokeOtherSessions" class="btn btn-danger btn-sm">
+                            <i class="fa-solid fa-ban" aria-hidden="true"></i> Revoke Other Sessions
+                        </button>
+                    </div>
+                    <div id="activeSessionsList" class="sessions-list">
+                        <div class="placeholder-item">Loading active sessions...</div>
                     </div>
                 </div>
             </div>
 
-            <!-- Tab 8: Project Registry -->
-            <div class="tab-content" id="projectRegistryTab">
-                <h2>Project Registry Management</h2>
-                <p class="description-text">Register new project spaces and view sync details. Synchronized code bases compile nodes and edges in the graph.</p>
-                
-                <div class="auth-layout" style="display: grid; grid-template-columns: 1.2fr 1.8fr; gap: 20px; margin-top: 20px; align-items: start;">
-                    <!-- Column 1: Register Project -->
+            <!-- Tab: Identity & RBAC Admin (Upgraded) -->
+            <div class="tab-content" id="authTab">
+                <div class="view-header">
+                    <div>
+                        <h2>Identity &amp; RBAC Administration</h2>
+                        <p class="description-text">Configure server authentication policies, provision user or service accounts, manage tool whitelists, and inspect security audit logs.</p>
+                    </div>
+                </div>
+
+                <!-- Global Auth & Security Policy Bar -->
+                <div class="card policy-bar-card">
+                    <h3><i class="fa-solid fa-sliders" aria-hidden="true"></i> Global Auth &amp; Security Policy</h3>
+                    <form id="authPolicyForm" class="policy-bar-form">
+                        <label class="checkbox-row" for="settingAllowRegistration">
+                            <input type="checkbox" id="settingAllowRegistration">
+                            <span>Allow self-registration</span>
+                        </label>
+                        <div class="policy-inline-field">
+                            <label for="settingDefaultRole">Default Role</label>
+                            <select id="settingDefaultRole">
+                                <option value="reader">reader</option>
+                                <option value="collaborator">collaborator</option>
+                            </select>
+                        </div>
+                        <div class="policy-inline-field">
+                            <label for="settingSessionTtl">Session TTL (hrs)</label>
+                            <input type="number" id="settingSessionTtl" class="mono-num" min="1" max="8760" value="720">
+                        </div>
+                        <label class="checkbox-row" for="settingRequireRestAuth">
+                            <input type="checkbox" id="settingRequireRestAuth">
+                            <span>Require REST auth</span>
+                        </label>
+                        <button type="submit" id="btnSaveAuthSettings" class="btn btn-primary btn-sm">
+                            <i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save Policy
+                        </button>
+                    </form>
+                </div>
+
+                <div class="auth-layout">
+                    <!-- Column 1: Create / Update User & Service Account -->
                     <div class="card">
-                        <h3><i class="fa-solid fa-folder-plus"></i> Register Project</h3>
-                        <form id="projectRegistryForm" style="display: flex; flex-direction: column; gap: 15px; margin-top: 15px;">
-                            <div class="form-group">
-                                <label for="regProjectId">Project ID (Unique Identifier):</label>
-                                <input type="text" id="regProjectId" placeholder="e.g. chien334/Project-Brain" required>
-                                <p class="info-text" style="margin-top: 4px; font-size: 11px; color: var(--text-secondary);"><i class="fa-solid fa-info-circle"></i> Use the format `username/project-name` matching your repository space.</p>
+                        <h3><i class="fa-solid fa-user-plus" aria-hidden="true"></i> Create or Update Account</h3>
+                        <form id="authAccountForm" class="stack-form">
+                            <div class="form-row">
+                                <div class="form-group flex-1">
+                                    <label for="authUsername">Username</label>
+                                    <input type="text" id="authUsername" autocomplete="off" spellcheck="false" placeholder="e.g. claude_desktop_client" required>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="authDisplayName">Display Name</label>
+                                    <input type="text" id="authDisplayName" placeholder="e.g. Claude Desktop">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group flex-1">
+                                    <label for="authEmail">Email (optional)</label>
+                                    <input type="email" id="authEmail" spellcheck="false" placeholder="user@company.com">
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="authPassword">Password (optional)</label>
+                                    <input type="password" id="authPassword" autocomplete="new-password" placeholder="Leave blank to keep unchanged">
+                                </div>
                             </div>
                             <div class="form-group">
-                                <label for="regProjectName">Display Name:</label>
-                                <input type="text" id="regProjectName" placeholder="e.g. Project-Brain" required>
+                                <label for="authToken">Custom Token (optional, auto-generated if blank)</label>
+                                <input type="text" id="authToken" class="code-font" placeholder="e.g. pb_tok_custom_value">
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group flex-1">
+                                    <label for="authRole">Role</label>
+                                    <select id="authRole">
+                                        <option value="admin">Admin (Full access, bypasses allowed tools validation)</option>
+                                        <option value="collaborator" selected>Collaborator (Read/Write subject to Allowed Tools)</option>
+                                        <option value="reader">Reader (Read-only tools only)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="authStatus">Account Status</label>
+                                    <select id="authStatus">
+                                        <option value="active" selected>Active</option>
+                                        <option value="disabled">Disabled</option>
+                                    </select>
+                                </div>
                             </div>
                             <div class="form-group">
-                                <label for="regProjectDesc">Description:</label>
-                                <textarea id="regProjectDesc" placeholder="e.g. Main system codebase for React web app" style="min-height: 60px;"></textarea>
+                                <label for="authAllowedProjects">Allowed Projects (comma-separated, or * for all)</label>
+                                <input type="text" id="authAllowedProjects" class="code-font" value="*" placeholder="*">
                             </div>
-                            <button type="submit" class="btn btn-primary" style="margin-top: 10px;"><i class="fa-solid fa-save"></i> Register Project</button>
+                            <div class="form-group">
+                                <label for="authAllowedTools">Allowed Tools (comma-separated, or * for all)</label>
+                                <input type="text" id="authAllowedTools" class="code-font" value="*" placeholder="e.g. projectbrain_query, projectbrain_read">
+                                <p class="info-text"><i class="fa-solid fa-circle-info" aria-hidden="true"></i> Readers are restricted from write tools regardless of this setting.</p>
+                            </div>
+                            <div class="form-group">
+                                <span class="field-group-label">Toggle Authorized MCP Tools</span>
+                                <div id="authAvailableToolsList" class="tools-selector-box">
+                                    <span class="placeholder-item">Loading available tools...</span>
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-primary">
+                                <i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save Account
+                            </button>
                         </form>
                     </div>
 
-                    <!-- Column 2: Registered Projects List -->
+                    <!-- Column 2: Registered Accounts Sticky Table -->
                     <div class="card">
-                        <h3><i class="fa-solid fa-folder-tree"></i> Registered Project Spaces</h3>
-                        <div id="projectRegistryList" class="accounts-list" style="margin-top: 15px; display: flex; flex-direction: column; gap: 12px; max-height: 500px; overflow-y: auto;">
-                            <!-- Dynamically loaded projects -->
-                            <div class="loader"><i class="fa-solid fa-spinner fa-spin"></i> Loading projects...</div>
+                        <h3><i class="fa-solid fa-users" aria-hidden="true"></i> Registered Accounts</h3>
+                        <div tabindex="0" role="region" aria-label="Registered accounts" class="table-wrapper">
+                            <div id="authAccountsList" class="accounts-list">
+                                <div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading accounts...</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Security & Auth Audit Log Panel -->
+                <div class="card section-spacer">
+                    <div class="card-header-action">
+                        <h3><i class="fa-solid fa-clipboard-list" aria-hidden="true"></i> Security &amp; Auth Audit Log</h3>
+                        <div class="audit-toolbar">
+                            <input type="text" id="auditLogEventFilter" placeholder="Filter event (e.g. login_failed)" aria-label="Filter audit events">
+                            <input type="text" id="auditLogUserFilter" placeholder="Filter username" aria-label="Filter audit username">
+                            <button type="button" id="btnRefreshAuditLogs" class="btn btn-secondary btn-sm">
+                                <i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh Logs
+                            </button>
+                        </div>
+                    </div>
+                    <div tabindex="0" role="region" aria-label="Security audit logs" class="table-wrapper">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Event</th>
+                                    <th>Actor</th>
+                                    <th>Target</th>
+                                    <th>IP / Source</th>
+                                    <th>Details</th>
+                                </tr>
+                            </thead>
+                            <tbody id="authAuditLogsTable">
+                                <tr>
+                                    <td colspan="6" class="placeholder-item">No security audit events loaded yet.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Projects, Databases & Schemas -->
+            <div class="tab-content" id="projectRegistryTab">
+                <div class="card-header-action">
+                    <div>
+                        <h2>Projects, Databases &amp; Schemas</h2>
+                        <p class="description-text">3-Tier Physical Isolation: Master Control Plane catalog, dedicated Project Databases (<code>pb_proj_*</code>), and isolated Branch Schemas (<code>pb_root</code> / <code>pb_br_*</code>) for Graphify and Documents.</p>
+                    </div>
+                    <button type="button" id="btnRefreshTopology" class="btn btn-secondary">
+                        <i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh Topology
+                    </button>
+                </div>
+
+                <!-- 3-Tier Storage Topology Summary Strip -->
+                <div class="topo-strip">
+                    <div class="kpi-card topo-card">
+                        <span class="kpi-label">MASTER CONTROL DATABASE</span>
+                        <span class="kpi-value kpi-value-sm code-font" id="topoMasterDb">Loading...</span>
+                        <span class="kpi-meta" id="topoMasterMeta">Global IAM, catalog &amp; routing plane</span>
+                    </div>
+                    <div class="kpi-card topo-card">
+                        <span class="kpi-label">PROJECT DATABASES (1 DB / PROJECT)</span>
+                        <span class="kpi-value mono-num" id="topoProjectDbCount">0</span>
+                        <span class="kpi-meta">Dedicated physical project databases</span>
+                    </div>
+                    <div class="kpi-card topo-card">
+                        <span class="kpi-label">BRANCH SCHEMAS (1 SCHEMA / BRANCH)</span>
+                        <span class="kpi-value mono-num" id="topoBranchSchemaCount">0</span>
+                        <span class="kpi-meta">Isolated Graph + Docs + Memory schemas</span>
+                    </div>
+                </div>
+
+                <div class="auth-layout">
+                    <!-- Column 1: Provision New Project Database -->
+                    <div class="card" id="projectProvisionCard">
+                        <h3><i class="fa-solid fa-database" aria-hidden="true"></i> Provision New Project Database</h3>
+                        <form id="projectRegistryForm" class="stack-form">
+                            <div class="form-group">
+                                <label for="regProjectId">Project ID (Unique Identifier)</label>
+                                <input type="text" id="regProjectId" class="code-font" placeholder="e.g. acme/core-api" required>
+                                <p class="info-text"><i class="fa-solid fa-circle-info" aria-hidden="true"></i> Use the format <code>org/project-name</code> matching your repository space.</p>
+                                <div id="regDbNamePreview" class="db-preview-badge code-font" aria-live="polite">DB: pb_proj_&lt;slug&gt;_&lt;hash8&gt; &middot; Root Schema: pb_root</div>
+                            </div>
+                            <div class="form-group">
+                                <label for="regProjectName">Display Name</label>
+                                <input type="text" id="regProjectName" placeholder="e.g. Core API" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="regProjectDesc">Description</label>
+                                <textarea id="regProjectDesc" placeholder="e.g. Main system codebase for backend &amp; docs"></textarea>
+                            </div>
+                            <button type="submit" id="btnProvisionProject" class="btn btn-primary">
+                                <i class="fa-solid fa-server" aria-hidden="true"></i> Provision Project DB
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Column 2: Project Databases & Branch Schemas -->
+                    <div class="card">
+                        <div class="card-title-row">
+                            <h3><i class="fa-solid fa-sitemap" aria-hidden="true"></i> Project Databases &amp; Branch Schemas</h3>
+                        </div>
+                        <div id="projectRegistryList" class="accounts-list">
+                            <div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading topology...</div>
                         </div>
                     </div>
                 </div>
@@ -660,8 +1573,120 @@
     </main>
 
     <footer class="app-footer">
-        <p>ProjectBrain Server running locally on PostgreSQL / SQLite</p>
+        <p>ProjectBrain v3.0 Engineering Workbench &middot; Precision Telemetry Slate</p>
     </footer>
+
+    <!-- Native Modal Dialogs -->
+    <dialog id="confirmDialog" aria-labelledby="confirmDialogTitle" class="wb-dialog">
+        <div class="dialog-header">
+            <h2 id="confirmDialogTitle">Confirm Action</h2>
+            <form method="dialog">
+                <button type="submit" value="cancel" class="btn-icon-only" aria-label="Close dialog">
+                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                </button>
+            </form>
+        </div>
+        <p id="confirmDialogMessage" class="dialog-body-text">Are you sure you want to proceed with this action?</p>
+        <form method="dialog" class="dialog-actions">
+            <button type="submit" value="cancel" class="btn btn-secondary" autofocus>Cancel</button>
+            <button type="submit" id="confirmDialogSubmit" value="confirm" class="btn btn-danger">Confirm</button>
+        </form>
+    </dialog>
+
+    <dialog id="newProjectDialog" aria-labelledby="newProjectDialogTitle" class="wb-dialog">
+        <div class="dialog-header">
+            <h2 id="newProjectDialogTitle">Create New Project Space</h2>
+            <form method="dialog">
+                <button type="submit" value="cancel" class="btn-icon-only" aria-label="Close dialog">
+                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                </button>
+            </form>
+        </div>
+        <form id="newProjectDialogForm" class="stack-form">
+            <div class="form-group">
+                <label for="dialogProjectId">Project ID</label>
+                <input type="text" id="dialogProjectId" class="code-font" required autofocus placeholder="e.g. org/service-name">
+            </div>
+            <div class="form-group">
+                <label for="dialogProjectName">Display Name</label>
+                <input type="text" id="dialogProjectName" required placeholder="e.g. Service Name">
+            </div>
+            <div class="form-group">
+                <label for="dialogProjectDesc">Description (optional)</label>
+                <textarea id="dialogProjectDesc" placeholder="Brief summary of the codebase or workspace"></textarea>
+            </div>
+            <div class="dialog-actions">
+                <button type="button" class="btn btn-secondary" command="close" commandfor="newProjectDialog">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Project</button>
+            </div>
+        </form>
+    </dialog>
+
+    <dialog id="newBranchSchemaDialog" aria-labelledby="newBranchSchemaDialogTitle" class="wb-dialog">
+        <div class="dialog-header">
+            <h2 id="newBranchSchemaDialogTitle">Provision New Branch Schema</h2>
+            <form method="dialog">
+                <button type="submit" value="cancel" class="btn-icon-only" aria-label="Close dialog">
+                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                </button>
+            </form>
+        </div>
+        <p id="newBranchSchemaProjectHint" class="dialog-body-text code-font"></p>
+        <form id="newBranchSchemaForm" class="stack-form">
+            <input type="hidden" id="branchDialogProjectId">
+            <div class="form-group">
+                <label for="branchDialogName">Branch Name</label>
+                <input type="text" id="branchDialogName" class="code-font" required autofocus placeholder="e.g. feat/auth-v2">
+            </div>
+            <div class="form-group">
+                <label for="branchDialogBase">Base Branch</label>
+                <select id="branchDialogBase" class="code-font">
+                    <option value="main">main</option>
+                </select>
+            </div>
+            <div id="branchDialogSchemaPreview" class="db-preview-badge code-font" aria-live="polite">Schema: pb_br_&lt;slug&gt;_&lt;hash8&gt; (Graph + Docs &amp; Memory)</div>
+            <div class="dialog-actions">
+                <button type="button" class="btn btn-secondary" id="btnCancelBranchDialog" command="close" commandfor="newBranchSchemaDialog">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="btnSubmitBranchDialog">Provision Branch Schema</button>
+            </div>
+        </form>
+    </dialog>
+
+    <dialog id="secretRevealDialog" aria-labelledby="secretRevealTitle" class="wb-dialog">
+        <div class="dialog-header">
+            <h2 id="secretRevealTitle">Credential Created</h2>
+            <form method="dialog">
+                <button type="submit" value="close" class="btn-icon-only" aria-label="Close dialog">
+                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                </button>
+            </form>
+        </div>
+        <p id="secretRevealSubtitle" class="dialog-body-text">Copy this credential now. For your security, the full secret value will not be shown again.</p>
+        <div class="secret-reveal-box">
+            <code id="secretRevealValue" class="code-font select-all"></code>
+            <button type="button" id="btnCopySecretReveal" class="btn btn-secondary btn-sm">
+                <i class="fa-solid fa-copy" aria-hidden="true"></i> Copy
+            </button>
+        </div>
+        <form method="dialog" class="dialog-actions">
+            <button type="submit" value="close" class="btn btn-primary" autofocus>Done</button>
+        </form>
+    </dialog>
+
+    <dialog id="commandPaletteDialog" closedby="any" aria-label="Command Palette" class="wb-dialog wb-command-dialog">
+        <div class="command-palette-header">
+            <i class="fa-solid fa-terminal" aria-hidden="true"></i>
+            <input type="search" id="commandPaletteInput" autofocus placeholder="Jump to view, run KB build, rotate key, or switch project..." aria-label="Command palette search">
+            <kbd class="kbd-chip">ESC</kbd>
+        </div>
+        <div id="commandPaletteResults" class="command-palette-results" role="listbox" aria-label="Available commands">
+            <div class="placeholder-item">Type to filter views and workbench actions...</div>
+        </div>
+    </dialog>
+
+    <!-- Accessible Popover Toast Stack & Screen Reader Announcer -->
+    <div id="toastRegion" role="region" aria-label="Notifications" class="toast-region"></div>
+    <div id="srAnnouncer" aria-live="polite" class="visually-hidden"></div>
 
     <script src="app.js"></script>
 </body>

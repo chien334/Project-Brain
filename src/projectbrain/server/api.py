@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from ..core.config import env
-from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth, graphify, kb, plugins_v3
+from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth, graphify, kb, plugins_v3, master_topology
 
 logger = logging.getLogger("server")
 
@@ -81,6 +81,7 @@ _PROTECTED_REST_PREFIXES = (
     "/memory",
     "/codegraph",
     "/graphify",
+    "/master",
     "/kb",
     "/sources",
     "/pm",
@@ -194,7 +195,10 @@ class SSEFilter:
                             filtered_tools = []
                             allowed_list = []
                             if self.allowed_tools_str != "*":
-                                allowed_list = [t.strip() for t in self.allowed_tools_str.split(",") if t.strip()]
+                                if self.allowed_tools_str == "__none__":
+                                    allowed_list = []
+                                else:
+                                    allowed_list = [t.strip() for t in self.allowed_tools_str.split(",") if t.strip()]
 
                             for tool in tools:
                                 tool_name = tool.get("name", "")
@@ -235,7 +239,7 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def rest_auth_middleware(request: Request, call_next):
-        if os.getenv("PB_REQUIRE_REST_AUTH", "false").lower() not in ("true", "1", "yes"):
+        if not auth._is_rest_auth_required():
             return await call_next(request)
 
         method = request.method.upper()
@@ -245,9 +249,20 @@ def create_app() -> FastAPI:
         path = request.url.path
         normalized_path = path.rstrip("/") or "/"
 
-        # Exempt public/docs/dashboard/MCP endpoints
+        # Exempt public/auth/docs/dashboard/MCP endpoints
         if (
-            normalized_path in ("/health", "/auth/verify", "/docs", "/openapi.json", "/redoc")
+            normalized_path
+            in (
+                "/health",
+                "/auth/config",
+                "/auth/login",
+                "/auth/register",
+                "/auth/logout",
+                "/auth/verify",
+                "/docs",
+                "/openapi.json",
+                "/redoc",
+            )
             or path.startswith("/docs/")
             or path.startswith("/redoc/")
             or path.startswith("/dashboard")
@@ -255,20 +270,33 @@ def create_app() -> FastAPI:
         ):
             return await call_next(request)
 
+        is_self_service_auth_route = (
+            normalized_path in ("/auth/me", "/auth/change-password")
+            or normalized_path == "/auth/sessions"
+            or path.startswith("/auth/sessions/")
+            or normalized_path == "/auth/api-keys"
+            or path.startswith("/auth/api-keys/")
+        )
         is_admin_plugin_route = (
             method in ("POST", "PUT", "PATCH", "DELETE")
             and (normalized_path == "/plugins" or path.startswith("/plugins/"))
         )
         is_admin_route = (
-            normalized_path == "/auth"
-            or path.startswith("/auth/")
+            (
+                (normalized_path == "/auth" or path.startswith("/auth/"))
+                and not is_self_service_auth_route
+            )
             or normalized_path == "/memory/mcp"
             or path.startswith("/memory/mcp/")
             or is_admin_plugin_route
         )
-        is_protected_route = is_admin_route or any(
-            normalized_path == prefix or path.startswith(prefix + "/")
-            for prefix in _PROTECTED_REST_PREFIXES
+        is_protected_route = (
+            is_self_service_auth_route
+            or is_admin_route
+            or any(
+                normalized_path == prefix or path.startswith(prefix + "/")
+                for prefix in _PROTECTED_REST_PREFIXES
+            )
         )
 
         if not is_protected_route:
@@ -289,10 +317,19 @@ def create_app() -> FastAPI:
             )
 
         if role == "reader" and method in ("POST", "PUT", "PATCH", "DELETE"):
-            if not (method == "POST" and normalized_path in _READ_ONLY_POST_ROUTES):
+            if not is_self_service_auth_route and not (method == "POST" and normalized_path in _READ_ONLY_POST_ROUTES):
                 return JSONResponse(
                     status_code=403,
                     content={"detail": "Permission denied: Read-only accounts cannot perform mutating operations."},
+                )
+
+        allowed_projects_str = (account.get("allowed_projects") or "*").strip()
+        if allowed_projects_str != "*" and not is_self_service_auth_route:
+            req_project_id = request.query_params.get("project_id") or request.query_params.get("user_id")
+            if req_project_id and not auth.is_project_allowed(req_project_id, allowed_projects_str):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": f"Permission denied: Account is not authorized for project '{req_project_id}'."},
                 )
 
         return await call_next(request)
@@ -322,6 +359,13 @@ def create_app() -> FastAPI:
                 if not account:
                     return PlainTextResponse("Permission denied: Invalid token.", status_code=403)
 
+                req_project_id = request.query_params.get("project_id") or request.query_params.get("user_id")
+                if req_project_id and not auth.is_project_allowed(req_project_id, account.get("allowed_projects")):
+                    return PlainTextResponse(
+                        f"Permission denied: Account is not authorized for project '{req_project_id}'.",
+                        status_code=403,
+                    )
+
                 role = account["role"]
                 allowed_tools_str = account["allowed_tools"] or "*"
 
@@ -340,7 +384,7 @@ def create_app() -> FastAPI:
                                     if "session_id=" in text:
                                         text = re.sub(
                                             r"(session_id=[a-zA-Z0-9\-]+)",
-                                            rf"\1&token={token}",
+                                            lambda m: f"{m.group(1)}&token={token}",
                                             text,
                                         )
                                         chunk = text.encode("utf-8")
@@ -394,6 +438,18 @@ def create_app() -> FastAPI:
 
             role = account["role"]
             allowed_tools_str = account["allowed_tools"] or "*"
+            allowed_projects_str = account.get("allowed_projects") or "*"
+
+            req_project_id = request.query_params.get("project_id") or request.query_params.get("user_id")
+            if req_project_id and not auth.is_project_allowed(req_project_id, allowed_projects_str):
+                return JSONResponse(status_code=403, content={
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32003,
+                        "message": f"Permission denied: Account is not authorized for project '{req_project_id}'."
+                    },
+                    "id": payload.get("id")
+                })
 
             role_token = None
             try:
@@ -406,10 +462,25 @@ def create_app() -> FastAPI:
                 if method == "tools/call":
                     params = payload.get("params", {})
                     tool_name = params.get("name", "")
+                    tool_args = params.get("arguments")
+                    if isinstance(tool_args, dict):
+                        arg_proj = tool_args.get("project_id") or tool_args.get("user_id")
+                        if isinstance(arg_proj, str) and arg_proj.strip() and not auth.is_project_allowed(arg_proj, allowed_projects_str):
+                            return JSONResponse(status_code=403, content={
+                                "jsonrpc": "2.0",
+                                "error": {
+                                    "code": -32003,
+                                    "message": f"Permission denied: Account is not authorized for project '{arg_proj}'."
+                                },
+                                "id": payload.get("id")
+                            })
 
                     # Check allowed tools list
                     if allowed_tools_str != "*":
-                        allowed_list = [t.strip() for t in allowed_tools_str.split(",") if t.strip()]
+                        if allowed_tools_str == "__none__":
+                            allowed_list = []
+                        else:
+                            allowed_list = [t.strip() for t in allowed_tools_str.split(",") if t.strip()]
                         short_tool_name = tool_name.split("-", 1)[1] if "-" in tool_name else tool_name
                         if tool_name not in allowed_list and short_tool_name not in allowed_list:
                             return JSONResponse(status_code=403, content={
@@ -456,7 +527,10 @@ def create_app() -> FastAPI:
                                 filtered_tools = []
                                 allowed_list = []
                                 if allowed_tools_str != "*":
-                                    allowed_list = [t.strip() for t in allowed_tools_str.split(",") if t.strip()]
+                                    if allowed_tools_str == "__none__":
+                                        allowed_list = []
+                                    else:
+                                        allowed_list = [t.strip() for t in allowed_tools_str.split(",") if t.strip()]
                                 for tool in tools:
                                     tool_name = tool.get("name", "")
                                     short_tool_name = tool_name.split("-", 1)[1] if "-" in tool_name else tool_name
@@ -531,6 +605,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix="/auth", tags=["auth"])
     app.include_router(sources.router)
     app.include_router(graphify.router)
+    app.include_router(master_topology.router)
     app.include_router(kb.router)
     app.include_router(plugins_v3.router)
     app.include_router(pm.router, prefix="/pm", tags=["pm"])
@@ -551,6 +626,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
+        auth.init_auth_system()
         logger.info(f"ProjectBrain Server running (database: {_redact_database_url(getattr(env, 'database_url', None))})")
 
     return app

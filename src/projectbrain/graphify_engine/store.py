@@ -12,7 +12,10 @@ import logging
 import os
 import re
 import sqlite3
+import threading
+import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import psycopg2
@@ -40,9 +43,11 @@ __all__ = [
     "BranchDiffSummary",
     "BranchDiffResult",
     "sanitize_branch_schema_name",
+    "sanitize_project_branch_schema_name",
     "GraphStore",
     "PostgresSchemaGraphStore",
     "SqliteOverlayGraphStore",
+    "MultiProjectGraphStore",
     "get_graph_store",
 ]
 
@@ -74,6 +79,21 @@ def _extract_edge_metadata_dict(edge_or_meta: Any) -> Dict[str, Any]:
 
 def _serialize_edge_metadata(edge_or_meta: Any) -> str:
     return json.dumps(_extract_edge_metadata_dict(edge_or_meta))
+
+
+def _dedup_nodes(nodes: List[GraphNode]) -> List[GraphNode]:
+    """Deduplicate nodes by primary key (id), keeping the last occurrence."""
+    return list({n.id: n for n in nodes}.values())
+
+
+def _dedup_edges(edges: List[GraphEdge]) -> List[GraphEdge]:
+    """Deduplicate edges by primary key (source, target, relation), keeping the last occurrence."""
+    return list({(e.source, e.target, e.relation): e for e in edges}.values())
+
+
+def _dedup_hyperedges(hyperedges: List[GraphHyperedge]) -> List[GraphHyperedge]:
+    """Deduplicate hyperedges by primary key (id), keeping the last occurrence."""
+    return list({h.id: h for h in hyperedges}.values())
 
 
 def sanitize_branch_schema_name(project_id: str, branch_name: str) -> str:
@@ -109,11 +129,28 @@ def sanitize_branch_schema_name(project_id: str, branch_name: str) -> str:
     return schema_name
 
 
+def sanitize_project_branch_schema_name(
+    branch_name: str, root_branch: str = "main"
+) -> str:
+    """Compute deterministic branch schema identifier inside a dedicated project DB (<= 60 bytes)."""
+    from ..core.tenant_manager import sanitize_branch_schema_for_project
+
+    return sanitize_branch_schema_for_project(branch_name, root_branch=root_branch)
+
+
 class GraphStore(ABC):
     """Abstract Base Class for ProjectBrain Graph Storage backends."""
 
-    def __init__(self, root_branch: str = "main"):
+    def __init__(self, root_branch: str = "main", project_scoped_schemas: bool = False):
         self.root_branch = root_branch or "main"
+        self.project_scoped_schemas = bool(project_scoped_schemas)
+
+    def _branch_schema_name(self, project_id: str, branch_name: str) -> str:
+        if getattr(self, "project_scoped_schemas", False):
+            return sanitize_project_branch_schema_name(
+                branch_name, root_branch=self.root_branch
+            )
+        return sanitize_branch_schema_name(project_id, branch_name)
 
     def close(self) -> None:
         """Close underlying database connection if owned by this store."""
@@ -683,6 +720,104 @@ class GraphStore(ABC):
             deleted_edges=deleted_edges,
         )
 
+    def _resolve_subgraph_for_visjs(
+        self,
+        project_id: str,
+        branch_name: Optional[str] = "main",
+        query: Optional[str] = None,
+        kinds: Optional[str] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Resolve full enough subgraph for Vis.js filtering and merge branches on wildcard."""
+        has_query = bool(query and str(query).strip())
+        has_kinds = bool(kinds and str(kinds).strip().lower() not in ("all", "*"))
+        subgraph_limit = 100_000 if (has_query or has_kinds) else max(limit * 5, 2000)
+
+        br = (branch_name or "").strip()
+        if br in ("%", "*", ""):
+            subgraph = self.get_resolved_subgraph(
+                project_id, self.root_branch, limit=subgraph_limit
+            )
+            try:
+                branches = self.list_branches(project_id) or []
+            except Exception:
+                branches = []
+            non_root = [
+                b.get("branch_name")
+                for b in branches
+                if b.get("branch_name")
+                and not b.get("is_root")
+                and not self.is_root_branch(b.get("branch_name"))
+            ]
+            if non_root:
+                nodes_by_id: Dict[str, Dict[str, Any]] = {
+                    n["id"]: n for n in subgraph.get("nodes", [])
+                }
+                edges_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {
+                    (e["source"], e["target"], e["relation"]): e
+                    for e in subgraph.get("edges", [])
+                }
+                for b_name in non_root:
+                    if len(nodes_by_id) >= subgraph_limit and not (has_query or has_kinds):
+                        break
+                    b_sub = self.get_resolved_subgraph(
+                        project_id, str(b_name), limit=subgraph_limit
+                    )
+                    for n in b_sub.get("nodes", []):
+                        nodes_by_id.setdefault(n["id"], n)
+                    for e in b_sub.get("edges", []):
+                        edges_by_key.setdefault(
+                            (e["source"], e["target"], e["relation"]), e
+                        )
+                subgraph = {
+                    "project_id": project_id,
+                    "branch": self.root_branch,
+                    "nodes": list(nodes_by_id.values()),
+                    "edges": list(edges_by_key.values()),
+                }
+            return subgraph
+
+        return self.get_resolved_subgraph(project_id, br, limit=subgraph_limit)
+
+    @staticmethod
+    def _infer_visjs_sym_kind(node: Dict[str, Any], meta: Dict[str, Any]) -> str:
+        """Derive normalized symbol kind from node metadata and AST/doc naming cues."""
+        sym_kind = str(
+            meta.get("kind")
+            or meta.get("symbol_type")
+            or meta.get("node_type")
+            or meta.get("type")
+            or ""
+        ).strip().lower()
+        if sym_kind:
+            return sym_kind
+
+        nid = str(node.get("id") or "")
+        label = str(node.get("label") or "")
+        src_file = str(node.get("source_file") or "")
+        file_type = (node.get("file_type") or "code").strip().lower()
+
+        if "_rationale_" in nid:
+            return "rationale"
+        if nid == src_file or label.endswith(
+            (".py", ".js", ".ts", ".tsx", ".sql", ".md", ".sh", ".json", ".toml")
+        ):
+            return "file"
+        if file_type in ("doc", "document", "markdown"):
+            return "section"
+        if meta.get("_callable_class") or (
+            file_type == "code"
+            and label[:1].isupper()
+            and " " not in label
+            and not label.endswith("()")
+        ):
+            return "class"
+        if file_type == "code" and label.startswith(".") and label.endswith("()"):
+            return "method"
+        if file_type == "code":
+            return "function"
+        return file_type
+
     def _format_legacy_visjs(
         self,
         subgraph: Dict[str, Any],
@@ -693,38 +828,126 @@ class GraphStore(ABC):
         raw_nodes = subgraph.get("nodes", [])
         raw_edges = subgraph.get("edges", [])
 
-        if query:
-            q = query.lower()
-            raw_nodes = [n for n in raw_nodes if q in n["id"].lower() or q in n.get("label", "").lower()]
+        kinds_str = (kinds or "").strip().lower()
+        has_kind_filter = bool(kinds_str) and kinds_str not in ("all", "*")
+        kind_set = (
+            {k.strip().lower() for k in kinds_str.split(",") if k.strip()}
+            if has_kind_filter
+            else set()
+        )
 
-        if kinds:
-            kind_set = {k.strip().lower() for k in kinds.split(",") if k.strip()}
-            raw_nodes = [n for n in raw_nodes if (n.get("file_type") or "code").lower() in kind_set]
+        # Precompute parsed metadata and symbol kinds once per node
+        parsed_meta_by_id: Dict[str, Dict[str, Any]] = {}
+        sym_kind_by_id: Dict[str, str] = {}
+        node_by_id: Dict[str, Dict[str, Any]] = {}
+        for n in raw_nodes:
+            nid = n["id"]
+            node_by_id[nid] = n
+            meta = _parse_edge_metadata(n.get("metadata"))
+            parsed_meta_by_id[nid] = meta
+            sym_kind_by_id[nid] = self._infer_visjs_sym_kind(n, meta)
 
-        selected_nodes = raw_nodes[:limit]
+        def _passes_kinds(n: Dict[str, Any]) -> bool:
+            if not has_kind_filter:
+                return True
+            nid = n["id"]
+            ft = (n.get("file_type") or "code").strip().lower()
+            return sym_kind_by_id[nid] in kind_set or ft in kind_set
+
+        q = (query or "").strip().lower()
+        if q:
+            matched: List[Dict[str, Any]] = []
+            for n in raw_nodes:
+                if not _passes_kinds(n):
+                    continue
+                nid = n["id"]
+                meta = parsed_meta_by_id[nid]
+                qname = str(meta.get("qualified_name") or "").lower()
+                src_file = str(n.get("source_file") or "").lower()
+                label = str(n.get("label") or "").lower()
+                if (
+                    q in nid.lower()
+                    or q in label
+                    or q in src_file
+                    or q in qname
+                ):
+                    matched.append(n)
+
+            selected_nodes = matched[:limit]
+            # Include true 1-hop connected neighbors when query results are under limit
+            if selected_nodes and len(selected_nodes) < limit:
+                seed_ids = {n["id"] for n in selected_nodes}
+                selected_ids = set(seed_ids)
+                seed_file_types = {
+                    (n.get("file_type") or "code").strip().lower()
+                    for n in selected_nodes
+                }
+                explicit_kinds_arg = bool(kinds_str)
+                for e in raw_edges:
+                    if len(selected_nodes) >= limit:
+                        break
+                    src, tgt = e.get("source"), e.get("target")
+                    neighbor_id = None
+                    if src in seed_ids and tgt not in selected_ids:
+                        neighbor_id = tgt
+                    elif tgt in seed_ids and src not in selected_ids:
+                        neighbor_id = src
+                    if not neighbor_id or neighbor_id not in node_by_id:
+                        continue
+                    nb = node_by_id[neighbor_id]
+                    if not _passes_kinds(nb):
+                        continue
+                    # When kinds is omitted, avoid pulling unrelated cross-domain doc nodes
+                    if not explicit_kinds_arg:
+                        nb_ft = (nb.get("file_type") or "code").strip().lower()
+                        if nb_ft not in seed_file_types:
+                            continue
+                    selected_ids.add(neighbor_id)
+                    selected_nodes.append(nb)
+        else:
+            selected_nodes = [n for n in raw_nodes if _passes_kinds(n)][:limit]
+
         node_id_set = {n["id"] for n in selected_nodes}
 
         vis_nodes = []
         for n in selected_nodes:
+            nid = n["id"]
+            meta = parsed_meta_by_id[nid]
+            sym_kind = sym_kind_by_id[nid]
+            label = n.get("label", nid)
             vis_nodes.append({
-                "id": n["id"],
-                "label": n.get("label", n["id"]),
-                "title": f"{n.get('label', n['id'])} ({n.get('source_file', '')})",
+                "id": nid,
+                "label": label,
+                "name": label,
+                "qualified_name": meta.get("qualified_name") or nid,
+                "kind": sym_kind,
+                "title": f"{label} ({n.get('source_file', '')})",
                 "group": n.get("file_type") or "code",
                 "source_file": n.get("source_file"),
+                "file_path": n.get("source_file"),
+                "source_location": n.get("source_location"),
+                "start_line": meta.get("start_line"),
+                "end_line": meta.get("end_line"),
+                "signature": meta.get("signature"),
+                "docstring": meta.get("docstring") or meta.get("summary"),
                 "community": n.get("community"),
-                "metadata": n.get("metadata", {}),
+                "metadata": meta,
             })
 
         vis_edges = []
         for e in raw_edges:
             if e["source"] in node_id_set and e["target"] in node_id_set:
+                rel = e.get("relation", "")
                 vis_edges.append({
-                    "id": f"{e['source']}->{e['target']}:{e['relation']}",
+                    "id": f"{e['source']}->{e['target']}:{rel}",
                     "from": e["source"],
                     "to": e["target"],
-                    "label": e.get("relation", ""),
-                    "relation": e.get("relation", ""),
+                    "source": e["source"],
+                    "target": e["target"],
+                    "label": rel,
+                    "relation": rel,
+                    "type": rel,
+                    "kind": rel,
                     "confidence": e.get("confidence", "EXTRACTED"),
                     "confidence_score": e.get("confidence_score", 1.0),
                     "weight": e.get("weight", 1.0),
@@ -754,8 +977,9 @@ class SqliteOverlayGraphStore(GraphStore):
         db_path: Optional[str] = None,
         conn: Optional[sqlite3.Connection] = None,
         root_branch: str = "main",
+        project_scoped_schemas: bool = False,
     ):
-        super().__init__(root_branch=root_branch)
+        super().__init__(root_branch=root_branch, project_scoped_schemas=project_scoped_schemas)
         if db_path is None:
             db_path = os.getenv("OM_DB_PATH") or os.getenv("PB_DB_PATH") or None
         self.db_path = db_path
@@ -881,7 +1105,7 @@ class SqliteOverlayGraphStore(GraphStore):
         base_branch: Optional[str] = None,
     ) -> str:
         self.ensure_root_schema()
-        schema_name = sanitize_branch_schema_name(project_id, branch_name)
+        schema_name = self._branch_schema_name(project_id, branch_name)
         clean_proj = project_id.replace("'", "''")
         conn = self.get_conn()
 
@@ -1018,11 +1242,13 @@ class SqliteOverlayGraphStore(GraphStore):
             SELECT r.project_id, r.source, r.target, r.relation, r.confidence, r.confidence_score, r.source_file, r.source_location, r.weight, r.metadata, r.created_at
             FROM root_edges r
             WHERE r.project_id = '{clean_proj}'
-              AND (r.source, r.target, r.relation) NOT IN (
-                  SELECT source, target, relation FROM {schema_name}_edge_tombstones WHERE project_id = '{clean_proj}'
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema_name}_edge_tombstones t
+                  WHERE t.project_id = r.project_id AND t.source = r.source AND t.target = r.target AND t.relation = r.relation
               )
-              AND (r.source, r.target, r.relation) NOT IN (
-                  SELECT source, target, relation FROM {schema_name}_edge_upserts WHERE project_id = '{clean_proj}'
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema_name}_edge_upserts u
+                  WHERE u.project_id = r.project_id AND u.source = r.source AND u.target = r.target AND u.relation = r.relation
               )
             """)
 
@@ -1141,7 +1367,7 @@ class SqliteOverlayGraphStore(GraphStore):
                     edges_deleted += c.rowcount
 
             # Upsert nodes
-            for n in delta.nodes:
+            for n in _dedup_nodes(delta.nodes):
                 meta_json = json.dumps(n.metadata) if isinstance(n.metadata, dict) else str(n.metadata or "{}")
                 conn.execute(
                     """
@@ -1161,7 +1387,7 @@ class SqliteOverlayGraphStore(GraphStore):
                 nodes_upserted += 1
 
             # Upsert edges
-            for e in delta.edges:
+            for e in _dedup_edges(delta.edges):
                 edge_meta_json = _serialize_edge_metadata(e)
                 conn.execute(
                     """
@@ -1180,7 +1406,7 @@ class SqliteOverlayGraphStore(GraphStore):
                 edges_upserted += 1
 
             # Upsert hyperedges
-            for h in delta.hyperedges:
+            for h in _dedup_hyperedges(delta.hyperedges):
                 nodes_json = json.dumps(h.nodes) if isinstance(h.nodes, list) else str(h.nodes)
                 conn.execute(
                     """
@@ -1202,7 +1428,7 @@ class SqliteOverlayGraphStore(GraphStore):
             "status": "synced",
             "project_id": project_id,
             "branch": self.root_branch,
-            "schema_name": "root",
+            "schema_name": "pb_root" if self.project_scoped_schemas else "root",
             "nodes_upserted": nodes_upserted,
             "nodes_deleted": nodes_deleted,
             "edges_upserted": edges_upserted,
@@ -1269,26 +1495,15 @@ class SqliteOverlayGraphStore(GraphStore):
         edges_tombstoned = 0
 
         delta_node_ids = set()
-        for n in delta.nodes:
+        for n in _dedup_nodes(delta.nodes):
             delta_node_ids.add(n.id)
             meta_dict = n.metadata if isinstance(n.metadata, dict) else {}
             meta_json = json.dumps(meta_dict)
 
-            if n.id not in root_nodes:
-                # Brand new node
-                conn.execute(
-                    f"""
-                    INSERT INTO {schema_name}_node_upserts
-                    (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                    """,
-                    (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
-                )
-                nodes_upserted += 1
-            else:
-                # Compare attributes with root
+            should_upsert = n.id not in root_nodes
+            if not should_upsert:
                 r = root_nodes[n.id]
-                differs = (
+                should_upsert = (
                     r["label"] != n.label
                     or r["file_type"] != n.file_type
                     or r["source_file"] != n.source_file
@@ -1296,47 +1511,46 @@ class SqliteOverlayGraphStore(GraphStore):
                     or r["community"] != n.community
                     or r["metadata"] != meta_dict
                 )
-                if differs:
-                    conn.execute(
-                        f"""
-                        INSERT INTO {schema_name}_node_upserts
-                        (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                        """,
-                        (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
-                    )
-                    nodes_upserted += 1
+            if should_upsert:
+                conn.execute(
+                    f"""
+                    INSERT INTO {schema_name}_node_upserts
+                    (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT (project_id, id) DO UPDATE SET
+                        label = excluded.label,
+                        file_type = excluded.file_type,
+                        source_file = excluded.source_file,
+                        source_location = excluded.source_location,
+                        community = excluded.community,
+                        metadata = excluded.metadata,
+                        updated_at = datetime('now')
+                    """,
+                    (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
+                )
+                nodes_upserted += 1
 
         # Root nodes missing from branch snapshot become tombstones
         for rid in root_nodes:
             if rid not in delta_node_ids:
                 conn.execute(
-                    f"INSERT INTO {schema_name}_node_tombstones (project_id, id) VALUES (?, ?)",
+                    f"INSERT OR IGNORE INTO {schema_name}_node_tombstones (project_id, id) VALUES (?, ?)",
                     (project_id, rid),
                 )
                 nodes_tombstoned += 1
 
         # Edge comparison
         delta_edge_keys = set()
-        for e in delta.edges:
+        for e in _dedup_edges(delta.edges):
             ekey = (e.source, e.target, e.relation)
             delta_edge_keys.add(ekey)
             edge_meta_dict = _extract_edge_metadata_dict(e)
             edge_meta_json = json.dumps(edge_meta_dict)
 
-            if ekey not in root_edges:
-                conn.execute(
-                    f"""
-                    INSERT INTO {schema_name}_edge_upserts
-                    (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
-                )
-                edges_upserted += 1
-            else:
+            should_upsert = ekey not in root_edges
+            if not should_upsert:
                 r = root_edges[ekey]
-                differs = (
+                should_upsert = (
                     r["confidence"] != e.confidence
                     or abs(r["confidence_score"] - e.confidence_score) > 1e-4
                     or (r["source_file"] or None) != (e.source_file or None)
@@ -1344,22 +1558,29 @@ class SqliteOverlayGraphStore(GraphStore):
                     or abs(r["weight"] - e.weight) > 1e-4
                     or _parse_edge_metadata(r.get("metadata")) != edge_meta_dict
                 )
-                if differs:
-                    conn.execute(
-                        f"""
-                        INSERT INTO {schema_name}_edge_upserts
-                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
-                    )
-                    edges_upserted += 1
+            if should_upsert:
+                conn.execute(
+                    f"""
+                    INSERT INTO {schema_name}_edge_upserts
+                    (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
+                        confidence = excluded.confidence,
+                        confidence_score = excluded.confidence_score,
+                        source_file = excluded.source_file,
+                        source_location = excluded.source_location,
+                        weight = excluded.weight,
+                        metadata = excluded.metadata
+                    """,
+                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
+                )
+                edges_upserted += 1
 
         # Missing root edges become tombstones
         for ekey in root_edges:
             if ekey not in delta_edge_keys:
                 conn.execute(
-                    f"INSERT INTO {schema_name}_edge_tombstones (project_id, source, target, relation) VALUES (?, ?, ?, ?)",
+                    f"INSERT OR IGNORE INTO {schema_name}_edge_tombstones (project_id, source, target, relation) VALUES (?, ?, ?, ?)",
                     (project_id, ekey[0], ekey[1], ekey[2]),
                 )
                 edges_tombstoned += 1
@@ -1368,7 +1589,7 @@ class SqliteOverlayGraphStore(GraphStore):
             conn.execute(f"DELETE FROM {schema_name}_hyperedge_upserts WHERE project_id = ? AND id = ?", (project_id, htid))
             conn.execute(f"INSERT OR IGNORE INTO {schema_name}_hyperedge_tombstones (project_id, id) VALUES (?, ?)", (project_id, htid))
 
-        for h in delta.hyperedges:
+        for h in _dedup_hyperedges(delta.hyperedges):
             conn.execute(f"DELETE FROM {schema_name}_hyperedge_tombstones WHERE project_id = ? AND id = ?", (project_id, h.id))
             nodes_val = json.dumps(h.nodes) if not isinstance(h.nodes, str) else h.nodes
             conn.execute(
@@ -1514,7 +1735,7 @@ class SqliteOverlayGraphStore(GraphStore):
                     root_edges[(rd["source"], rd["target"], rd["relation"])] = rd
 
             # File scoped delta entities
-            delta_file_nodes = [n for n in delta.nodes if n.source_file == fpath]
+            delta_file_nodes = _dedup_nodes([n for n in delta.nodes if n.source_file == fpath])
             delta_node_ids = {n.id for n in delta_file_nodes}
 
             # Any root node in this file missing from delta is tombstoned
@@ -1534,38 +1755,37 @@ class SqliteOverlayGraphStore(GraphStore):
                 meta_json = json.dumps(meta_dict)
                 conn.execute(f"DELETE FROM {schema_name}_node_tombstones WHERE project_id = ? AND id = ?", (project_id, n.id))
 
-                if n.id not in root_nodes:
-                    conn.execute(
-                        f"""
-                        INSERT INTO {schema_name}_node_upserts
-                        (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                        """,
-                        (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
-                    )
-                    nodes_upserted += 1
-                else:
+                should_upsert = n.id not in root_nodes
+                if not should_upsert:
                     r = root_nodes[n.id]
-                    differs = (
+                    should_upsert = (
                         r["label"] != n.label
                         or r["file_type"] != n.file_type
                         or (r["source_location"] or None) != (n.source_location or None)
                         or r["community"] != n.community
                         or r["metadata"] != meta_dict
                     )
-                    if differs:
-                        conn.execute(
-                            f"""
-                            INSERT INTO {schema_name}_node_upserts
-                            (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                            """,
-                            (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
-                        )
-                        nodes_upserted += 1
+                if should_upsert:
+                    conn.execute(
+                        f"""
+                        INSERT INTO {schema_name}_node_upserts
+                        (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT (project_id, id) DO UPDATE SET
+                            label = excluded.label,
+                            file_type = excluded.file_type,
+                            source_file = excluded.source_file,
+                            source_location = excluded.source_location,
+                            community = excluded.community,
+                            metadata = excluded.metadata,
+                            updated_at = datetime('now')
+                        """,
+                        (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
+                    )
+                    nodes_upserted += 1
 
             # Edge file scoping
-            delta_file_edges = [e for e in delta.edges if e.source_file == fpath]
+            delta_file_edges = _dedup_edges([e for e in delta.edges if e.source_file == fpath])
             delta_edge_keys = {(e.source, e.target, e.relation) for e in delta_file_edges}
 
             for ekey in root_edges:
@@ -1589,35 +1809,33 @@ class SqliteOverlayGraphStore(GraphStore):
                     f"DELETE FROM {schema_name}_edge_tombstones WHERE project_id = ? AND source = ? AND target = ? AND relation = ?",
                     (project_id, e.source, e.target, e.relation),
                 )
-                if ekey not in root_edges:
-                    conn.execute(
-                        f"""
-                        INSERT INTO {schema_name}_edge_upserts
-                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
-                    )
-                    edges_upserted += 1
-                else:
+                should_upsert = ekey not in root_edges
+                if not should_upsert:
                     r = root_edges[ekey]
-                    differs = (
+                    should_upsert = (
                         r["confidence"] != e.confidence
                         or abs(r["confidence_score"] - e.confidence_score) > 1e-4
                         or (r["source_location"] or None) != (e.source_location or None)
                         or abs(r["weight"] - e.weight) > 1e-4
                         or _parse_edge_metadata(r.get("metadata")) != edge_meta_dict
                     )
-                    if differs:
-                        conn.execute(
-                            f"""
-                            INSERT INTO {schema_name}_edge_upserts
-                            (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
-                        )
-                        edges_upserted += 1
+                if should_upsert:
+                    conn.execute(
+                        f"""
+                        INSERT INTO {schema_name}_edge_upserts
+                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
+                            confidence = excluded.confidence,
+                            confidence_score = excluded.confidence_score,
+                            source_file = excluded.source_file,
+                            source_location = excluded.source_location,
+                            weight = excluded.weight,
+                            metadata = excluded.metadata
+                        """,
+                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
+                    )
+                    edges_upserted += 1
 
             # Registry update
             conn.execute(
@@ -1646,7 +1864,7 @@ class SqliteOverlayGraphStore(GraphStore):
             conn.execute(f"DELETE FROM {schema_name}_hyperedge_upserts WHERE project_id = ? AND id = ?", (project_id, htid))
             conn.execute(f"INSERT OR IGNORE INTO {schema_name}_hyperedge_tombstones (project_id, id) VALUES (?, ?)", (project_id, htid))
 
-        for h in delta.hyperedges:
+        for h in _dedup_hyperedges(delta.hyperedges):
             conn.execute(f"DELETE FROM {schema_name}_hyperedge_tombstones WHERE project_id = ? AND id = ?", (project_id, h.id))
             nodes_val = json.dumps(h.nodes) if not isinstance(h.nodes, str) else h.nodes
             conn.execute(
@@ -1678,7 +1896,7 @@ class SqliteOverlayGraphStore(GraphStore):
         }
 
     def _get_branch_overlay(self, project_id: str, branch_name: str) -> Dict[str, Any]:
-        schema_name = sanitize_branch_schema_name(project_id, branch_name)
+        schema_name = self._branch_schema_name(project_id, branch_name)
         conn = self.get_conn()
 
         node_upserts: Dict[str, Dict[str, Any]] = {}
@@ -2151,8 +2369,8 @@ class SqliteOverlayGraphStore(GraphStore):
                 return self._resolve_multi_level_subgraph(
                     project_id, branch_name, lineage, files=files, limit=limit
                 )
-            schema_name = sanitize_branch_schema_name(project_id, branch_name)
-            # Query resolved views
+            schema_name = self._branch_schema_name(project_id, branch_name)
+            # Query resolved node/hyperedge views, and merge edges in O(N+M) to avoid SQLite tuple NOT IN scans
             try:
                 if files:
                     q_ph = ",".join("?" for _ in files)
@@ -2165,11 +2383,30 @@ class SqliteOverlayGraphStore(GraphStore):
                         f"SELECT * FROM {schema_name}_v_resolved_nodes WHERE project_id = ? LIMIT ?",
                         (project_id, limit),
                     ).fetchall()
-                edges_rows = conn.execute(f"SELECT * FROM {schema_name}_v_resolved_edges WHERE project_id = ?", (project_id,)).fetchall()
+                upsert_edges_rows = conn.execute(
+                    f"SELECT * FROM {schema_name}_edge_upserts WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+                tomb_edges_rows = conn.execute(
+                    f"SELECT source, target, relation FROM {schema_name}_edge_tombstones WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+                root_edges_rows = conn.execute(
+                    "SELECT * FROM root_edges WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
                 hyperedges_rows = conn.execute(f"SELECT * FROM {schema_name}_v_resolved_hyperedges WHERE project_id = ?", (project_id,)).fetchall()
             except sqlite3.OperationalError:
                 # View doesn't exist yet, fall back to root
                 return self.get_resolved_subgraph(project_id, self.root_branch, files=files, limit=limit)
+
+            tomb_edge_set = {(r[0], r[1], r[2]) for r in tomb_edges_rows}
+            upsert_edge_keys = {(r["source"], r["target"], r["relation"]) for r in upsert_edges_rows}
+            edges_rows = list(upsert_edges_rows)
+            for r in root_edges_rows:
+                ekey = (r["source"], r["target"], r["relation"])
+                if ekey not in tomb_edge_set and ekey not in upsert_edge_keys:
+                    edges_rows.append(r)
 
         nodes: List[Dict[str, Any]] = []
         for r in nodes_rows:
@@ -2184,8 +2421,8 @@ class SqliteOverlayGraphStore(GraphStore):
         node_id_set = {n["id"] for n in nodes}
         edges: List[Dict[str, Any]] = []
         for r in edges_rows:
-            d = dict(r)
-            if d["source"] in node_id_set and d["target"] in node_id_set:
+            if r["source"] in node_id_set and r["target"] in node_id_set:
+                d = dict(r)
                 d["metadata"] = _parse_edge_metadata(d.get("metadata"))
                 edges.append(d)
 
@@ -2248,7 +2485,7 @@ class SqliteOverlayGraphStore(GraphStore):
     def delete_branch(self, project_id: str, branch_name: str) -> bool:
         if self.is_root_branch(branch_name):
             return False
-        schema_name = sanitize_branch_schema_name(project_id, branch_name)
+        schema_name = self._branch_schema_name(project_id, branch_name)
         conn = self.get_conn()
         with conn:
             conn.execute(f"DROP VIEW IF EXISTS {schema_name}_v_resolved_nodes")
@@ -2271,7 +2508,11 @@ class SqliteOverlayGraphStore(GraphStore):
             (project_id,),
         ).fetchall()
         branches: List[Dict[str, Any]] = [
-            {"branch_name": self.root_branch, "schema_name": "root", "is_root": True}
+            {
+                "branch_name": self.root_branch,
+                "schema_name": "pb_root" if self.project_scoped_schemas else "root",
+                "is_root": True,
+            }
         ]
         for r in rows:
             if r["branch_name"] != self.root_branch:
@@ -2294,7 +2535,9 @@ class SqliteOverlayGraphStore(GraphStore):
         kinds: Optional[str] = None,
         limit: int = 500,
     ) -> Dict[str, Any]:
-        subgraph = self.get_resolved_subgraph(project_id, branch_name, limit=limit * 2)
+        subgraph = self._resolve_subgraph_for_visjs(
+            project_id, branch_name=branch_name, query=query, kinds=kinds, limit=limit
+        )
         return self._format_legacy_visjs(subgraph, query=query, kinds=kinds, limit=limit)
 
 
@@ -2313,8 +2556,9 @@ class PostgresSchemaGraphStore(GraphStore):
         connection_url: Optional[str] = None,
         conn: Optional[Any] = None,
         root_branch: str = "main",
+        project_scoped_schemas: bool = False,
     ):
-        super().__init__(root_branch=root_branch)
+        super().__init__(root_branch=root_branch, project_scoped_schemas=project_scoped_schemas)
         self.connection_url = connection_url
         self._external_conn = conn
         self._conn = conn
@@ -2422,7 +2666,7 @@ class PostgresSchemaGraphStore(GraphStore):
 
     def generate_branch_schema_ddl(self, project_id: str, branch_name: str) -> List[Any]:
         """Generate psycopg2.sql statements for an isolated branch schema and resolved views."""
-        schema_name = sanitize_branch_schema_name(project_id, branch_name)
+        schema_name = self._branch_schema_name(project_id, branch_name)
         schema_id = psql.Identifier(schema_name)
         proj_lit = psql.Literal(project_id)
 
@@ -2577,7 +2821,7 @@ class PostgresSchemaGraphStore(GraphStore):
         base_branch: Optional[str] = None,
     ) -> str:
         self.ensure_root_schema()
-        schema_name = sanitize_branch_schema_name(project_id, branch_name)
+        schema_name = self._branch_schema_name(project_id, branch_name)
         conn = self.get_conn()
 
         existing_parents: Dict[str, str] = {}
@@ -2703,7 +2947,7 @@ class PostgresSchemaGraphStore(GraphStore):
                     edges_deleted += cur.rowcount
 
             # Upsert nodes
-            for n in delta.nodes:
+            for n in _dedup_nodes(delta.nodes):
                 cur.execute(
                     """
                     INSERT INTO pb_root.nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
@@ -2722,7 +2966,7 @@ class PostgresSchemaGraphStore(GraphStore):
                 nodes_upserted += 1
 
             # Upsert edges
-            for e in delta.edges:
+            for e in _dedup_edges(delta.edges):
                 edge_meta_json = _serialize_edge_metadata(e)
                 cur.execute(
                     """
@@ -2740,7 +2984,7 @@ class PostgresSchemaGraphStore(GraphStore):
                 )
                 edges_upserted += 1
 
-            for h in delta.hyperedges:
+            for h in _dedup_hyperedges(delta.hyperedges):
                 cur.execute(
                     """
                     INSERT INTO pb_root.hyperedges (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
@@ -2804,22 +3048,13 @@ class PostgresSchemaGraphStore(GraphStore):
         edges_tombstoned = 0
 
         delta_node_ids = set()
-        for n in delta.nodes:
+        for n in _dedup_nodes(delta.nodes):
             delta_node_ids.add(n.id)
             meta_json = json.dumps(n.metadata or {})
-            if n.id not in root_nodes:
-                cur.execute(
-                    psql.SQL("""
-                    INSERT INTO {schema}.node_upserts
-                    (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW());
-                    """).format(schema=schema_id),
-                    (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
-                )
-                nodes_upserted += 1
-            else:
+            should_upsert = n.id not in root_nodes
+            if not should_upsert:
                 r = root_nodes[n.id]
-                differs = (
+                should_upsert = (
                     r["label"] != n.label
                     or r["file_type"] != n.file_type
                     or r["source_file"] != n.source_file
@@ -2827,44 +3062,43 @@ class PostgresSchemaGraphStore(GraphStore):
                     or r["community"] != n.community
                     or r["metadata"] != (n.metadata or {})
                 )
-                if differs:
-                    cur.execute(
-                        psql.SQL("""
-                        INSERT INTO {schema}.node_upserts
-                        (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW());
-                        """).format(schema=schema_id),
-                        (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
-                    )
-                    nodes_upserted += 1
+            if should_upsert:
+                cur.execute(
+                    psql.SQL("""
+                    INSERT INTO {schema}.node_upserts
+                    (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (project_id, id) DO UPDATE SET
+                        label = EXCLUDED.label,
+                        file_type = EXCLUDED.file_type,
+                        source_file = EXCLUDED.source_file,
+                        source_location = EXCLUDED.source_location,
+                        community = EXCLUDED.community,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = NOW();
+                    """).format(schema=schema_id),
+                    (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
+                )
+                nodes_upserted += 1
 
         for rid in root_nodes:
             if rid not in delta_node_ids:
                 cur.execute(
-                    psql.SQL("INSERT INTO {schema}.node_tombstones (project_id, id) VALUES (%s, %s);").format(schema=schema_id),
+                    psql.SQL("INSERT INTO {schema}.node_tombstones (project_id, id) VALUES (%s, %s) ON CONFLICT DO NOTHING;").format(schema=schema_id),
                     (project_id, rid),
                 )
                 nodes_tombstoned += 1
 
         delta_edge_keys = set()
-        for e in delta.edges:
+        for e in _dedup_edges(delta.edges):
             ekey = (e.source, e.target, e.relation)
             delta_edge_keys.add(ekey)
             edge_meta_dict = _extract_edge_metadata_dict(e)
             edge_meta_json = json.dumps(edge_meta_dict)
-            if ekey not in root_edges:
-                cur.execute(
-                    psql.SQL("""
-                    INSERT INTO {schema}.edge_upserts
-                    (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                    """).format(schema=schema_id),
-                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
-                )
-                edges_upserted += 1
-            else:
+            should_upsert = ekey not in root_edges
+            if not should_upsert:
                 r = root_edges[ekey]
-                differs = (
+                should_upsert = (
                     r["confidence"] != e.confidence
                     or abs(r["confidence_score"] - e.confidence_score) > 1e-4
                     or (r["source_file"] or None) != (e.source_file or None)
@@ -2872,21 +3106,28 @@ class PostgresSchemaGraphStore(GraphStore):
                     or abs(r["weight"] - e.weight) > 1e-4
                     or _parse_edge_metadata(r.get("metadata")) != edge_meta_dict
                 )
-                if differs:
-                    cur.execute(
-                        psql.SQL("""
-                        INSERT INTO {schema}.edge_upserts
-                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                        """).format(schema=schema_id),
-                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
-                    )
-                    edges_upserted += 1
+            if should_upsert:
+                cur.execute(
+                    psql.SQL("""
+                    INSERT INTO {schema}.edge_upserts
+                    (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
+                        confidence = EXCLUDED.confidence,
+                        confidence_score = EXCLUDED.confidence_score,
+                        source_file = EXCLUDED.source_file,
+                        source_location = EXCLUDED.source_location,
+                        weight = EXCLUDED.weight,
+                        metadata = EXCLUDED.metadata;
+                    """).format(schema=schema_id),
+                    (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
+                )
+                edges_upserted += 1
 
         for ekey in root_edges:
             if ekey not in delta_edge_keys:
                 cur.execute(
-                    psql.SQL("INSERT INTO {schema}.edge_tombstones (project_id, source, target, relation) VALUES (%s, %s, %s, %s);").format(schema=schema_id),
+                    psql.SQL("INSERT INTO {schema}.edge_tombstones (project_id, source, target, relation) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING;").format(schema=schema_id),
                     (project_id, ekey[0], ekey[1], ekey[2]),
                 )
                 edges_tombstoned += 1
@@ -2895,7 +3136,7 @@ class PostgresSchemaGraphStore(GraphStore):
             cur.execute(psql.SQL("DELETE FROM {schema}.hyperedge_upserts WHERE project_id = %s AND id = %s;").format(schema=schema_id), (project_id, htid))
             cur.execute(psql.SQL("INSERT INTO {schema}.hyperedge_tombstones (project_id, id) VALUES (%s, %s) ON CONFLICT DO NOTHING;").format(schema=schema_id), (project_id, htid))
 
-        for h in delta.hyperedges:
+        for h in _dedup_hyperedges(delta.hyperedges):
             cur.execute(psql.SQL("DELETE FROM {schema}.hyperedge_tombstones WHERE project_id = %s AND id = %s;").format(schema=schema_id), (project_id, h.id))
             nodes_list = h.nodes if isinstance(h.nodes, list) else json.loads(h.nodes)
             cur.execute(
@@ -3025,7 +3266,7 @@ class PostgresSchemaGraphStore(GraphStore):
                     rd["metadata"] = _parse_edge_metadata(rd.get("metadata"))
                     root_edges[(rd["source"], rd["target"], rd["relation"])] = rd
 
-            delta_file_nodes = [n for n in delta.nodes if n.source_file == fpath]
+            delta_file_nodes = _dedup_nodes([n for n in delta.nodes if n.source_file == fpath])
             delta_node_ids = {n.id for n in delta_file_nodes}
 
             for rid in root_nodes:
@@ -3042,37 +3283,36 @@ class PostgresSchemaGraphStore(GraphStore):
                 meta_json = json.dumps(n.metadata or {})
                 cur.execute(psql.SQL("DELETE FROM {schema}.node_tombstones WHERE project_id = %s AND id = %s;").format(schema=schema_id), (project_id, n.id))
 
-                if n.id not in root_nodes:
-                    cur.execute(
-                        psql.SQL("""
-                        INSERT INTO {schema}.node_upserts
-                        (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW());
-                        """).format(schema=schema_id),
-                        (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
-                    )
-                    nodes_upserted += 1
-                else:
+                should_upsert = n.id not in root_nodes
+                if not should_upsert:
                     r = root_nodes[n.id]
-                    differs = (
+                    should_upsert = (
                         r["label"] != n.label
                         or r["file_type"] != n.file_type
                         or (r["source_location"] or None) != (n.source_location or None)
                         or r["community"] != n.community
                         or r["metadata"] != (n.metadata or {})
                     )
-                    if differs:
-                        cur.execute(
-                            psql.SQL("""
-                            INSERT INTO {schema}.node_upserts
-                            (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW());
-                            """).format(schema=schema_id),
-                            (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
-                        )
-                        nodes_upserted += 1
+                if should_upsert:
+                    cur.execute(
+                        psql.SQL("""
+                        INSERT INTO {schema}.node_upserts
+                        (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (project_id, id) DO UPDATE SET
+                            label = EXCLUDED.label,
+                            file_type = EXCLUDED.file_type,
+                            source_file = EXCLUDED.source_file,
+                            source_location = EXCLUDED.source_location,
+                            community = EXCLUDED.community,
+                            metadata = EXCLUDED.metadata,
+                            updated_at = NOW();
+                        """).format(schema=schema_id),
+                        (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
+                    )
+                    nodes_upserted += 1
 
-            delta_file_edges = [e for e in delta.edges if e.source_file == fpath]
+            delta_file_edges = _dedup_edges([e for e in delta.edges if e.source_file == fpath])
             delta_edge_keys = {(e.source, e.target, e.relation) for e in delta_file_edges}
 
             for ekey in root_edges:
@@ -3096,35 +3336,33 @@ class PostgresSchemaGraphStore(GraphStore):
                     psql.SQL("DELETE FROM {schema}.edge_tombstones WHERE project_id = %s AND source = %s AND target = %s AND relation = %s;").format(schema=schema_id),
                     (project_id, e.source, e.target, e.relation),
                 )
-                if ekey not in root_edges:
-                    cur.execute(
-                        psql.SQL("""
-                        INSERT INTO {schema}.edge_upserts
-                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                        """).format(schema=schema_id),
-                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
-                    )
-                    edges_upserted += 1
-                else:
+                should_upsert = ekey not in root_edges
+                if not should_upsert:
                     r = root_edges[ekey]
-                    differs = (
+                    should_upsert = (
                         r["confidence"] != e.confidence
                         or abs(r["confidence_score"] - e.confidence_score) > 1e-4
                         or (r["source_location"] or None) != (e.source_location or None)
                         or abs(r["weight"] - e.weight) > 1e-4
                         or _parse_edge_metadata(r.get("metadata")) != edge_meta_dict
                     )
-                    if differs:
-                        cur.execute(
-                            psql.SQL("""
-                            INSERT INTO {schema}.edge_upserts
-                            (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                            """).format(schema=schema_id),
-                            (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
-                        )
-                        edges_upserted += 1
+                if should_upsert:
+                    cur.execute(
+                        psql.SQL("""
+                        INSERT INTO {schema}.edge_upserts
+                        (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
+                            confidence = EXCLUDED.confidence,
+                            confidence_score = EXCLUDED.confidence_score,
+                            source_file = EXCLUDED.source_file,
+                            source_location = EXCLUDED.source_location,
+                            weight = EXCLUDED.weight,
+                            metadata = EXCLUDED.metadata;
+                        """).format(schema=schema_id),
+                        (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
+                    )
+                    edges_upserted += 1
 
             cur.execute(
                 psql.SQL("""
@@ -3155,7 +3393,7 @@ class PostgresSchemaGraphStore(GraphStore):
             cur.execute(psql.SQL("DELETE FROM {schema}.hyperedge_upserts WHERE project_id = %s AND id = %s;").format(schema=schema_id), (project_id, htid))
             cur.execute(psql.SQL("INSERT INTO {schema}.hyperedge_tombstones (project_id, id) VALUES (%s, %s) ON CONFLICT DO NOTHING;").format(schema=schema_id), (project_id, htid))
 
-        for h in delta.hyperedges:
+        for h in _dedup_hyperedges(delta.hyperedges):
             cur.execute(psql.SQL("DELETE FROM {schema}.hyperedge_tombstones WHERE project_id = %s AND id = %s;").format(schema=schema_id), (project_id, h.id))
             nodes_list = h.nodes if isinstance(h.nodes, list) else json.loads(h.nodes)
             cur.execute(
@@ -3186,7 +3424,7 @@ class PostgresSchemaGraphStore(GraphStore):
         }
 
     def _get_branch_overlay(self, project_id: str, branch_name: str) -> Dict[str, Any]:
-        schema_name = sanitize_branch_schema_name(project_id, branch_name)
+        schema_name = self._branch_schema_name(project_id, branch_name)
         schema_id = psql.Identifier(schema_name)
         conn = self.get_conn()
 
@@ -3660,7 +3898,7 @@ class PostgresSchemaGraphStore(GraphStore):
                 cur.execute("SELECT * FROM pb_root.hyperedges WHERE project_id = %s", (project_id,))
                 hyperedges_rows = cur.fetchall()
             else:
-                schema_name = sanitize_branch_schema_name(project_id, branch_name)
+                schema_name = self._branch_schema_name(project_id, branch_name)
                 schema_id = psql.Identifier(schema_name)
                 try:
                     if files:
@@ -3740,7 +3978,7 @@ class PostgresSchemaGraphStore(GraphStore):
     def delete_branch(self, project_id: str, branch_name: str) -> bool:
         if self.is_root_branch(branch_name):
             return False
-        schema_name = sanitize_branch_schema_name(project_id, branch_name)
+        schema_name = self._branch_schema_name(project_id, branch_name)
         schema_id = psql.Identifier(schema_name)
         conn = self.get_conn()
         with conn.cursor() as cur:
@@ -3775,8 +4013,391 @@ class PostgresSchemaGraphStore(GraphStore):
         kinds: Optional[str] = None,
         limit: int = 500,
     ) -> Dict[str, Any]:
-        subgraph = self.get_resolved_subgraph(project_id, branch_name, limit=limit * 2)
+        subgraph = self._resolve_subgraph_for_visjs(
+            project_id, branch_name=branch_name, query=query, kinds=kinds, limit=limit
+        )
         return self._format_legacy_visjs(subgraph, query=query, kinds=kinds, limit=limit)
+
+
+# =====================================================================
+# 3-Tier Multi-Project GraphStore Router (1 DB per Project + 1 Schema per Branch)
+# =====================================================================
+
+
+class MultiProjectGraphStore(GraphStore):
+    """Routes each project_id to its dedicated physical Project DB via tenant_manager.
+
+    - PostgreSQL: dedicated DB `pb_proj_*` with `pb_root` and `pb_br_*` schemas.
+    - SQLite: dedicated file `<master_dir>/pb_projects/pb_proj_*/graph.sqlite`.
+    Keeps `master_projects` and `master_branches` in Master DB synchronized.
+    """
+
+    def __init__(
+        self,
+        master_db_path: Optional[str] = None,
+        connection_url: Optional[str] = None,
+        root_branch: str = "main",
+    ):
+        super().__init__(root_branch=root_branch, project_scoped_schemas=True)
+        self.master_db_path = master_db_path
+        self.connection_url = connection_url
+        self._stores: Dict[str, GraphStore] = {}
+        self._store_targets: Dict[str, Tuple[bool, str, str]] = {}
+        self._lock = threading.RLock()
+
+    def _ensure_master_binding(self) -> None:
+        from ..core.db import db as core_db
+        from ..core.tenant_manager import tenant_manager
+
+        if getattr(core_db, "conn", None) is None:
+            core_db.connect()
+        tenant_manager.bind_master_db(core_db)
+        tenant_manager.ensure_master_catalog()
+
+    def _normalize_project_id(self, project_id: str) -> str:
+        from ..core.tenant_manager import parse_tenant_from_user_id
+
+        return parse_tenant_from_user_id(project_id, default_branch=self.root_branch)[0]
+
+    def _get_project_store(self, project_id: str) -> Tuple[GraphStore, Dict[str, Any]]:
+        from ..core.tenant_manager import tenant_manager
+
+        with self._lock:
+            self._ensure_master_binding()
+            proj = self._normalize_project_id(project_id)
+            target = tenant_manager.get_project_graph_target(proj)
+            target_key = (
+                bool(target["is_postgres"]),
+                str(target.get("dsn") or target.get("sqlite_path") or ":memory:"),
+                str(target["db_name"]),
+            )
+            cached = self._stores.get(proj)
+            if cached is not None and self._store_targets.get(proj) == target_key:
+                return cached, target
+            if cached is not None:
+                try:
+                    cached.close()
+                except Exception:
+                    pass
+            if target["is_postgres"]:
+                delegate: GraphStore = PostgresSchemaGraphStore(
+                    connection_url=target["dsn"],
+                    root_branch=self.root_branch,
+                    project_scoped_schemas=True,
+                )
+            else:
+                delegate = SqliteOverlayGraphStore(
+                    db_path=target["sqlite_path"] or ":memory:",
+                    root_branch=self.root_branch,
+                    project_scoped_schemas=True,
+                )
+            self._stores[proj] = delegate
+            self._store_targets[proj] = target_key
+            return delegate, target
+
+    def close(self) -> None:
+        with self._lock:
+            for st in list(self._stores.values()):
+                try:
+                    st.close()
+                except Exception:
+                    pass
+            self._stores.clear()
+            self._store_targets.clear()
+
+    def ensure_root_schema(self) -> None:
+        with self._lock:
+            self._ensure_master_binding()
+            for st in list(self._stores.values()):
+                st.ensure_root_schema()
+
+    def get_branch_lineage(
+        self, project_id: str, branch_name: str, max_depth: int = 8
+    ) -> List[str]:
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        return delegate.get_branch_lineage(proj, branch_name, max_depth=max_depth)
+
+    def ensure_branch_schema(
+        self,
+        project_id: str,
+        branch_name: str,
+        author: str = "system",
+        base_branch: Optional[str] = None,
+    ) -> str:
+        from ..core.tenant_manager import tenant_manager
+
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        if self.is_root_branch(branch_name):
+            delegate.ensure_root_schema()
+            info = tenant_manager.ensure_branch_schema(
+                proj,
+                self.root_branch,
+                base_branch=self.root_branch,
+                author=author or "system",
+                has_graph=True,
+                record_lineage=False,
+            )
+            return str(info["schema_name"])
+
+        schema_name = delegate.ensure_branch_schema(
+            proj, branch_name, author=author, base_branch=base_branch
+        )
+        has_explicit_base = bool(
+            base_branch and base_branch.strip() and base_branch.strip() != branch_name.strip()
+        )
+        tenant_manager.ensure_branch_schema(
+            proj,
+            branch_name,
+            base_branch=base_branch or self.root_branch,
+            author=author or "system",
+            has_graph=True,
+            record_lineage=has_explicit_base,
+            preserve_existing_base=not has_explicit_base,
+        )
+        return schema_name
+
+    def sync_branch_delta(
+        self,
+        project_id: str,
+        branch_name: str,
+        delta: GraphDelta,
+        partial: bool = False,
+        synced_files: Optional[List[str]] = None,
+        deleted_files: Optional[List[str]] = None,
+        author: str = "system",
+        base_branch: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from ..core.tenant_manager import tenant_manager
+
+        proj = self._normalize_project_id(project_id)
+        delegate, target = self._get_project_store(proj)
+        res = delegate.sync_branch_delta(
+            proj,
+            branch_name,
+            delta,
+            partial=partial,
+            synced_files=synced_files,
+            deleted_files=deleted_files,
+            author=author,
+            base_branch=base_branch,
+        )
+        has_explicit_base = bool(
+            base_branch and base_branch.strip() and base_branch.strip() != branch_name.strip()
+        )
+        branch_info = tenant_manager.ensure_branch_schema(
+            proj,
+            branch_name,
+            base_branch=base_branch or self.root_branch,
+            author=author or "system",
+            has_graph=True,
+            record_lineage=has_explicit_base,
+            preserve_existing_base=not has_explicit_base,
+        )
+        res["db_name"] = target["db_name"]
+        if self.is_root_branch(branch_name):
+            res["schema_name"] = branch_info["schema_name"]
+        else:
+            res.setdefault("schema_name", branch_info["schema_name"])
+        return res
+
+    sync_delta = sync_branch_delta
+
+    def diff_branch_vs_root(
+        self,
+        project_id: str,
+        branch_name: str,
+        file_filter: Optional[str] = None,
+        community: Optional[int] = None,
+    ) -> BranchDiffResult:
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        return delegate.diff_branch_vs_root(
+            proj, branch_name, file_filter=file_filter, community=community
+        )
+
+    def diff_branches(
+        self,
+        project_id: str,
+        base_branch: str,
+        target_branch: str,
+        file_filter: Optional[str] = None,
+        community: Optional[int] = None,
+    ) -> BranchDiffResult:
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        return delegate.diff_branches(
+            proj, base_branch, target_branch, file_filter=file_filter, community=community
+        )
+
+    def promote_branch_to_root(
+        self,
+        project_id: str,
+        branch_name: str,
+        target_branch: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from ..core.tenant_manager import tenant_manager
+
+        proj = self._normalize_project_id(project_id)
+        delegate, target = self._get_project_store(proj)
+        res = delegate.promote_branch_to_root(
+            proj, branch_name, target_branch=target_branch
+        )
+        if res.get("status") == "promoted" and not self.is_root_branch(branch_name):
+            effective_target = str(res.get("target_branch") or self.root_branch)
+            tenant_manager.ensure_branch_schema(
+                proj,
+                effective_target,
+                base_branch=self.root_branch,
+                has_graph=True,
+                record_lineage=False,
+                preserve_existing_base=True,
+            )
+            now_ms = int(time.time() * 1000)
+            tenant_manager._master_execute(
+                "UPDATE master_branches SET base_branch = ?, updated_at = ? "
+                "WHERE project_id = ? AND base_branch = ? AND branch_name != ?",
+                (effective_target, now_ms, proj, branch_name, effective_target),
+            )
+            try:
+                tenant_manager.drop_branch_schema(proj, branch_name)
+            except Exception as exc:
+                logger.debug("Master branch drop warning on promote %s:%s (%s)", proj, branch_name, exc)
+        res["db_name"] = target["db_name"]
+        return res
+
+    def get_resolved_subgraph(
+        self,
+        project_id: str,
+        branch_name: str,
+        files: Optional[List[str]] = None,
+        limit: int = 1000,
+    ) -> Dict[str, Any]:
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        return delegate.get_resolved_subgraph(proj, branch_name, files=files, limit=limit)
+
+    def get_stats(self, project_id: str, branch_name: str = "main") -> Dict[str, Any]:
+        proj = self._normalize_project_id(project_id)
+        delegate, target = self._get_project_store(proj)
+        stats = delegate.get_stats(proj, branch_name)
+        stats["db_name"] = target["db_name"]
+        return stats
+
+    def list_projects(self) -> List[str]:
+        from ..core.tenant_manager import tenant_manager
+
+        with self._lock:
+            self._ensure_master_binding()
+            rows = tenant_manager._master_fetchall(
+                "SELECT project_id FROM master_projects WHERE status = 'active' ORDER BY project_id ASC"
+            )
+            projs = {str(r["project_id"]) for r in rows if r.get("project_id")}
+            projs |= set(self._stores.keys())
+            return sorted(projs)
+
+    def delete_project(self, project_id: str) -> bool:
+        from ..core.tenant_manager import tenant_manager
+
+        proj = self._normalize_project_id(project_id)
+        with self._lock:
+            self._ensure_master_binding()
+            cached = self._stores.pop(proj, None)
+            self._store_targets.pop(proj, None)
+            if cached is not None:
+                try:
+                    cached.delete_project(proj)
+                finally:
+                    cached.close()
+        tenant_manager.drop_project_database(proj)
+        return True
+
+    def delete_branch(self, project_id: str, branch_name: str) -> bool:
+        from ..core.tenant_manager import tenant_manager
+
+        if self.is_root_branch(branch_name):
+            return False
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        ok = delegate.delete_branch(proj, branch_name)
+        try:
+            tenant_manager.drop_branch_schema(proj, branch_name)
+        except Exception as exc:
+            logger.debug("Master branch drop warning on delete %s:%s (%s)", proj, branch_name, exc)
+        return ok
+
+    def list_branches(self, project_id: str) -> List[Dict[str, Any]]:
+        from ..core.tenant_manager import tenant_manager
+
+        proj = self._normalize_project_id(project_id)
+        delegate, target = self._get_project_store(proj)
+        branches = delegate.list_branches(proj)
+        mb_rows = tenant_manager._master_fetchall(
+            "SELECT * FROM master_branches WHERE project_id = ? ORDER BY is_root DESC, created_at ASC",
+            (proj,),
+        )
+        mb_map = {str(r["branch_name"]): r for r in mb_rows if r.get("branch_name")}
+        seen: Set[str] = set()
+        for b in branches:
+            bname = str(b.get("branch_name") or "")
+            seen.add(bname)
+            b["db_name"] = target["db_name"]
+            if bname in mb_map:
+                mb = mb_map[bname]
+                b.setdefault("base_branch", mb.get("base_branch"))
+                b["has_graph_schema"] = bool(mb.get("has_graph_schema", 1))
+                b["has_doc_schema"] = bool(mb.get("has_doc_schema", 1))
+                if b.get("is_root"):
+                    b["schema_name"] = mb.get("schema_name") or "pb_root"
+        for bname, mb in mb_map.items():
+            if bname not in seen:
+                branches.append(
+                    {
+                        "branch_name": bname,
+                        "schema_name": mb.get("schema_name"),
+                        "base_branch": mb.get("base_branch"),
+                        "author": mb.get("author") or "system",
+                        "is_root": bool(mb.get("is_root")),
+                        "has_graph_schema": bool(mb.get("has_graph_schema", 1)),
+                        "has_doc_schema": bool(mb.get("has_doc_schema", 1)),
+                        "db_name": target["db_name"],
+                    }
+                )
+        return branches
+
+    def to_legacy_visjs(
+        self,
+        project_id: str,
+        branch_name: str = "main",
+        query: Optional[str] = None,
+        kinds: Optional[str] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        return delegate.to_legacy_visjs(
+            proj, branch_name=branch_name, query=query, kinds=kinds, limit=limit
+        )
+
+    def _get_branch_overlay(self, project_id: str, branch_name: str) -> Dict[str, Any]:
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        return delegate._get_branch_overlay(proj, branch_name)
+
+    def _get_root_nodes_by_ids(
+        self, project_id: str, node_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        return delegate._get_root_nodes_by_ids(proj, node_ids)
+
+    def _get_root_edges_by_keys(
+        self, project_id: str, edge_keys: List[Tuple[str, str, str]]
+    ) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+        proj = self._normalize_project_id(project_id)
+        delegate, _ = self._get_project_store(proj)
+        return delegate._get_root_edges_by_keys(proj, edge_keys)
 
 
 # =====================================================================
@@ -3796,6 +4417,46 @@ def _map_graph_backend_to_plugin_id(backend_name: str) -> str:
     return aliases.get(norm, backend_name.strip())
 
 
+def _is_explicit_standalone_graph_override(
+    caller_db_path: Optional[str],
+    caller_connection_url: Optional[str],
+    backend_val: str,
+) -> bool:
+    """Return True if caller passed an explicit standalone path/URL/backend distinct from Master DB."""
+    from ..core.tenant_manager import resolve_effective_master_url
+
+    master_url = resolve_effective_master_url() or ""
+    master_is_pg = master_url.startswith(("postgresql://", "postgres://"))
+
+    if caller_connection_url is not None:
+        if not master_is_pg or caller_connection_url != master_url:
+            return True
+
+    if backend_val in ("postgres", "postgresql") and not master_is_pg:
+        return True
+    if backend_val in ("sqlite", "sqlite_overlay") and master_is_pg:
+        return True
+
+    if caller_db_path is not None:
+        raw_caller = str(caller_db_path).strip()
+        if raw_caller == ":memory:" or raw_caller.startswith("file::memory:"):
+            return True
+        known_master_paths: Set[str] = set()
+        if master_url.startswith("sqlite:///"):
+            raw_m = master_url[len("sqlite:///"):]
+            if raw_m and raw_m != ":memory:" and not raw_m.startswith("file::memory:"):
+                known_master_paths.add(str(Path(raw_m).expanduser().resolve()))
+        for env_key in ("PB_DB_PATH", "OM_DB_PATH"):
+            ev = os.getenv(env_key)
+            if ev and ev != ":memory:" and not ev.startswith("file::memory:"):
+                known_master_paths.add(str(Path(ev).expanduser().resolve()))
+        req_resolved = str(Path(raw_caller).expanduser().resolve())
+        if known_master_paths and req_resolved not in known_master_paths:
+            return True
+
+    return False
+
+
 def get_graph_store(
     db_path: Optional[str] = None,
     backend: Optional[str] = None,
@@ -3805,6 +4466,8 @@ def get_graph_store(
     registry: Optional[Any] = None,
 ) -> GraphStore:
     """Factory creating configured GraphStore instance based on environment, PluginRegistry, or parameters."""
+    from ..core.tenant_manager import is_multi_db_enabled
+
     caller_root_branch = root_branch
     if root_branch is None:
         resolved_root = os.getenv("PB_ROOT_BRANCH") or os.getenv("OM_ROOT_BRANCH")
@@ -3817,6 +4480,7 @@ def get_graph_store(
         root_branch = resolved_root or "main"
 
     caller_db_path = db_path
+    caller_connection_url = connection_url
     if not db_path:
         db_path = os.getenv("OM_DB_PATH") or os.getenv("PB_DB_PATH") or None
 
@@ -3835,6 +4499,11 @@ def get_graph_store(
                 backend_val = (getattr(env, "db_backend", None) or "sqlite").lower()
             except Exception:
                 backend_val = "sqlite"
+
+    multi_db_active = is_multi_db_enabled()
+    standalone_override = _is_explicit_standalone_graph_override(
+        caller_db_path, caller_connection_url, backend_val
+    )
 
     import sys
 
@@ -3888,31 +4557,43 @@ def get_graph_store(
                         f"Requested graph_backend plugin '{preferred_id}' is not enabled or registered"
                     )
 
-            store_cfg: Dict[str, Any] = {}
-            if hasattr(active_reg, "get_effective_config"):
-                store_cfg.update(
-                    active_reg.get_effective_config(
-                        plugin.metadata.plugin_id,
-                        project_id=project_id,
+            is_non_default_plugin = plugin.metadata.plugin_id not in (
+                "graph.sqlite_overlay",
+                "graph.postgres_schema",
+            )
+            if is_non_default_plugin or not multi_db_active or standalone_override:
+                store_cfg: Dict[str, Any] = {}
+                if hasattr(active_reg, "get_effective_config"):
+                    store_cfg.update(
+                        active_reg.get_effective_config(
+                            plugin.metadata.plugin_id,
+                            project_id=project_id,
+                        )
                     )
-                )
-            if caller_db_path is not None:
-                store_cfg["db_path"] = caller_db_path
-            elif "db_path" not in store_cfg and db_path is not None:
-                store_cfg["db_path"] = db_path
-            if connection_url is not None:
-                store_cfg["connection_url"] = connection_url
-            if caller_root_branch is not None:
-                store_cfg["root_branch"] = caller_root_branch
-            else:
-                store_cfg.setdefault("root_branch", root_branch)
+                if caller_db_path is not None:
+                    store_cfg["db_path"] = caller_db_path
+                elif "db_path" not in store_cfg and db_path is not None:
+                    store_cfg["db_path"] = db_path
+                if connection_url is not None:
+                    store_cfg["connection_url"] = connection_url
+                if caller_root_branch is not None:
+                    store_cfg["root_branch"] = caller_root_branch
+                else:
+                    store_cfg.setdefault("root_branch", root_branch)
 
-            return plugin.create_store(store_cfg)
+                return plugin.create_store(store_cfg)
         except LookupError:
             if explicit_backend and explicit_backend.lower() not in ("sqlite", "postgres", "postgresql"):
                 raise
         except ImportError:
             pass
+
+    if multi_db_active and not standalone_override:
+        return MultiProjectGraphStore(
+            master_db_path=caller_db_path or db_path,
+            connection_url=caller_connection_url,
+            root_branch=root_branch,
+        )
 
     if backend_val in ("postgres", "postgresql"):
         return PostgresSchemaGraphStore(

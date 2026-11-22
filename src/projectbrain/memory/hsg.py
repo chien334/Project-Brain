@@ -13,6 +13,13 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 from ..core.db import q, db, transaction
 from ..core.config import env
 from ..core.constants import SECTOR_CONFIGS
+from ..core.tenant_manager import (
+    _effective_root_branch,
+    get_current_tenant,
+    parse_tenant_from_user_id,
+    tenant_context,
+    tenant_manager,
+)
 from ..core.vector_store import vector_store as store
 from ..utils.text import canonical_token_set, canonical_tokens_from_text, stable_text_fallback_hash
 from ..utils.chunking import chunk_text
@@ -291,26 +298,35 @@ async def create_cross_sector_waypoints(prim_id: str, prim_sec: str, add_secs: L
 async def create_inter_mem_waypoints(new_id: str, prim_sec: str, new_vec: List[float], ts: int, user_id: Optional[str] = None):
     thresh = 0.75
     wt = 0.5
-    vecs = await store.getVectorsBySector(prim_sec)
+    active_t = get_current_tenant()
+    if active_t is None and user_id:
+        p_id, br_name = parse_tenant_from_user_id(user_id, default_branch=_effective_root_branch())
+        ctx = tenant_context(p_id, br_name)
+    else:
+        from contextlib import nullcontext
+        ctx = nullcontext()
 
-    nm = np.array(new_vec, dtype=np.float32)
+    with ctx:
+        vecs = await store.getVectorsBySector(prim_sec)
 
-    for vr in vecs:
-        vr_id = vr["id"] if isinstance(vr, dict) else vr.id
-        if vr_id == new_id: continue
-        vr_vec = vr["vector"] if isinstance(vr, dict) else vr.vector
-        ex_vec = np.array(vr_vec, dtype=np.float32)
-        if ex_vec.shape != nm.shape:
-            continue
-        sim = cos_sim(nm, ex_vec)
+        nm = np.array(new_vec, dtype=np.float32)
 
-        if sim >= thresh:
-            uid = user_id or "anonymous"
-            db.execute("INSERT OR REPLACE INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?)",
-                       (new_id, vr_id, uid, wt, ts, ts))
-            db.execute("INSERT OR REPLACE INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?)",
-                       (vr_id, new_id, uid, wt, ts, ts))
-    db.commit()
+        for vr in vecs:
+            vr_id = vr["id"] if isinstance(vr, dict) else vr.id
+            if vr_id == new_id: continue
+            vr_vec = vr["vector"] if isinstance(vr, dict) else vr.vector
+            ex_vec = np.array(vr_vec, dtype=np.float32)
+            if ex_vec.shape != nm.shape:
+                continue
+            sim = cos_sim(nm, ex_vec)
+
+            if sim >= thresh:
+                uid = user_id or "anonymous"
+                db.execute("INSERT OR REPLACE INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+                           (new_id, vr_id, uid, wt, ts, ts))
+                db.execute("INSERT OR REPLACE INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+                           (vr_id, new_id, uid, wt, ts, ts))
+        db.commit()
 
 async def create_contextual_waypoints(mem_id: str, rel_ids: List[str], base_wt: float = 0.3, user_id: Optional[str] = None):
     now = int(time.time() * 1000)
@@ -395,47 +411,55 @@ async def delete_branch_target_memories(project_id: str, branch: str, target_typ
     if not norm_key:
         return 0
 
-    rows = db.fetchall("SELECT id, meta FROM memories WHERE user_id=?", (uid,))
-    deleted = 0
-    for row in rows:
-        raw_meta = row.get("meta")
-        if isinstance(raw_meta, str):
-            try:
-                meta = json.loads(raw_meta)
-            except Exception:
+    eff_root = _effective_root_branch()
+    with tenant_context(project_id, branch):
+        if branch in ("main", eff_root):
+            rows = db.fetchall(
+                "SELECT id, meta FROM memories WHERE user_id IN (?, ?)",
+                (uid, project_id),
+            )
+        else:
+            rows = db.fetchall("SELECT id, meta FROM memories WHERE user_id=?", (uid,))
+        deleted = 0
+        for row in rows:
+            raw_meta = row.get("meta")
+            if isinstance(raw_meta, str):
+                try:
+                    meta = json.loads(raw_meta)
+                except Exception:
+                    meta = {}
+            elif isinstance(raw_meta, dict):
+                meta = raw_meta
+            else:
                 meta = {}
-        elif isinstance(raw_meta, dict):
-            meta = raw_meta
-        else:
-            meta = {}
-        if not isinstance(meta, dict):
-            continue
+            if not isinstance(meta, dict):
+                continue
 
-        matched = False
-        if target_type == "file":
-            for field in ("file_path", "filename"):
-                val = meta.get(field)
-                if val and _normalize_overlay_key("file", str(val)) == norm_key:
-                    matched = True
-                    break
-        elif target_type == "doc":
-            for field in ("doc_key", "filename"):
-                val = meta.get(field)
-                if val and _normalize_overlay_key("doc", str(val)) == norm_key:
-                    matched = True
-                    break
-        else:
-            for field in (target_type, "filename"):
-                val = meta.get(field)
-                if val and _normalize_overlay_key(target_type, str(val)) == norm_key:
-                    matched = True
-                    break
+            matched = False
+            if target_type == "file":
+                for field in ("file_path", "filename"):
+                    val = meta.get(field)
+                    if val and _normalize_overlay_key("file", str(val)) == norm_key:
+                        matched = True
+                        break
+            elif target_type == "doc":
+                for field in ("doc_key", "filename"):
+                    val = meta.get(field)
+                    if val and _normalize_overlay_key("doc", str(val)) == norm_key:
+                        matched = True
+                        break
+            else:
+                for field in (target_type, "filename"):
+                    val = meta.get(field)
+                    if val and _normalize_overlay_key(target_type, str(val)) == norm_key:
+                        matched = True
+                        break
 
-        if matched:
-            mid = row["id"]
-            await store.deleteVectors(mid)
-            q.del_mem(mid)
-            deleted += 1
+            if matched:
+                mid = row["id"]
+                await store.deleteVectors(mid)
+                q.del_mem(mid)
+                deleted += 1
 
     invalidate_query_cache()
     return deleted
@@ -443,96 +467,102 @@ async def delete_branch_target_memories(project_id: str, branch: str, target_typ
 
 async def add_hsg_memory(content: str, tags: Optional[str] = None, metadata: Any = None, user_id: Optional[str] = None) -> Dict[str, Any]:
     uid = user_id or "anonymous"
-    simhash = compute_simhash(content)
-    existing = db.fetchone("SELECT * FROM memories WHERE simhash=? AND user_id=? ORDER BY salience DESC LIMIT 1", (simhash, uid))
+    eff_root = _effective_root_branch()
+    active_tenant = get_current_tenant()
+    if active_tenant is not None and ":" not in uid and uid in (active_tenant[0], "anonymous", "default"):
+        proj, br = active_tenant
+    else:
+        proj, br = parse_tenant_from_user_id(uid, default_branch=eff_root)
 
-    if existing and hamming_dist(simhash, existing["simhash"]) <= 3:
-        now = int(time.time()*1000)
-        boost = min(1.0, (existing["salience"] or 0) + 0.15)
-        db.execute("UPDATE memories SET last_seen_at=?, salience=?, updated_at=? WHERE id=?", (now, boost, now, existing["id"]))
-        db.commit()
-        _maybe_record_overlay_tombstone(user_id, metadata)
-        invalidate_query_cache()
-        return {
-            "id": existing["id"],
-            "primary_sector": existing["primary_sector"],
-            "sectors": [existing["primary_sector"]],
-            "deduplicated": True
-        }
+    with tenant_context(proj, br):
+        simhash = compute_simhash(content)
+        existing = db.fetchone("SELECT * FROM memories WHERE simhash=? AND user_id=? ORDER BY salience DESC LIMIT 1", (simhash, uid))
 
-    mid = str(uuid.uuid4())
-    now = int(time.time()*1000)
-    if user_id:
-        u = db.fetchone("SELECT * FROM users WHERE user_id=?", (user_id,))
-        if not u:
-            db.execute("INSERT OR IGNORE INTO users(user_id,summary,reflection_count,created_at,updated_at) VALUES (?,?,?,?,?)",
-                       (user_id, "User profile initializing...", 0, now, now))
+        if existing and hamming_dist(simhash, existing["simhash"]) <= 3:
+            now = int(time.time()*1000)
+            boost = min(1.0, (existing["salience"] or 0) + 0.15)
+            db.execute("UPDATE memories SET last_seen_at=?, salience=?, updated_at=? WHERE id=?", (now, boost, now, existing["id"]))
             db.commit()
+            _maybe_record_overlay_tombstone(user_id, metadata)
+            invalidate_query_cache()
+            return {
+                "id": existing["id"],
+                "primary_sector": existing["primary_sector"],
+                "sectors": [existing["primary_sector"]],
+                "deduplicated": True
+            }
 
-    chunks = chunk_text(content)
-    use_chunks = len(chunks) > 1
-    cls = classify_content(content, metadata)
-    all_secs = [cls["primary"]] + cls["additional"]
-    try:
-        max_seg_res = db.fetchone("SELECT coalesce(max(segment), 0) as max_seg FROM memories")
-
-        max_seg_res = db.fetchone("SELECT coalesce(max(segment), 0) as max_seg FROM memories")
-        cur_seg = max_seg_res["max_seg"]
-        cnt_res = db.fetchone("SELECT count(*) as c FROM memories WHERE segment=?", (cur_seg,))
-        if cnt_res["c"] >= env.seg_size:
-            cur_seg += 1
-            print(f"[HSG] Rotated to segment {cur_seg}")
-
-        stored = extract_essence(content, cls["primary"], env.summary_max_length)
-        sec_cfg = SECTOR_CONFIGS[cls["primary"]]
-        init_sal = max(0.0, min(1.0, 0.4 + 0.1 * len(cls["additional"])))
-        q.ins_mem(
-            id=mid,
-            user_id=user_id or "anonymous",
-            segment=cur_seg,
-            content=stored,
-            simhash=simhash,
-            primary_sector=cls["primary"],
-            tags=tags,
-            meta=json.dumps(metadata or {}),
-            created_at=now,
-            updated_at=now,
-            last_seen_at=now,
-            salience=init_sal,
-            decay_lambda=sec_cfg["decay_lambda"],
-            version=1,
-            mean_dim=None,
-            mean_vec=None,
-            compressed_vec=None,
-            feedback_score=0
-        )
-        emb_res = await embed_multi_sector(mid, content, all_secs, chunks if use_chunks else None)
-        for r in emb_res:
-             await store.storeVector(mid, r["sector"], r["vector"], r["dim"], user_id or "anonymous")
-
-        mean_vec = calc_mean_vec(emb_res, all_secs)
-        mean_buf = vec_to_buf(mean_vec)
-        db.execute("UPDATE memories SET mean_dim=?, mean_vec=? WHERE id=?", (len(mean_vec), mean_buf, mid))
-
-        if len(mean_vec) > 128:
-            comp = compress_vec_for_storage(mean_vec, 128)
-            db.execute("UPDATE memories SET compressed_vec=? WHERE id=?", (vec_to_buf(comp), mid))
-
-        await create_single_waypoint(mid, mean_vec, now, user_id)
+        mid = str(uuid.uuid4())
+        now = int(time.time()*1000)
         if user_id:
-            await update_user_summary(user_id)
-        _maybe_record_overlay_tombstone(user_id, metadata)
-        invalidate_query_cache()
-        return {
-            "id": mid,
-            "content": content,
-            "primary_sector": cls["primary"],
-            "sectors": all_secs,
-            "chunks": len(chunks),
-            "salience": init_sal
-        }
-    except Exception as e:
-        raise e
+            u = db.fetchone("SELECT * FROM users WHERE user_id=?", (user_id,))
+            if not u:
+                db.execute("INSERT OR IGNORE INTO users(user_id,summary,reflection_count,created_at,updated_at) VALUES (?,?,?,?,?)",
+                           (user_id, "User profile initializing...", 0, now, now))
+                db.commit()
+
+        chunks = chunk_text(content)
+        use_chunks = len(chunks) > 1
+        cls = classify_content(content, metadata)
+        all_secs = [cls["primary"]] + cls["additional"]
+        try:
+            max_seg_res = db.fetchone("SELECT coalesce(max(segment), 0) as max_seg FROM memories")
+            cur_seg = max_seg_res["max_seg"]
+            cnt_res = db.fetchone("SELECT count(*) as c FROM memories WHERE segment=?", (cur_seg,))
+            if cnt_res["c"] >= env.seg_size:
+                cur_seg += 1
+                print(f"[HSG] Rotated to segment {cur_seg}")
+
+            stored = extract_essence(content, cls["primary"], env.summary_max_length)
+            sec_cfg = SECTOR_CONFIGS[cls["primary"]]
+            init_sal = max(0.0, min(1.0, 0.4 + 0.1 * len(cls["additional"])))
+            q.ins_mem(
+                id=mid,
+                user_id=user_id or "anonymous",
+                segment=cur_seg,
+                content=stored,
+                simhash=simhash,
+                primary_sector=cls["primary"],
+                tags=tags,
+                meta=json.dumps(metadata or {}),
+                created_at=now,
+                updated_at=now,
+                last_seen_at=now,
+                salience=init_sal,
+                decay_lambda=sec_cfg["decay_lambda"],
+                version=1,
+                mean_dim=None,
+                mean_vec=None,
+                compressed_vec=None,
+                feedback_score=0
+            )
+            emb_res = await embed_multi_sector(mid, content, all_secs, chunks if use_chunks else None)
+            for r in emb_res:
+                 await store.storeVector(mid, r["sector"], r["vector"], r["dim"], user_id or "anonymous")
+
+            mean_vec = calc_mean_vec(emb_res, all_secs)
+            mean_buf = vec_to_buf(mean_vec)
+            db.execute("UPDATE memories SET mean_dim=?, mean_vec=? WHERE id=?", (len(mean_vec), mean_buf, mid))
+
+            if len(mean_vec) > 128:
+                comp = compress_vec_for_storage(mean_vec, 128)
+                db.execute("UPDATE memories SET compressed_vec=? WHERE id=?", (vec_to_buf(comp), mid))
+
+            await create_single_waypoint(mid, mean_vec, now, user_id)
+            if user_id:
+                await update_user_summary(user_id)
+            _maybe_record_overlay_tombstone(user_id, metadata)
+            invalidate_query_cache()
+            return {
+                "id": mid,
+                "content": content,
+                "primary_sector": cls["primary"],
+                "sectors": all_secs,
+                "chunks": len(chunks),
+                "salience": init_sal
+            }
+        except Exception as e:
+            raise e
 
 MAX_CACHE_SIZE = 512
 cache: OrderedDict = OrderedDict()
@@ -565,17 +595,25 @@ async def expand_via_waypoints(ids: List[str], max_exp: int = 10):
     return exp
 
 async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    from contextlib import nullcontext
+
     start_q = time.time()
     inc_q()
     try:
         f_dict = f or {}
         inherit_base = bool(f_dict.get("inherit_base", True))
         raw_uid = f_dict.get("user_id")
+        eff_root = _effective_root_branch()
+        active_tenant = get_current_tenant()
 
         lineage_branches: List[str] = []
         lineage_uids: List[str] = []
         uid_depth: Dict[str, int] = {}
+        uid_to_branch: Dict[str, str] = {}
         branch_tombstones: Dict[str, Dict[str, Set[str]]] = {}
+        query_proj: Optional[str] = None
+        single_branch: Optional[str] = None
+        wildcard_branches: List[str] = []
 
         if (
             raw_uid
@@ -585,23 +623,66 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
             and ":" in raw_uid
         ):
             from ..core.db import get_memory_branch_lineage, get_memory_tombstones
-            proj, branch = raw_uid.split(":", 1)
+            proj, branch = parse_tenant_from_user_id(raw_uid, default_branch=eff_root)
+            query_proj = proj
+            single_branch = branch
             lineage_branches = get_memory_branch_lineage(proj, branch)
             if len(lineage_branches) > 1:
                 for idx, b_name in enumerate(lineage_branches):
                     cand_uid = f"{proj}:{b_name}"
                     if cand_uid not in uid_depth:
                         uid_depth[cand_uid] = idx
+                        uid_to_branch[cand_uid] = b_name
                         lineage_uids.append(cand_uid)
                 oldest_idx = len(lineage_branches) - 1
                 root_br = getattr(env, "root_branch", None) or "main"
                 if lineage_branches[-1] == root_br or lineage_branches[-1] == "main":
                     if proj not in uid_depth:
                         uid_depth[proj] = oldest_idx
+                        uid_to_branch[proj] = lineage_branches[-1]
                         lineage_uids.append(proj)
                 branch_tombstones = {
                     b: get_memory_tombstones(proj, b) for b in lineage_branches
                 }
+        elif raw_uid and isinstance(raw_uid, str):
+            if "%" in raw_uid:
+                if ":" in raw_uid:
+                    p_part, b_part = raw_uid.split(":", 1)
+                    p_clean = p_part.strip() or "default"
+                    if "%" not in p_clean:
+                        query_proj = p_clean
+                        reg_branches = tenant_manager.list_project_branches(p_clean)
+                        if reg_branches:
+                            if b_part in ("%", ""):
+                                wildcard_branches = reg_branches
+                            else:
+                                b_rx = re.compile(
+                                    "^"
+                                    + "".join(
+                                        ".*" if c == "%" else "." if c == "_" else re.escape(c)
+                                        for c in b_part
+                                    )
+                                    + "$"
+                                )
+                                matched_br = [
+                                    b
+                                    for b in reg_branches
+                                    if b_rx.match(b) or b_rx.match(f"{p_clean}:{b}")
+                                ]
+                                wildcard_branches = matched_br if matched_br else reg_branches
+            else:
+                if active_tenant is not None and ":" not in raw_uid and raw_uid in (
+                    active_tenant[0],
+                    "anonymous",
+                    "default",
+                ):
+                    query_proj, single_branch = active_tenant
+                else:
+                    query_proj, single_branch = parse_tenant_from_user_id(
+                        raw_uid, default_branch=eff_root
+                    )
+        elif active_tenant is not None:
+            query_proj, single_branch = active_tenant
 
         tomb_sig = (
             [
@@ -617,7 +698,8 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
         )
         cache_key = (
             f"{qt}:{k}:{json.dumps(f_dict, sort_keys=True, default=str)}:"
-            f"{json.dumps(lineage_branches)}:{json.dumps(tomb_sig)}"
+            f"{json.dumps(lineage_branches)}:{json.dumps(tomb_sig)}:"
+            f"{active_tenant if raw_uid is None else ''}"
         )
         if cache_key in cache:
             entry = cache[cache_key]
@@ -656,19 +738,54 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
                 cum_tomb_docs[d] = d_set
 
         sr = {}
+        hit_branch: Dict[str, str] = {}
+        hit_proj: Dict[str, str] = {}
+        hit_best_sim: Dict[str, float] = {}
+
         for s in ss:
             qv = qe[s]
-            if len(lineage_branches) > 1:
+            if len(lineage_branches) > 1 and query_proj:
                 merged_by_id: Dict[str, Dict[str, Any]] = {}
                 for cand_uid in lineage_uids:
-                    cand_res = await store.search(qv, s, k*3, {"user_id": cand_uid})
+                    cand_b = uid_to_branch.get(cand_uid, single_branch or eff_root)
+                    with tenant_context(query_proj, cand_b):
+                        cand_res = await store.search(qv, s, k*3, {"user_id": cand_uid})
                     for r in cand_res:
                         rid = r["id"]
-                        if rid not in merged_by_id or r["similarity"] > merged_by_id[rid]["similarity"]:
+                        sim_val = float(r.get("similarity") or 0.0)
+                        if rid not in merged_by_id or sim_val > merged_by_id[rid]["similarity"]:
                             merged_by_id[rid] = r
+                        if rid not in hit_best_sim or sim_val >= hit_best_sim[rid]:
+                            hit_best_sim[rid] = sim_val
+                            hit_proj[rid] = query_proj
+                            hit_branch[rid] = cand_b
                 sr[s] = list(merged_by_id.values())
+            elif wildcard_branches and query_proj:
+                merged_wc: Dict[str, Dict[str, Any]] = {}
+                for cand_b in wildcard_branches:
+                    with tenant_context(query_proj, cand_b):
+                        cand_res = await store.search(qv, s, k*3, {"user_id": raw_uid})
+                    for r in cand_res:
+                        rid = r["id"]
+                        sim_val = float(r.get("similarity") or 0.0)
+                        if rid not in merged_wc or sim_val > merged_wc[rid]["similarity"]:
+                            merged_wc[rid] = r
+                        if rid not in hit_best_sim or sim_val >= hit_best_sim[rid]:
+                            hit_best_sim[rid] = sim_val
+                            hit_proj[rid] = query_proj
+                            hit_branch[rid] = cand_b
+                sr[s] = list(merged_wc.values())
+            elif query_proj and single_branch:
+                with tenant_context(query_proj, single_branch):
+                    res = await store.search(qv, s, k*3, {"user_id": raw_uid})
+                for r in res:
+                    rid = r["id"]
+                    hit_proj.setdefault(rid, query_proj)
+                    hit_branch.setdefault(rid, single_branch)
+                sr[s] = res
             else:
-                res = await store.search(qv, s, k*3, {"user_id": raw_uid})
+                with tenant_context(None):
+                    res = await store.search(qv, s, k*3, {"user_id": raw_uid})
                 sr[s] = res
 
         all_sims = []
@@ -684,9 +801,27 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
         high_conf = avg_top >= 0.55
 
         exp = []
-        if not high_conf:
-            exp = await expand_via_waypoints(list(ids), k*2)
-            for e in exp: ids.add(e["id"])
+        if not high_conf and ids:
+            grouped_ids: Dict[Optional[Tuple[str, str]], List[str]] = {}
+            for mid in ids:
+                if mid in hit_proj and mid in hit_branch:
+                    key: Optional[Tuple[str, str]] = (hit_proj[mid], hit_branch[mid])
+                elif query_proj and single_branch:
+                    key = (query_proj, single_branch)
+                else:
+                    key = tenant_manager.lookup_memory_hint(mid)
+                grouped_ids.setdefault(key, []).append(mid)
+
+            for t_pair, b_ids in grouped_ids.items():
+                ctx = tenant_context(t_pair[0], t_pair[1]) if t_pair else tenant_context(None)
+                with ctx:
+                    b_exp = await expand_via_waypoints(b_ids, k*2)
+                for e in b_exp:
+                    exp.append(e)
+                    ids.add(e["id"])
+                    if t_pair:
+                        hit_proj.setdefault(e["id"], t_pair[0])
+                        hit_branch.setdefault(e["id"], t_pair[1])
 
         res_list = []
         kw_scores = {}
@@ -694,7 +829,6 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
         if raw_uid and len(lineage_branches) <= 1:
             uid_pattern = raw_uid
             if "%" in uid_pattern:
-                import re
                 regex_pat = "^" + "".join(
                     ".*" if c == "%" else
                     "." if c == "_" else
@@ -710,7 +844,34 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
             from ..core.db import _normalize_overlay_key
 
         for mid in ids:
-            mem = q.get_mem(mid)
+            m_proj = hit_proj.get(mid)
+            m_br = hit_branch.get(mid)
+            if not (m_proj and m_br):
+                hint = tenant_manager.lookup_memory_hint(mid)
+                if hint:
+                    m_proj, m_br = hint
+                elif query_proj and single_branch and len(lineage_branches) <= 1 and not wildcard_branches:
+                    m_proj, m_br = query_proj, single_branch
+
+            if m_proj and m_br:
+                with tenant_context(m_proj, m_br):
+                    mem = q.get_mem(mid)
+                if mem:
+                    hit_proj[mid] = m_proj
+                    hit_branch[mid] = m_br
+            else:
+                with tenant_context(None):
+                    mem = q.get_mem(mid)
+                if mem:
+                    hint = tenant_manager.lookup_memory_hint(mid)
+                    if hint:
+                        hit_proj[mid], hit_branch[mid] = hint
+                    elif mem.get("user_id"):
+                        p_inferred, b_inferred = parse_tenant_from_user_id(
+                            mem["user_id"], default_branch=eff_root
+                        )
+                        hit_proj[mid], hit_branch[mid] = p_inferred, b_inferred
+
             if mem:
                 mem_map[mid] = mem
                 overlap = compute_keyword_overlap(qt, mem["content"])
@@ -795,7 +956,14 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
                 elif m["user_id"] != raw_uid:
                     continue
 
-            mvf = await calc_multi_vec_fusion_score(mid, qe, w)
+            score_ctx = (
+                tenant_context(hit_proj[mid], hit_branch[mid])
+                if (mid in hit_proj and mid in hit_branch)
+                else nullcontext()
+            )
+            with score_ctx:
+                mvf = await calc_multi_vec_fusion_score(mid, qe, w)
+                tag_Match = await compute_tag_match_score(mid, qtk)
             csr = await calculateCrossSectorResonanceScore(m["primary_sector"], qc["primary"], mvf)
 
             best_sim = csr
@@ -818,7 +986,6 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
             mtk = canonical_token_set(m["content"])
             tok_ov = compute_token_overlap(qtk, mtk)
             rec_sc = calc_recency_score_decay(m["last_seen_at"])
-            tag_Match = await compute_tag_match_score(mid, qtk)
 
             fs = compute_hybrid_score(adj, tok_ov, ww, rec_sc, kw_scores.get(mid, 0), tag_Match)
 
@@ -850,24 +1017,38 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
         res_list.sort(key=lambda x: x["score"], reverse=True)
         top = res_list[:k]
         for r in top:
-             rsal = await applyRetrievalTraceReinforcementToMemory(r["id"], r["salience"])
-             now = int(time.time()*1000)
-             db.execute("UPDATE memories SET salience=?, last_seen_at=? WHERE id=?", (rsal, now, r["id"]))
-             if len(r["path"]) > 1:
-                 wps_rows = db.fetchall("SELECT dst_id, weight FROM waypoints WHERE src_id=?", (r["id"],))
-                 wps = [{"target_id": row["dst_id"], "weight": row["weight"]} for row in wps_rows]
+            rmid = r["id"]
+            r_proj = hit_proj.get(rmid)
+            r_br = hit_branch.get(rmid)
+            if not (r_proj and r_br):
+                hint = tenant_manager.lookup_memory_hint(rmid)
+                if hint:
+                    r_proj, r_br = hint
+                elif r.get("user_id"):
+                    r_proj, r_br = parse_tenant_from_user_id(
+                        r["user_id"], default_branch=eff_root
+                    )
+            reinf_ctx = tenant_context(r_proj, r_br) if (r_proj and r_br) else nullcontext()
+            with reinf_ctx:
+                rsal = await applyRetrievalTraceReinforcementToMemory(rmid, r["salience"])
+                now = int(time.time()*1000)
+                db.execute("UPDATE memories SET salience=?, last_seen_at=? WHERE id=?", (rsal, now, rmid))
+                if len(r["path"]) > 1:
+                    wps_rows = db.fetchall("SELECT dst_id, weight FROM waypoints WHERE src_id=?", (rmid,))
+                    wps = [{"target_id": row["dst_id"], "weight": row["weight"]} for row in wps_rows]
 
-                 pru = await propagateAssociativeReinforcementToLinkedNodes(r["id"], rsal, wps)
-                 for u in pru:
-                     linked_mem = q.get_mem(u["node_id"])
-                     if linked_mem:
-                         time_diff = (now - linked_mem["last_seen_at"]) / 86400000.0
-                         decay_fact = math.exp(-0.02 * time_diff)
-                         ctx_boost = HYBRID_PARAMS["gamma"] * (rsal - (linked_mem["salience"] or 0)) * decay_fact
-                         new_sal = max(0.0, min(1.0, (linked_mem["salience"] or 0) + ctx_boost))
-                         db.execute("UPDATE memories SET salience=?, last_seen_at=? WHERE id=?", (new_sal, now, u["node_id"]))
+                    pru = await propagateAssociativeReinforcementToLinkedNodes(rmid, rsal, wps)
+                    for u in pru:
+                        linked_mem = q.get_mem(u["node_id"])
+                        if linked_mem:
+                            time_diff = (now - linked_mem["last_seen_at"]) / 86400000.0
+                            decay_fact = math.exp(-0.02 * time_diff)
+                            ctx_boost = HYBRID_PARAMS["gamma"] * (rsal - (linked_mem["salience"] or 0)) * decay_fact
+                            new_sal = max(0.0, min(1.0, (linked_mem["salience"] or 0) + ctx_boost))
+                            db.execute("UPDATE memories SET salience=?, last_seen_at=? WHERE id=?", (new_sal, now, u["node_id"]))
 
-             await on_query_hit(r["id"], r["primary_sector"], lambda t: embed_for_sector(t, r["primary_sector"]))
+                await on_query_hit(rmid, r["primary_sector"], lambda t: embed_for_sector(t, r["primary_sector"]))
+                db.commit()
 
         cache[cache_key] = {"r": top, "t": time.time()*1000}
         cache.move_to_end(cache_key)
