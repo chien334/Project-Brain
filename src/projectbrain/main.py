@@ -1407,7 +1407,8 @@ def _get_positional_args(argv_slice: List[str], value_flags: Optional[Any] = Non
     return pos
 
 
-if __name__ == "__main__":
+def cli_main() -> None:
+    """CLI entry point for both `projectbrain` and `python -m projectbrain.main`."""
     import sys
     import os
 
@@ -1767,3 +1768,7 @@ if __name__ == "__main__":
         print("  python -m projectbrain.main v3-plan <project_id> [--branch B] [--version-tag V] [--files f1,f2] [--artifacts a1,a2] [--db-path DB]")
         print("  python -m projectbrain.main v3-oracle <project_id> [--intent-id I] [--version-tag V] [--uart-log L] [--db-path DB]")
         print("  python -m projectbrain.main v3-rca <project_id> <log_text_or_file> [--run-id R] [--db-path DB]")
+
+
+if __name__ == "__main__":
+    cli_main()
