@@ -383,6 +383,42 @@ def _resolve_graph_store_config(
     return None
 
 
+_DEFAULT_GRAPH_BACKEND_PLUGIN_IDS = (
+    "graph.sqlite_overlay",
+    "graph.postgres_schema",
+)
+
+
+def _create_resolved_graph_store(
+    registry: Optional[Any],
+    graph_plugin: Any,
+    project_id: str,
+) -> Any:
+    """Open GraphStore via get_graph_store() for default backends so MultiProjectGraphStore routing applies."""
+    store_cfg = _resolve_graph_store_config(registry, graph_plugin, project_id)
+    meta = getattr(graph_plugin, "metadata", None)
+    pid = getattr(meta, "plugin_id", None)
+    plugin_cfg = getattr(graph_plugin, "config", None)
+    merged_cfg: Dict[str, Any] = {}
+    if isinstance(plugin_cfg, dict):
+        merged_cfg.update(plugin_cfg)
+    if isinstance(store_cfg, dict):
+        merged_cfg.update(store_cfg)
+
+    if pid in _DEFAULT_GRAPH_BACKEND_PLUGIN_IDS and merged_cfg.get("conn") is None:
+        from ...graphify_engine.store import get_graph_store
+
+        return get_graph_store(
+            db_path=merged_cfg.get("db_path"),
+            connection_url=merged_cfg.get("connection_url") or merged_cfg.get("db_url"),
+            root_branch=merged_cfg.get("root_branch"),
+            project_id=project_id,
+            registry=registry,
+        )
+
+    return graph_plugin.create_store(store_cfg)
+
+
 def _strip_flow_prefix(node_id: str) -> str:
     s = str(node_id or "").strip()
     return s[5:] if s.startswith("flow:") else s
@@ -1012,8 +1048,7 @@ class ImpactTestDAGPlannerPlugin(BrainConsumerPlugin):
             return {"nodes": [], "edges": []}
         store: Optional[Any] = None
         try:
-            store_cfg = _resolve_graph_store_config(registry, graph_plugin, project_id)
-            store = graph_plugin.create_store(store_cfg)
+            store = _create_resolved_graph_store(registry, graph_plugin, project_id)
             sub = store.get_resolved_subgraph(project_id, branch, limit=100000)
             nodes = list(sub.get("nodes") or [])
             edges_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -1624,8 +1659,7 @@ class OracleKnowledgeJudgePlugin(BrainConsumerPlugin):
         if graph_plugin is not None:
             store: Optional[Any] = None
             try:
-                store_cfg = _resolve_graph_store_config(registry, graph_plugin, project_id)
-                store = graph_plugin.create_store(store_cfg)
+                store = _create_resolved_graph_store(registry, graph_plugin, project_id)
                 sub = store.get_resolved_subgraph(project_id, branch, limit=100000)
                 flow_node_ids: Set[str] = set()
                 for node in sub.get("nodes") or []:

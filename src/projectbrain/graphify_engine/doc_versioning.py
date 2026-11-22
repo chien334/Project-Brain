@@ -26,9 +26,16 @@ from ..core.db import (
     db,
     ensure_doc_versioning_tables,
     get_memory_branch_lineage,
+    get_memory_tombstones,
     q,
     record_memory_tombstone,
     register_memory_branch,
+)
+from ..core.tenant_manager import (
+    _effective_root_branch,
+    parse_tenant_from_user_id,
+    tenant_context,
+    tenant_manager,
 )
 from ..core.vector_store import vector_store
 from ..memory import hsg as _hsg_mod
@@ -62,12 +69,14 @@ def derive_doc_key(filename: str, explicit_doc_key: Optional[str] = None) -> str
     return slug or "document"
 
 
-def resolve_doc_user_id(project_id: str, branch: str) -> Tuple[str, str, str]:
+def resolve_doc_user_id(project_id: str, branch: Optional[str] = "main") -> Tuple[str, str, str]:
     """Resolve (target_proj, target_branch, effective_user_id)."""
     raw_proj = (project_id or "default").strip() or "default"
     raw_branch = (branch or "main").strip() or "main"
     if ":" in raw_proj:
-        target_proj, proj_br = raw_proj.split(":", 1)
+        p_part, b_part = raw_proj.split(":", 1)
+        target_proj = p_part.strip() or "default"
+        proj_br = b_part.strip()
         target_branch = raw_branch if (raw_branch and raw_branch != "main") else (proj_br or "main")
         effective_user_id = f"{target_proj}:{target_branch}"
     else:
@@ -85,22 +94,25 @@ def next_doc_version(
 ) -> str:
     """Compute the next sequential version string (v1, v2, ...) for a doc_key."""
     ensure_doc_versioning_tables()
-    rows = db.fetchall(
-        "SELECT version FROM document_versions WHERE project_id=? AND branch=? AND doc_key=?",
-        (project_id, branch, doc_key),
-    )
+    target_proj, target_branch, _ = resolve_doc_user_id(project_id, branch)
+    with tenant_context(target_proj, target_branch):
+        rows = db.fetchall(
+            "SELECT version FROM document_versions WHERE project_id=? AND branch=? AND doc_key=?",
+            (target_proj, target_branch, doc_key),
+        )
     if not rows:
         candidate_branches: List[str] = []
-        if base_branch and base_branch != branch:
+        if base_branch and base_branch != target_branch:
             candidate_branches.append(base_branch)
-        for b in get_memory_branch_lineage(project_id, branch):
-            if b != branch and b not in candidate_branches:
+        for b in get_memory_branch_lineage(target_proj, target_branch):
+            if b != target_branch and b not in candidate_branches:
                 candidate_branches.append(b)
         for cand_br in candidate_branches:
-            cand_rows = db.fetchall(
-                "SELECT version FROM document_versions WHERE project_id=? AND branch=? AND doc_key=?",
-                (project_id, cand_br, doc_key),
-            )
+            with tenant_context(target_proj, cand_br):
+                cand_rows = db.fetchall(
+                    "SELECT version FROM document_versions WHERE project_id=? AND branch=? AND doc_key=?",
+                    (target_proj, cand_br, doc_key),
+                )
             if cand_rows:
                 rows = cand_rows
                 break
@@ -419,19 +431,42 @@ async def clone_memory_with_vectors(
     old_memory_id: str,
     target_user_id: str,
     new_meta: Dict[str, Any],
+    source_project_id: Optional[str] = None,
+    source_branch: Optional[str] = None,
 ) -> Optional[str]:
     """Clone an existing memory row and all its vectors with ZERO LLM/embedding calls."""
-    old = q.get_mem(old_memory_id)
-    if not old:
-        return None
+    if source_project_id is not None:
+        src_proj, inf_src_br = parse_tenant_from_user_id(
+            source_project_id, default_branch=source_branch or _effective_root_branch()
+        )
+        src_br = (source_branch or inf_src_br or _effective_root_branch()).strip() or _effective_root_branch()
+        with tenant_context(src_proj, src_br):
+            old = q.get_mem(old_memory_id)
+            if not old:
+                return None
+            vectors = await vector_store.getVectorsById(old_memory_id)
+    else:
+        with tenant_context(None):
+            old = q.get_mem(old_memory_id)
+            if not old:
+                return None
+            hint = tenant_manager.lookup_memory_hint(old_memory_id)
+            if hint is not None:
+                with tenant_context(hint[0], hint[1]):
+                    vectors = await vector_store.getVectorsById(old_memory_id)
+            else:
+                vectors = await vector_store.getVectorsById(old_memory_id)
+
+    eff_uid = target_user_id or old.get("user_id") or "anonymous"
+    target_proj, target_br = parse_tenant_from_user_id(
+        eff_uid, default_branch=_effective_root_branch()
+    )
+    if isinstance(new_meta, dict) and new_meta.get("project_id"):
+        target_proj = parse_tenant_from_user_id(str(new_meta["project_id"]))[0]
+        if new_meta.get("branch"):
+            target_br = str(new_meta["branch"]).strip() or target_br
 
     now_ms = int(time.time() * 1000)
-    if target_user_id:
-        db.execute(
-            "INSERT OR IGNORE INTO users(user_id, summary, reflection_count, created_at, updated_at) VALUES (?,?,?,?,?)",
-            (target_user_id, "User profile initializing...", 0, now_ms, now_ms),
-        )
-        db.commit()
 
     merged_meta: Dict[str, Any] = {}
     raw_old_meta = old.get("meta")
@@ -447,30 +482,38 @@ async def clone_memory_with_vectors(
     merged_meta.update(new_meta)
 
     new_id = str(uuid.uuid4())
-    q.ins_mem(
-        id=new_id,
-        user_id=target_user_id or old.get("user_id") or "anonymous",
-        segment=old.get("segment", 0),
-        content=old.get("content"),
-        simhash=old.get("simhash"),
-        primary_sector=old.get("primary_sector"),
-        tags=old.get("tags"),
-        meta=json.dumps(merged_meta),
-        created_at=now_ms,
-        updated_at=now_ms,
-        last_seen_at=now_ms,
-        salience=old.get("salience", 1.0),
-        decay_lambda=old.get("decay_lambda", 0.02),
-        version=old.get("version", 1),
-        mean_dim=old.get("mean_dim"),
-        mean_vec=old.get("mean_vec"),
-        compressed_vec=old.get("compressed_vec"),
-        feedback_score=old.get("feedback_score", 0),
-    )
+    with tenant_context(target_proj, target_br):
+        if target_user_id:
+            db.execute(
+                "INSERT OR IGNORE INTO users(user_id, summary, reflection_count, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (target_user_id, "User profile initializing...", 0, now_ms, now_ms),
+            )
+            db.commit()
 
-    vectors = await vector_store.getVectorsById(old_memory_id)
-    for vr in vectors:
-        await vector_store.storeVector(new_id, vr.sector, vr.vector, vr.dim, target_user_id)
+        q.ins_mem(
+            id=new_id,
+            user_id=eff_uid,
+            segment=old.get("segment", 0),
+            content=old.get("content"),
+            simhash=old.get("simhash"),
+            primary_sector=old.get("primary_sector"),
+            tags=old.get("tags"),
+            meta=json.dumps(merged_meta),
+            created_at=now_ms,
+            updated_at=now_ms,
+            last_seen_at=now_ms,
+            salience=old.get("salience", 1.0),
+            decay_lambda=old.get("decay_lambda", 0.02),
+            version=old.get("version", 1),
+            mean_dim=old.get("mean_dim"),
+            mean_vec=old.get("mean_vec"),
+            compressed_vec=old.get("compressed_vec"),
+            feedback_score=old.get("feedback_score", 0),
+        )
+
+        for vr in vectors:
+            await vector_store.storeVector(new_id, vr.sector, vr.vector, vr.dim, eff_uid)
+        tenant_manager.remember_memory_id(new_id, target_proj, target_br)
 
     return new_id
 
@@ -483,52 +526,56 @@ def _resolve_parent_version(
     base_branch: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Resolve (parent_version, parent_branch) for delta reuse."""
-    lineage = get_memory_branch_lineage(project_id, branch)
+    target_proj, target_branch, _ = resolve_doc_user_id(project_id, branch)
+    lineage = get_memory_branch_lineage(target_proj, target_branch)
     search_branches: List[str] = []
     if base_version:
         if base_branch:
             search_branches.append(base_branch)
-        if branch not in search_branches:
-            search_branches.append(branch)
+        if target_branch not in search_branches:
+            search_branches.append(target_branch)
         for b in lineage:
             if b not in search_branches:
                 search_branches.append(b)
         for b in search_branches:
-            row = db.fetchone(
-                "SELECT version, branch FROM document_versions "
-                "WHERE project_id=? AND branch=? AND doc_key=? AND version=? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (project_id, b, doc_key, base_version),
-            )
+            with tenant_context(target_proj, b):
+                row = db.fetchone(
+                    "SELECT version, branch FROM document_versions "
+                    "WHERE project_id=? AND branch=? AND doc_key=? AND version=? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (target_proj, b, doc_key, base_version),
+                )
             if row:
                 return row["version"], row["branch"]
-        return base_version, (base_branch or branch)
+        return base_version, (base_branch or target_branch)
 
     # No explicit base_version: check active version on target branch first
-    row = db.fetchone(
-        "SELECT version, branch FROM document_versions "
-        "WHERE project_id=? AND branch=? AND doc_key=? AND status='active' "
-        "ORDER BY created_at DESC LIMIT 1",
-        (project_id, branch, doc_key),
-    )
+    with tenant_context(target_proj, target_branch):
+        row = db.fetchone(
+            "SELECT version, branch FROM document_versions "
+            "WHERE project_id=? AND branch=? AND doc_key=? AND status='active' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (target_proj, target_branch, doc_key),
+        )
     if row:
         return row["version"], row["branch"]
 
     # Then check explicit base_branch and registered branch lineage
     fallback_branches: List[str] = []
-    if base_branch and base_branch != branch:
+    if base_branch and base_branch != target_branch:
         fallback_branches.append(base_branch)
     for b in lineage:
-        if b != branch and b not in fallback_branches:
+        if b != target_branch and b not in fallback_branches:
             fallback_branches.append(b)
 
     for b in fallback_branches:
-        row = db.fetchone(
-            "SELECT version, branch FROM document_versions "
-            "WHERE project_id=? AND branch=? AND doc_key=? AND status='active' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (project_id, b, doc_key),
-        )
+        with tenant_context(target_proj, b):
+            row = db.fetchone(
+                "SELECT version, branch FROM document_versions "
+                "WHERE project_id=? AND branch=? AND doc_key=? AND status='active' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (target_proj, b, doc_key),
+            )
         if row:
             return row["version"], row["branch"]
 
@@ -547,21 +594,23 @@ def lookup_parent_units_by_hash(
     Used by both ingest_document_versioned and DocumentPipeline pre-OCR reuse.
     """
     ensure_doc_versioning_tables()
+    target_proj, target_branch, _ = resolve_doc_user_id(project_id, branch)
     parent_version, parent_branch = _resolve_parent_version(
-        project_id=project_id,
-        branch=branch,
+        project_id=target_proj,
+        branch=target_branch,
         doc_key=doc_key,
         base_version=base_version,
         base_branch=base_branch,
     )
     by_hash: Dict[str, List[Dict[str, Any]]] = {}
     if parent_version and parent_branch:
-        rows = db.fetchall(
-            "SELECT * FROM document_units "
-            "WHERE project_id=? AND branch=? AND doc_key=? AND version=? "
-            "ORDER BY unit_index ASC",
-            (project_id, parent_branch, doc_key, parent_version),
-        )
+        with tenant_context(target_proj, parent_branch):
+            rows = db.fetchall(
+                "SELECT * FROM document_units "
+                "WHERE project_id=? AND branch=? AND doc_key=? AND version=? "
+                "ORDER BY unit_index ASC",
+                (target_proj, parent_branch, doc_key, parent_version),
+            )
         for r in rows:
             by_hash.setdefault(r["unit_sha256"], []).append(dict(r))
     return parent_version, parent_branch, by_hash
@@ -611,6 +660,18 @@ async def ingest_document_versioned(
         doc_version.strip()
         if (doc_version and str(doc_version).strip())
         else next_doc_version(target_proj, target_branch, d_key, base_branch=effective_base_branch)
+    )
+    has_explicit_base = bool(
+        effective_base_branch and effective_base_branch != target_branch
+    )
+    proj_meta = tenant_manager.ensure_branch_schema(
+        target_proj,
+        target_branch,
+        base_branch=effective_base_branch or _effective_root_branch(),
+        author=author or "system",
+        has_doc=True,
+        record_lineage=has_explicit_base,
+        preserve_existing_base=not has_explicit_base,
     )
 
     # Build raw candidate units
@@ -759,7 +820,13 @@ async def ingest_document_versioned(
                 }
                 if author:
                     new_meta["author"] = author
-                cloned_id = await clone_memory_with_vectors(old_mid, effective_user_id, new_meta)
+                cloned_id = await clone_memory_with_vectors(
+                    old_mid,
+                    effective_user_id,
+                    new_meta,
+                    source_project_id=target_proj,
+                    source_branch=parent_branch,
+                )
                 if cloned_id:
                     cloned_ids.append(cloned_id)
             if cloned_ids:
@@ -779,173 +846,177 @@ async def ingest_document_versioned(
     )
 
     if same_branch_update:
-        for old_mid in all_parent_memory_ids:
-            await vector_store.deleteVectors(old_mid)
-            q.del_mem(old_mid)
-        db.execute(
-            "UPDATE document_versions SET status='superseded' "
-            "WHERE project_id=? AND branch=? AND doc_key=? AND status='active'",
-            (target_proj, target_branch, d_key),
-        )
-        db.commit()
+        with tenant_context(target_proj, target_branch):
+            for old_mid in all_parent_memory_ids:
+                await vector_store.deleteVectors(old_mid)
+                q.del_mem(old_mid)
+            db.execute(
+                "UPDATE document_versions SET status='superseded' "
+                "WHERE project_id=? AND branch=? AND doc_key=? AND status='active'",
+                (target_proj, target_branch, d_key),
+            )
+            db.commit()
     elif cross_branch_update:
         if base_branch and base_branch != target_branch:
             register_memory_branch(target_proj, target_branch, base_branch)
         elif parent_branch and parent_branch != target_branch:
             register_memory_branch(target_proj, target_branch, parent_branch)
-        record_memory_tombstone(target_proj, target_branch, "doc", d_key)
+        with tenant_context(target_proj, target_branch):
+            record_memory_tombstone(target_proj, target_branch, "doc", d_key)
 
     if len(get_memory_branch_lineage(target_proj, target_branch)) > 1:
-        record_memory_tombstone(target_proj, target_branch, "doc", d_key)
+        with tenant_context(target_proj, target_branch):
+            record_memory_tombstone(target_proj, target_branch, "doc", d_key)
 
     # Step 3: Embed missed units (or preserve legacy explicit chunks on initial push-processed)
     use_explicit_chunks = bool(chunks and parent_version is None)
-    if use_explicit_chunks:
-        chunk_mids: List[str] = []
-        for idx_c, ch in enumerate(chunks or []):
-            ch_text = ch.get("content") or ch.get("text") or ""
-            if not ch_text.strip():
-                continue
-            ch_tags = ch.get("tags") or tag_list
-            if isinstance(ch_tags, list):
-                ch_tag_str = json.dumps(ch_tags)
-            else:
-                ch_tag_str = json.dumps([t.strip() for t in str(ch_tags).split(",") if t.strip()])
-            ch_meta = {
-                "source": "push-processed",
-                "filename": filename,
-                "sha256": file_sha256,
-                "doc_key": d_key,
-                "doc_version": d_ver,
-                "unit_index": 0,
-                "chunk_id": ch.get("chunk_id") or f"p_{idx_c + 1}",
-                "project_id": target_proj,
-                "branch": target_branch,
-            }
-            if author:
-                ch_meta["author"] = author
-            res_mem = await _hsg_mod.add_hsg_memory(
-                content=ch_text,
-                tags=ch_tag_str,
-                metadata=ch_meta,
-                user_id=effective_user_id,
-            )
-            mid = res_mem.get("id")
-            if mid:
-                chunk_mids.append(mid)
-                all_memory_ids.append(mid)
-        if planned_units:
-            planned_units[0]["memory_ids"] = list(chunk_mids)
-        elif chunk_mids:
-            # Record a synthetic unit so future versions can supersede/reuse cleanly
-            synth_text = full_markdown or "\n\n".join(
-                (ch.get("content") or ch.get("text") or "") for ch in (chunks or [])
-            ).strip()
-            planned_units.append(
-                {
-                    "unit_index": 0,
-                    "unit_type": "section",
-                    "unit_title": "Document",
-                    "unit_sha256": hashlib.sha256(synth_text.encode("utf-8")).hexdigest(),
-                    "markdown_text": synth_text,
-                    "reused": False,
-                    "memory_ids": list(chunk_mids),
-                }
-            )
-            total_units = 1
-            new_units = 1
-    else:
-        for p in units_needing_embed:
-            unit_md = (p.get("markdown_text") or "").strip()
-            if not unit_md:
-                continue
-            unit_chunks = chunk_text(unit_md, tgt=768, ovr=0.1)
-            unit_mids: List[str] = []
-            for c_idx, c in enumerate(unit_chunks):
-                c_text = (c.get("text") or "").strip()
-                if not c_text:
+    with tenant_context(target_proj, target_branch):
+        if use_explicit_chunks:
+            chunk_mids: List[str] = []
+            for idx_c, ch in enumerate(chunks or []):
+                ch_text = ch.get("content") or ch.get("text") or ""
+                if not ch_text.strip():
                     continue
-                unit_meta = {
-                    "source": "document_versioning",
+                ch_tags = ch.get("tags") or tag_list
+                if isinstance(ch_tags, list):
+                    ch_tag_str = json.dumps(ch_tags)
+                else:
+                    ch_tag_str = json.dumps([t.strip() for t in str(ch_tags).split(",") if t.strip()])
+                ch_meta = {
+                    "source": "push-processed",
                     "filename": filename,
                     "sha256": file_sha256,
                     "doc_key": d_key,
                     "doc_version": d_ver,
-                    "unit_index": p["unit_index"],
-                    "unit_title": p["unit_title"],
-                    "unit_type": p["unit_type"],
-                    "chunk_index": c_idx,
+                    "unit_index": 0,
+                    "chunk_id": ch.get("chunk_id") or f"p_{idx_c + 1}",
                     "project_id": target_proj,
                     "branch": target_branch,
                 }
                 if author:
-                    unit_meta["author"] = author
+                    ch_meta["author"] = author
                 res_mem = await _hsg_mod.add_hsg_memory(
-                    content=c_text,
-                    tags=tag_json,
-                    metadata=unit_meta,
+                    content=ch_text,
+                    tags=ch_tag_str,
+                    metadata=ch_meta,
                     user_id=effective_user_id,
                 )
                 mid = res_mem.get("id")
                 if mid:
-                    unit_mids.append(mid)
+                    chunk_mids.append(mid)
                     all_memory_ids.append(mid)
-            p["memory_ids"] = unit_mids
+            if planned_units:
+                planned_units[0]["memory_ids"] = list(chunk_mids)
+            elif chunk_mids:
+                # Record a synthetic unit so future versions can supersede/reuse cleanly
+                synth_text = full_markdown or "\n\n".join(
+                    (ch.get("content") or ch.get("text") or "") for ch in (chunks or [])
+                ).strip()
+                planned_units.append(
+                    {
+                        "unit_index": 0,
+                        "unit_type": "section",
+                        "unit_title": "Document",
+                        "unit_sha256": hashlib.sha256(synth_text.encode("utf-8")).hexdigest(),
+                        "markdown_text": synth_text,
+                        "reused": False,
+                        "memory_ids": list(chunk_mids),
+                    }
+                )
+                total_units = 1
+                new_units = 1
+        else:
+            for p in units_needing_embed:
+                unit_md = (p.get("markdown_text") or "").strip()
+                if not unit_md:
+                    continue
+                unit_chunks = chunk_text(unit_md, tgt=768, ovr=0.1)
+                unit_mids: List[str] = []
+                for c_idx, c in enumerate(unit_chunks):
+                    c_text = (c.get("text") or "").strip()
+                    if not c_text:
+                        continue
+                    unit_meta = {
+                        "source": "document_versioning",
+                        "filename": filename,
+                        "sha256": file_sha256,
+                        "doc_key": d_key,
+                        "doc_version": d_ver,
+                        "unit_index": p["unit_index"],
+                        "unit_title": p["unit_title"],
+                        "unit_type": p["unit_type"],
+                        "chunk_index": c_idx,
+                        "project_id": target_proj,
+                        "branch": target_branch,
+                    }
+                    if author:
+                        unit_meta["author"] = author
+                    res_mem = await _hsg_mod.add_hsg_memory(
+                        content=c_text,
+                        tags=tag_json,
+                        metadata=unit_meta,
+                        user_id=effective_user_id,
+                    )
+                    mid = res_mem.get("id")
+                    if mid:
+                        unit_mids.append(mid)
+                        all_memory_ids.append(mid)
+                p["memory_ids"] = unit_mids
 
-    # Step 4: Persist document_versions and document_units
-    now_ms = int(time.time() * 1000)
-    ver_id = str(uuid.uuid4())
-    db.execute(
-        "INSERT OR REPLACE INTO document_versions("
-        "id, project_id, branch, doc_key, version, parent_version, base_branch, "
-        "filename, file_sha256, total_units, reused_units, new_units, deleted_units, status, created_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            ver_id,
-            target_proj,
-            target_branch,
-            d_key,
-            d_ver,
-            parent_version,
-            effective_base_branch,
-            filename,
-            file_sha256,
-            total_units,
-            reused_units,
-            new_units,
-            deleted_units,
-            "active",
-            now_ms,
-        ),
-    )
-
-    # Clear any pre-existing units for this exact (project, branch, doc_key, version) if re-written
-    db.execute(
-        "DELETE FROM document_units WHERE project_id=? AND branch=? AND doc_key=? AND version=?",
-        (target_proj, target_branch, d_key, d_ver),
-    )
-    for p in planned_units:
-        unit_id = str(uuid.uuid4())
+        # Step 4: Persist document_versions and document_units
+        now_ms = int(time.time() * 1000)
+        ver_id = str(uuid.uuid4())
         db.execute(
-            "INSERT OR REPLACE INTO document_units("
-            "id, project_id, branch, doc_key, version, unit_index, unit_type, "
-            "unit_title, unit_sha256, markdown_text, memory_ids_json"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO document_versions("
+            "id, project_id, branch, doc_key, version, parent_version, base_branch, "
+            "filename, file_sha256, total_units, reused_units, new_units, deleted_units, status, created_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                unit_id,
+                ver_id,
                 target_proj,
                 target_branch,
                 d_key,
                 d_ver,
-                p["unit_index"],
-                p["unit_type"],
-                p["unit_title"],
-                p["unit_sha256"],
-                p["markdown_text"],
-                json.dumps(p.get("memory_ids") or []),
+                parent_version,
+                effective_base_branch,
+                filename,
+                file_sha256,
+                total_units,
+                reused_units,
+                new_units,
+                deleted_units,
+                "active",
+                now_ms,
             ),
         )
-    db.commit()
+
+        # Clear any pre-existing units for this exact (project, branch, doc_key, version) if re-written
+        db.execute(
+            "DELETE FROM document_units WHERE project_id=? AND branch=? AND doc_key=? AND version=?",
+            (target_proj, target_branch, d_key, d_ver),
+        )
+        for p in planned_units:
+            unit_id = str(uuid.uuid4())
+            db.execute(
+                "INSERT OR REPLACE INTO document_units("
+                "id, project_id, branch, doc_key, version, unit_index, unit_type, "
+                "unit_title, unit_sha256, markdown_text, memory_ids_json"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    unit_id,
+                    target_proj,
+                    target_branch,
+                    d_key,
+                    d_ver,
+                    p["unit_index"],
+                    p["unit_type"],
+                    p["unit_title"],
+                    p["unit_sha256"],
+                    p["markdown_text"],
+                    json.dumps(p.get("memory_ids") or []),
+                ),
+            )
+        db.commit()
     _hsg_mod.invalidate_query_cache()
 
     return {
@@ -953,6 +1024,8 @@ async def ingest_document_versioned(
         "doc_version": d_ver,
         "parent_version": parent_version,
         "base_branch": effective_base_branch,
+        "db_name": proj_meta["db_name"],
+        "doc_schema": proj_meta["schema_name"],
         "total_units": total_units,
         "reused_units": reused_units,
         "new_units": new_units,
@@ -970,12 +1043,60 @@ def list_documents(
 ) -> List[Dict[str, Any]]:
     """List documents registered in document_versions for a project/branch."""
     ensure_doc_versioning_tables()
-    target_proj = project_id.split(":", 1)[0] if ":" in (project_id or "") else (project_id or "default")
+    raw_proj = (project_id or "default").strip() or "default"
+    if ":" in raw_proj:
+        target_proj, inferred_br = parse_tenant_from_user_id(raw_proj)
+        eff_branch = branch or inferred_br
+    else:
+        target_proj = raw_proj
+        eff_branch = branch
+
+    if eff_branch:
+        clauses = ["project_id=?", "branch=?"]
+        params: List[Any] = [target_proj, eff_branch]
+        if status and status != "all":
+            clauses.append("status=?")
+            params.append(status)
+        sql = (
+            f"SELECT * FROM document_versions WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at DESC"
+        )
+        with tenant_context(target_proj, eff_branch):
+            rows = db.fetchall(sql, tuple(params))
+        if rows:
+            return rows
+
+        lineage = get_memory_branch_lineage(target_proj, eff_branch)
+        if len(lineage) > 1:
+            tombstoned_docs: set = set()
+            for anc_idx in range(len(lineage)):
+                b_name = lineage[anc_idx]
+                with tenant_context(target_proj, b_name):
+                    t_map = get_memory_tombstones(target_proj, b_name)
+                    tombstoned_docs.update(t_map.get("doc", set()))
+                if anc_idx == 0:
+                    continue
+                anc_clauses = ["project_id=?", "branch=?"]
+                anc_params: List[Any] = [target_proj, b_name]
+                if status and status != "all":
+                    anc_clauses.append("status=?")
+                    anc_params.append(status)
+                anc_sql = (
+                    f"SELECT * FROM document_versions WHERE {' AND '.join(anc_clauses)} "
+                    "ORDER BY created_at DESC"
+                )
+                with tenant_context(target_proj, b_name):
+                    anc_rows = db.fetchall(anc_sql, tuple(anc_params))
+                filtered = [
+                    r for r in anc_rows
+                    if r.get("doc_key") not in tombstoned_docs
+                ]
+                if filtered:
+                    return filtered
+        return []
+
     clauses = ["project_id=?"]
-    params: List[Any] = [target_proj]
-    if branch:
-        clauses.append("branch=?")
-        params.append(branch)
+    params = [target_proj]
     if status and status != "all":
         clauses.append("status=?")
         params.append(status)
@@ -983,7 +1104,22 @@ def list_documents(
         f"SELECT * FROM document_versions WHERE {' AND '.join(clauses)} "
         "ORDER BY created_at DESC"
     )
-    return db.fetchall(sql, tuple(params))
+    registered_branches = tenant_manager.list_project_branches(target_proj)
+    if not registered_branches:
+        with tenant_context(None):
+            return db.fetchall(sql, tuple(params))
+
+    merged: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    for br in registered_branches:
+        with tenant_context(target_proj, br):
+            for r in db.fetchall(sql, tuple(params)):
+                rid = r.get("id") or (r.get("project_id"), r.get("branch"), r.get("doc_key"), r.get("version"))
+                if rid not in seen_ids:
+                    seen_ids.add(rid)
+                    merged.append(r)
+    merged.sort(key=lambda r: int(r.get("created_at") or 0), reverse=True)
+    return merged
 
 
 def list_document_versions(
@@ -993,17 +1129,42 @@ def list_document_versions(
 ) -> List[Dict[str, Any]]:
     """List all versions of a specific doc_key for a project (optionally filtered by branch)."""
     ensure_doc_versioning_tables()
-    target_proj = project_id.split(":", 1)[0] if ":" in (project_id or "") else (project_id or "default")
-    clauses = ["project_id=?", "doc_key=?"]
-    params: List[Any] = [target_proj, doc_key]
-    if branch:
-        clauses.append("branch=?")
-        params.append(branch)
+    raw_proj = (project_id or "default").strip() or "default"
+    if ":" in raw_proj:
+        target_proj, inferred_br = parse_tenant_from_user_id(raw_proj)
+        eff_branch = branch or inferred_br
+    else:
+        target_proj = raw_proj
+        eff_branch = branch
+
+    if eff_branch:
+        sql = (
+            "SELECT * FROM document_versions WHERE project_id=? AND doc_key=? AND branch=? "
+            "ORDER BY created_at DESC"
+        )
+        with tenant_context(target_proj, eff_branch):
+            return db.fetchall(sql, (target_proj, doc_key, eff_branch))
+
     sql = (
-        f"SELECT * FROM document_versions WHERE {' AND '.join(clauses)} "
+        "SELECT * FROM document_versions WHERE project_id=? AND doc_key=? "
         "ORDER BY created_at DESC"
     )
-    return db.fetchall(sql, tuple(params))
+    registered_branches = tenant_manager.list_project_branches(target_proj)
+    if not registered_branches:
+        with tenant_context(None):
+            return db.fetchall(sql, (target_proj, doc_key))
+
+    merged: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    for br in registered_branches:
+        with tenant_context(target_proj, br):
+            for r in db.fetchall(sql, (target_proj, doc_key)):
+                rid = r.get("id") or (r.get("project_id"), r.get("branch"), r.get("doc_key"), r.get("version"))
+                if rid not in seen_ids:
+                    seen_ids.add(rid)
+                    merged.append(r)
+    merged.sort(key=lambda r: int(r.get("created_at") or 0), reverse=True)
+    return merged
 
 
 def diff_document_versions(
@@ -1017,36 +1178,37 @@ def diff_document_versions(
 ) -> Dict[str, Any]:
     """Compute unit-level diff between two versions of a document."""
     ensure_doc_versioning_tables()
-    target_proj = project_id.split(":", 1)[0] if ":" in (project_id or "") else (project_id or "default")
+    target_proj = parse_tenant_from_user_id(project_id)[0]
     f_br = from_branch or branch or "main"
     t_br = to_branch or branch or "main"
 
-    from_meta = db.fetchone(
-        "SELECT * FROM document_versions WHERE project_id=? AND branch=? AND doc_key=? AND version=?",
-        (target_proj, f_br, doc_key, from_version),
-    )
-    if not from_meta:
-        raise KeyError(
-            f"Document '{doc_key}' version '{from_version}' not found on branch '{f_br}' for project '{target_proj}'"
+    with tenant_context(target_proj, f_br):
+        from_meta = db.fetchone(
+            "SELECT * FROM document_versions WHERE project_id=? AND branch=? AND doc_key=? AND version=?",
+            (target_proj, f_br, doc_key, from_version),
+        )
+        if not from_meta:
+            raise KeyError(
+                f"Document '{doc_key}' version '{from_version}' not found on branch '{f_br}' for project '{target_proj}'"
+            )
+        from_units = db.fetchall(
+            "SELECT * FROM document_units WHERE project_id=? AND branch=? AND doc_key=? AND version=? ORDER BY unit_index ASC",
+            (target_proj, f_br, doc_key, from_version),
         )
 
-    to_meta = db.fetchone(
-        "SELECT * FROM document_versions WHERE project_id=? AND branch=? AND doc_key=? AND version=?",
-        (target_proj, t_br, doc_key, to_version),
-    )
-    if not to_meta:
-        raise KeyError(
-            f"Document '{doc_key}' version '{to_version}' not found on branch '{t_br}' for project '{target_proj}'"
+    with tenant_context(target_proj, t_br):
+        to_meta = db.fetchone(
+            "SELECT * FROM document_versions WHERE project_id=? AND branch=? AND doc_key=? AND version=?",
+            (target_proj, t_br, doc_key, to_version),
         )
-
-    from_units = db.fetchall(
-        "SELECT * FROM document_units WHERE project_id=? AND branch=? AND doc_key=? AND version=? ORDER BY unit_index ASC",
-        (target_proj, f_br, doc_key, from_version),
-    )
-    to_units = db.fetchall(
-        "SELECT * FROM document_units WHERE project_id=? AND branch=? AND doc_key=? AND version=? ORDER BY unit_index ASC",
-        (target_proj, t_br, doc_key, to_version),
-    )
+        if not to_meta:
+            raise KeyError(
+                f"Document '{doc_key}' version '{to_version}' not found on branch '{t_br}' for project '{target_proj}'"
+            )
+        to_units = db.fetchall(
+            "SELECT * FROM document_units WHERE project_id=? AND branch=? AND doc_key=? AND version=? ORDER BY unit_index ASC",
+            (target_proj, t_br, doc_key, to_version),
+        )
 
     from_by_hash: Dict[str, List[Dict[str, Any]]] = {}
     for fu in from_units:

@@ -62,8 +62,11 @@ class PushDocumentRequest(BaseModel):
 async def push_processed(req: PushDocumentRequest):
     _check_read_only()
     try:
-        project_id = req.project_id or "default"
-        branch = req.branch or "main"
+        from ...graphify_engine.doc_versioning import ingest_document_versioned, resolve_doc_user_id
+
+        project_id, branch, _ = resolve_doc_user_id(
+            req.project_id or "default", req.branch or "main"
+        )
         doc = req.document or {}
 
         filename = doc.get("filename", "unknown_doc")
@@ -79,7 +82,6 @@ async def push_processed(req: PushDocumentRequest):
         base_branch = doc.get("base_branch") or req.base_branch
 
         # 1. Versioned ingestion into HSG memory (with unit reuse & superseding)
-        from ...graphify_engine.doc_versioning import ingest_document_versioned
 
         doc_tags = doc.get("tags")
         if isinstance(doc_tags, str):
@@ -158,6 +160,8 @@ async def push_processed(req: PushDocumentRequest):
             "project_id": project_id,
             "branch": branch,
             "schema_used": schema_used,
+            "db_name": sync_res.get("db_name") or ver_res.get("db_name"),
+            "doc_schema": ver_res.get("doc_schema"),
             "nodes_upserted": nodes_upserted,
             "edges_upserted": edges_upserted,
             "memories_created": memories_created,
@@ -216,8 +220,10 @@ async def upload_document(
             tag_list.append("document")
 
         # 1. Versioned pre-OCR delta ingestion (avoids eager full-doc OCR on unchanged units)
-        from ...graphify_engine.doc_versioning import ingest_document_versioned
+        from ...graphify_engine.doc_versioning import ingest_document_versioned, resolve_doc_user_id
         from ...utils.doc_parser import ocr_options_context
+
+        project_id, branch, _ = resolve_doc_user_id(project_id, branch)
 
         eff_ocr_engine = (
             ocr_engine
@@ -286,6 +292,7 @@ async def upload_document(
         nodes_upserted = 0
         edges_upserted = 0
         graphify_synced = False
+        sync_res: Dict[str, Any] = {}
         try:
             from ...graphify_engine.extractor import GraphifyExtractor
             extractor = GraphifyExtractor()
@@ -317,11 +324,20 @@ async def upload_document(
             logger.warning(f"Graphify extraction for uploaded file {filename} skipped or failed: {ge}")
 
         memory_ids = ver_res.get("memory_ids") or []
+        doc_schema = ver_res.get("doc_schema")
+        schema_used = (
+            sync_res.get("schema_name")
+            or sync_res.get("schema_used")
+            or doc_schema
+        )
         return {
             "status": "success",
             "filename": filename,
             "project_id": project_id,
             "branch": branch,
+            "schema_used": schema_used,
+            "db_name": sync_res.get("db_name") or ver_res.get("db_name"),
+            "doc_schema": doc_schema,
             "memory_id": memory_ids[0] if memory_ids else None,
             "tags": tag_list,
             "graphify_synced": graphify_synced,

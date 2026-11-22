@@ -471,6 +471,74 @@ class EnvConfig:
             str(raw_local_embed_model or "BAAI/bge-small-en-v1.5").strip()
             or "BAAI/bge-small-en-v1.5"
         )
+
+        # Identity & Access Management (projectbrain.toml [auth] & PB_* auth env vars)
+        auth_sec = self._toml.get("auth", {})
+        if not isinstance(auth_sec, dict):
+            auth_sec = {}
+
+        self.allow_registration: bool = _parse_bool(
+            auth_sec.get("allow_registration")
+            if auth_sec.get("allow_registration") is not None
+            else pb_getenv("PB_ALLOW_REGISTRATION"),
+            True,
+        )
+        raw_signup_role = str(
+            auth_sec.get("default_signup_role")
+            if auth_sec.get("default_signup_role") is not None
+            else (pb_getenv("PB_DEFAULT_SIGNUP_ROLE") or "collaborator")
+        ).strip().lower()
+        self.default_signup_role: str = (
+            raw_signup_role if raw_signup_role in ("collaborator", "reader") else "collaborator"
+        )
+        self.session_ttl_hours: int = max(
+            1,
+            _parse_int(
+                auth_sec.get("session_ttl_hours")
+                if auth_sec.get("session_ttl_hours") is not None
+                else pb_getenv("PB_SESSION_TTL_HOURS"),
+                24,
+            ),
+        )
+        self.require_rest_auth: bool = _parse_bool(
+            auth_sec.get("require_rest_auth")
+            if auth_sec.get("require_rest_auth") is not None
+            else pb_getenv("PB_REQUIRE_REST_AUTH"),
+            False,
+        )
+        self.auth_lockout_max_attempts: int = max(
+            1,
+            _parse_int(
+                auth_sec.get("lockout_max_attempts")
+                if auth_sec.get("lockout_max_attempts") is not None
+                else pb_getenv("PB_AUTH_LOCKOUT_MAX_ATTEMPTS"),
+                5,
+            ),
+        )
+        self.auth_lockout_seconds: int = max(
+            1,
+            _parse_int(
+                auth_sec.get("lockout_seconds")
+                if auth_sec.get("lockout_seconds") is not None
+                else pb_getenv("PB_AUTH_LOCKOUT_SECONDS"),
+                300,
+            ),
+        )
+
+        # Multi-DB / Multi-Schema 3-tier tenant isolation (default True)
+        db_sec = self._toml.get("db", {})
+        if not isinstance(db_sec, dict):
+            db_sec = {}
+        self._initial_pb_db_path = os.getenv("PB_DB_PATH")
+        self._initial_om_db_path = os.getenv("OM_DB_PATH")
+        self._initial_db_url = self.db_url
+        self._initial_multi_db_env = pb_getenv("OM_MULTI_DB_ENABLED")
+        self.multi_db_enabled: bool = _parse_bool(
+            db_sec.get("multi_db_enabled")
+            if db_sec.get("multi_db_enabled") is not None
+            else self._initial_multi_db_env,
+            True,
+        )
         
     @property
     def database_url(self) -> str:

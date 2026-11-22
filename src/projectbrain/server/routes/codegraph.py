@@ -7,6 +7,14 @@ import json
 import logging
 from pathlib import Path
 from ...core.db import db
+from ...core.tenant_manager import (
+    _effective_root_branch,
+    is_multi_db_enabled,
+    sanitize_branch_schema_for_project,
+    sanitize_project_db_name,
+    tenant_context,
+    tenant_manager,
+)
 
 logger = logging.getLogger("server.routes.codegraph")
 
@@ -58,38 +66,204 @@ class CreateProjectRequest(BaseModel):
 def get_local_db_path() -> Path:
     return Path(__file__).parent.parent.parent.parent.parent / ".codegraph" / "codegraph.db"
 
+
+def _replace_codegraph_tables(
+    project_id_key: str,
+    proj: str,
+    branch: str,
+    project_name: str,
+    description: str,
+    ts: int,
+    client_ip: str,
+    author: Optional[str],
+    project_path: Optional[str],
+    nodes: List[Dict[str, Any]],
+    edges: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Persist legacy codegraph project metadata in Master DB and nodes/edges in Project DB."""
+    proj_meta = tenant_manager.ensure_project_database(proj, name=project_name)
+    eff_root = str(proj_meta.get("root_branch") or _effective_root_branch())
+    tenant_manager.ensure_branch_schema(
+        proj,
+        branch,
+        base_branch=eff_root,
+        author=author or "system",
+        has_graph=True,
+        has_doc=False,
+        record_lineage=(branch != eff_root),
+    )
+
+    db.connect()
+    db.execute("DELETE FROM projects WHERE id = ?", (project_id_key,))
+    db.execute(
+        "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip, sync_author, project_path) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            project_id_key,
+            project_name,
+            description,
+            ts,
+            ts,
+            client_ip,
+            author or "anonymous",
+            project_path,
+        ),
+    )
+
+    with tenant_context(proj, branch):
+        db.execute("DELETE FROM project_edges WHERE project_id = ?", (project_id_key,))
+        db.execute("DELETE FROM project_nodes WHERE project_id = ?", (project_id_key,))
+
+        if nodes or edges:
+            if is_multi_db_enabled():
+                t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(proj, eff_root)
+            else:
+                db.connect()
+                t_conn, t_is_pg = db.conn, db.is_postgres
+
+            node_tuples = [
+                (
+                    project_id_key,
+                    n.get("id"),
+                    n.get("kind"),
+                    n.get("name"),
+                    n.get("qualified_name"),
+                    n.get("file_path"),
+                    n.get("language"),
+                    n.get("start_line", 0),
+                    n.get("end_line", 0),
+                    n.get("docstring"),
+                    n.get("signature"),
+                    n.get("updated_at", ts),
+                )
+                for n in nodes
+            ]
+            edge_tuples = [
+                (
+                    project_id_key,
+                    e.get("id"),
+                    e.get("source"),
+                    e.get("target"),
+                    e.get("kind"),
+                    json.dumps(e.get("metadata"))
+                    if isinstance(e.get("metadata"), (dict, list))
+                    else e.get("metadata"),
+                    e.get("line"),
+                    e.get("col"),
+                )
+                for e in edges
+            ]
+
+            if t_is_pg:
+                from psycopg2.extras import execute_values
+
+                with t_conn.cursor() as cur:
+                    if node_tuples:
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO project_nodes
+                            (project_id, id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at)
+                            VALUES %s
+                            """,
+                            node_tuples,
+                        )
+                    if edge_tuples:
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO project_edges
+                            (project_id, id, source, target, kind, metadata, line, col)
+                            VALUES %s
+                            """,
+                            edge_tuples,
+                        )
+                try:
+                    if not getattr(t_conn, "autocommit", False):
+                        t_conn.commit()
+                except Exception:
+                    pass
+            else:
+                if node_tuples:
+                    t_conn.executemany(
+                        """
+                        INSERT INTO project_nodes
+                        (project_id, id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        node_tuples,
+                    )
+                if edge_tuples:
+                    t_conn.executemany(
+                        """
+                        INSERT INTO project_edges
+                        (project_id, id, source, target, kind, metadata, line, col)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        edge_tuples,
+                    )
+                try:
+                    t_conn.commit()
+                except Exception:
+                    pass
+
+    db.commit()
+    return proj_meta
+
+
 @router.get("/projects")
 async def get_projects():
     db.connect()
     try:
-        cursor = db.conn.cursor()
-        cursor.execute("SELECT id, name, description, created_at, updated_at, sync_ip, sync_author, project_path FROM projects ORDER BY name ASC;")
-        rows = cursor.fetchall()
-        
+        rows = db.fetchall(
+            "SELECT id, name, description, created_at, updated_at, sync_ip, sync_author, project_path "
+            "FROM projects ORDER BY name ASC;"
+        )
+
         projects = []
         seen_ids = set()
         for r in rows:
-            if db.is_postgres:
-                p = {
-                    "id": r[0],
-                    "name": r[1],
-                    "description": r[2],
-                    "created_at": r[3],
-                    "updated_at": r[4],
-                    "sync_ip": r[5],
-                    "sync_author": r[6],
-                    "project_path": r[7]
-                }
-            else:
-                p = dict(r)
+            p = dict(r)
             projects.append(p)
             seen_ids.add(p["id"])
-                
-        cursor.close()
+
+        # Load master catalog projects and branch schemas
+        master_proj_map: Dict[str, Dict[str, Any]] = {}
+        branches_by_proj: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            mp_rows = tenant_manager._master_fetchall(
+                "SELECT project_id, name, description, db_name, root_branch, root_schema, created_at, updated_at "
+                "FROM master_projects ORDER BY project_id ASC"
+            )
+            for mp in mp_rows:
+                pid = str(mp.get("project_id") or "")
+                if pid:
+                    master_proj_map[pid] = dict(mp)
+
+            mb_rows = tenant_manager._master_fetchall(
+                "SELECT project_id, branch_name, schema_name, base_branch, is_root, has_graph_schema, has_doc_schema, updated_at "
+                "FROM master_branches ORDER BY is_root DESC, created_at ASC"
+            )
+            for mb in mb_rows:
+                pid = str(mb.get("project_id") or "")
+                if not pid:
+                    continue
+                branches_by_proj.setdefault(pid, []).append(
+                    {
+                        "branch_name": str(mb.get("branch_name") or ""),
+                        "schema_name": str(mb.get("schema_name") or ""),
+                        "base_branch": str(mb.get("base_branch") or "main"),
+                        "is_root": bool(mb.get("is_root", False)),
+                        "has_graph_schema": bool(mb.get("has_graph_schema", False)),
+                        "has_doc_schema": bool(mb.get("has_doc_schema", False)),
+                        "updated_at": mb.get("updated_at"),
+                    }
+                )
+        except Exception as me:
+            logger.debug(f"Master catalog merge skipped: {me}")
 
         # Merge with GraphStore projects
         try:
-            from ...graphify_engine.store import get_graph_store
             store = _get_store()
             try:
                 store_projects = store.list_projects()
@@ -98,23 +272,58 @@ async def get_projects():
             now_ts = int(time.time())
             for sp in store_projects:
                 if sp not in seen_ids:
-                    projects.append({
-                        "id": sp,
-                        "name": sp,
-                        "description": f"Graphify project {sp}",
-                        "created_at": now_ts,
-                        "updated_at": now_ts,
-                        "sync_ip": "127.0.0.1",
-                        "sync_author": "system",
-                        "project_path": None
-                    })
+                    projects.append(
+                        {
+                            "id": sp,
+                            "name": sp,
+                            "description": f"Graphify project {sp}",
+                            "created_at": now_ts,
+                            "updated_at": now_ts,
+                            "sync_ip": "127.0.0.1",
+                            "sync_author": "system",
+                            "project_path": None,
+                        }
+                    )
                     seen_ids.add(sp)
         except Exception as ge:
             logger.debug(f"GraphStore project merge skipped: {ge}")
 
+        # Merge master_projects entries missing from projects / GraphStore
+        now_ts = int(time.time())
+        for pid, mp in master_proj_map.items():
+            if pid not in seen_ids:
+                projects.append(
+                    {
+                        "id": pid,
+                        "name": mp.get("name") or pid,
+                        "description": mp.get("description") or f"Project {pid}",
+                        "created_at": mp.get("created_at") or now_ts,
+                        "updated_at": mp.get("updated_at") or now_ts,
+                        "sync_ip": "127.0.0.1",
+                        "sync_author": "system",
+                        "project_path": None,
+                    }
+                )
+                seen_ids.add(pid)
+
+        eff_root = _effective_root_branch()
+        for p in projects:
+            proj_key, _ = parse_project_and_branch(p["id"], default_branch=eff_root)
+            mp = master_proj_map.get(proj_key)
+            p["db_name"] = (
+                str(mp["db_name"])
+                if mp and mp.get("db_name")
+                else sanitize_project_db_name(proj_key)
+            )
+            p["root_schema"] = (
+                str(mp["root_schema"]) if mp and mp.get("root_schema") else "pb_root"
+            )
+            p["branches"] = branches_by_proj.get(proj_key, [])
+
         return {"projects": projects}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load projects: {str(e)}")
+
 
 @router.post("/projects")
 async def create_project(req: CreateProjectRequest):
@@ -124,38 +333,94 @@ async def create_project(req: CreateProjectRequest):
     db.connect()
     ts = int(time.time())
     try:
-        cursor = db.conn.cursor()
-        if db.is_postgres:
-            cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description, updated_at=EXCLUDED.updated_at",
-                (req.id, req.name, req.description or f"Project {req.name}", ts, ts)
-            )
-        else:
-            cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name=excluded.name, description=excluded.description, updated_at=excluded.updated_at",
-                (req.id, req.name, req.description or f"Project {req.name}", ts, ts)
-            )
-        db.conn.commit()
-        cursor.close()
-        return {"status": "success", "message": f"Project {req.id} created successfully."}
+        eff_default_root = _effective_root_branch()
+        proj, branch = parse_project_and_branch(req.id, default_branch=eff_default_root)
+        desc = req.description or f"Project {req.name}"
+        proj_meta = tenant_manager.ensure_project_database(
+            proj, name=req.name, description=desc
+        )
+        eff_root = str(proj_meta.get("root_branch") or eff_default_root)
+        has_explicit_branch = ":" in req.id and branch != eff_root
+        br_meta = tenant_manager.ensure_branch_schema(
+            proj,
+            branch if has_explicit_branch else eff_root,
+            base_branch=eff_root,
+            author="system",
+            has_graph=True,
+            has_doc=True,
+            record_lineage=has_explicit_branch,
+        )
+        schema_name = str(
+            br_meta.get("schema_name")
+            or sanitize_branch_schema_for_project(branch, eff_root)
+        )
+
+        try:
+            store = _get_store()
+            try:
+                if has_explicit_branch and hasattr(store, "ensure_branch_schema"):
+                    store.ensure_branch_schema(
+                        proj, branch, author="system", base_branch=eff_root
+                    )
+                elif hasattr(store, "_get_project_store"):
+                    delegate, _ = store._get_project_store(proj)
+                    delegate.ensure_root_schema()
+                elif hasattr(store, "ensure_root_schema"):
+                    store.ensure_root_schema()
+            finally:
+                store.close()
+        except Exception as ge:
+            logger.debug(f"GraphStore project init skipped: {ge}")
+
+        db.execute(
+            "INSERT INTO projects (id, name, description, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (id) DO UPDATE SET name=excluded.name, description=excluded.description, updated_at=excluded.updated_at",
+            (req.id, req.name, desc, ts, ts),
+        )
+        db.commit()
+        return {
+            "status": "success",
+            "message": f"Project {req.id} created successfully.",
+            "project_id": req.id,
+            "db_name": proj_meta["db_name"],
+            "schema_name": schema_name,
+        }
     except Exception as e:
         if db.conn:
-            try: db.conn.rollback()
-            except: pass
+            try:
+                db.conn.rollback()
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=f"Failed to create project: {str(e)}")
+
 
 @router.delete("/projects/{project_id:path}")
 async def delete_project(project_id: str):
     import os
     if os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes"):
         raise HTTPException(status_code=403, detail="Operation not permitted: Server is running in Read-Only mode.")
-    # Also clean up GraphStore
+
+    eff_default_root = _effective_root_branch()
+    proj, branch = parse_project_and_branch(project_id, default_branch=eff_default_root)
+    proj_root = eff_default_root
     try:
-        from ...graphify_engine.store import get_graph_store
+        row = tenant_manager._master_fetchone(
+            "SELECT root_branch FROM master_projects WHERE project_id = ?",
+            (proj,),
+        )
+        if row and row.get("root_branch"):
+            proj_root = str(row["root_branch"])
+    except Exception:
+        pass
+
+    delete_branch_only = ":" in project_id and branch != proj_root
+
+    # Clean up GraphStore
+    try:
         store = _get_store()
         try:
-            proj, branch = parse_project_and_branch(project_id)
-            if branch != "main":
+            if delete_branch_only:
                 store.delete_branch(proj, branch)
             else:
                 store.delete_project(proj)
@@ -166,22 +431,41 @@ async def delete_project(project_id: str):
 
     db.connect()
     try:
-        cursor = db.conn.cursor()
-        if db.is_postgres:
-            cursor.execute("DELETE FROM project_nodes WHERE project_id = %s;", (project_id,))
-            cursor.execute("DELETE FROM project_edges WHERE project_id = %s;", (project_id,))
-            cursor.execute("DELETE FROM projects WHERE id = %s;", (project_id,))
+        if delete_branch_only:
+            try:
+                tenant_manager.drop_branch_schema(proj, branch)
+            except Exception:
+                pass
+            db.execute("DELETE FROM projects WHERE id = ?;", (project_id,))
         else:
-            cursor.execute("DELETE FROM project_nodes WHERE project_id = ?;", (project_id,))
-            cursor.execute("DELETE FROM project_edges WHERE project_id = ?;", (project_id,))
-            cursor.execute("DELETE FROM projects WHERE id = ?;", (project_id,))
-        db.conn.commit()
-        cursor.close()
+            try:
+                with tenant_context(proj, proj_root):
+                    db.execute("DELETE FROM project_nodes WHERE project_id = ?;", (project_id,))
+                    db.execute("DELETE FROM project_edges WHERE project_id = ?;", (project_id,))
+                    if proj != project_id:
+                        db.execute("DELETE FROM project_nodes WHERE project_id = ?;", (proj,))
+                        db.execute("DELETE FROM project_edges WHERE project_id = ?;", (proj,))
+            except Exception as te:
+                logger.debug(f"Tenant codegraph cleanup skipped for {proj}: {te}")
+
+            try:
+                tenant_manager.drop_project_database(proj)
+            except Exception as de:
+                logger.debug(f"Master project database drop warning for {proj}: {de}")
+
+            db.execute(
+                "DELETE FROM projects WHERE id = ? OR id = ? OR id LIKE ?;",
+                (project_id, proj, f"{proj}:%"),
+            )
+
+        db.commit()
         return {"status": "success", "message": f"Project {project_id} deleted successfully."}
     except Exception as e:
         if db.conn:
-            try: db.conn.rollback()
-            except: pass
+            try:
+                db.conn.rollback()
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=f"Failed to delete project: {str(e)}")
 
 @router.get("/diff")
@@ -221,47 +505,26 @@ async def diff_projects(base_project_id: str, target_project_id: str):
 
     db.connect()
     try:
-        cursor = db.conn.cursor()
-        
-        # Fetch base nodes
-        if db.is_postgres:
-            cursor.execute("""
-                SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature 
-                FROM project_nodes WHERE project_id = %s
-            """, (base_project_id,))
-        else:
-            cursor.execute("""
-                SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature 
-                FROM project_nodes WHERE project_id = ?
-            """, (base_project_id,))
-        base_rows = cursor.fetchall()
-        
-        # Fetch target nodes
-        if db.is_postgres:
-            cursor.execute("""
-                SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature 
-                FROM project_nodes WHERE project_id = %s
-            """, (target_project_id,))
-        else:
-            cursor.execute("""
-                SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature 
-                FROM project_nodes WHERE project_id = ?
-            """, (target_project_id,))
-        target_rows = cursor.fetchall()
-        cursor.close()
-        
-        # Helper to convert sqlite/postgres rows to dict
-        def row_to_dict(r):
-            if db.is_postgres:
-                return {
-                    "id": r[0], "kind": r[1], "name": r[2], "qualified_name": r[3],
-                    "file_path": r[4], "language": r[5], "start_line": r[6], "end_line": r[7],
-                    "docstring": r[8], "signature": r[9]
-                }
-            return dict(r)
-            
-        base_nodes = [row_to_dict(r) for r in base_rows]
-        target_nodes = [row_to_dict(r) for r in target_rows]
+        eff_root = _effective_root_branch()
+        base_proj, base_br = parse_project_and_branch(base_project_id, default_branch=eff_root)
+        target_proj, target_br = parse_project_and_branch(target_project_id, default_branch=eff_root)
+
+        with tenant_context(base_proj, base_br):
+            base_rows = db.fetchall(
+                "SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature "
+                "FROM project_nodes WHERE project_id = ?",
+                (base_project_id,),
+            )
+
+        with tenant_context(target_proj, target_br):
+            target_rows = db.fetchall(
+                "SELECT id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature "
+                "FROM project_nodes WHERE project_id = ?",
+                (target_project_id,),
+            )
+
+        base_nodes = [dict(r) for r in base_rows]
+        target_nodes = [dict(r) for r in target_rows]
         
         # Index nodes by (kind, qualified_name, file_path)
         base_map = {(n["kind"], n["qualified_name"], n["file_path"]): n for n in base_nodes}
@@ -338,21 +601,18 @@ async def get_codegraph_status(project_id: Optional[str] = None):
 
         db.connect()
         try:
-            cursor = db.conn.cursor()
-            
-            # Count nodes
-            if db.is_postgres:
-                cursor.execute("SELECT COUNT(*) FROM project_nodes WHERE project_id = %s;", (project_id,))
-                nodes_count = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM project_edges WHERE project_id = %s;", (project_id,))
-                edges_count = cursor.fetchone()[0]
-            else:
-                cursor.execute("SELECT COUNT(*) FROM project_nodes WHERE project_id = ?;", (project_id,))
-                nodes_count = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM project_edges WHERE project_id = ?;", (project_id,))
-                edges_count = cursor.fetchone()[0]
-                
-            cursor.close()
+            proj_id, branch = parse_project_and_branch(project_id, default_branch=_effective_root_branch())
+            with tenant_context(proj_id, branch):
+                n_row = db.fetchone(
+                    "SELECT COUNT(*) AS cnt FROM project_nodes WHERE project_id = ?;",
+                    (project_id,),
+                )
+                e_row = db.fetchone(
+                    "SELECT COUNT(*) AS cnt FROM project_edges WHERE project_id = ?;",
+                    (project_id,),
+                )
+            nodes_count = int((n_row or {}).get("cnt", 0))
+            edges_count = int((e_row or {}).get("cnt", 0))
             return {
                 "status": "ready",
                 "source": "server",
@@ -429,121 +689,88 @@ async def get_codegraph_data(
 
         db.connect()
         try:
-            cursor = db.conn.cursor()
-            
-            # Build node query for Server Db
-            if "%" in project_id or "_" in project_id:
-                where_clauses = ["project_id LIKE " + ("%s" if db.is_postgres else "?")]
+            proj_id, branch = parse_project_and_branch(project_id, default_branch=_effective_root_branch())
+            if "%" in proj_id:
+                ctx = tenant_context(None)
+            elif "%" in branch:
+                ctx = tenant_context(proj_id, "%")
             else:
-                where_clauses = ["project_id = " + ("%s" if db.is_postgres else "?")]
-            params = [project_id]
-            
+                ctx = tenant_context(proj_id, branch)
+
+            is_like = "%" in project_id
+            where_clauses = ["project_id LIKE ?" if is_like else "project_id = ?"]
+            params: List[Any] = [project_id]
+
             if query:
-                where_clauses.append("(name LIKE " + ("%s" if db.is_postgres else "?") + 
-                                     " OR qualified_name LIKE " + ("%s" if db.is_postgres else "?") + 
-                                     " OR file_path LIKE " + ("%s" if db.is_postgres else "?") + ")")
+                where_clauses.append("(name LIKE ? OR qualified_name LIKE ? OR file_path LIKE ?)")
                 q_param = f"%{query}%"
                 params.extend([q_param, q_param, q_param])
-                
+
             if kinds and kinds != "all":
                 kind_list = [k.strip() for k in kinds.split(",") if k.strip()]
                 if kind_list:
-                    placeholders = ",".join(["%s" if db.is_postgres else "?"] * len(kind_list))
+                    placeholders = ",".join(["?"] * len(kind_list))
                     where_clauses.append(f"kind IN ({placeholders})")
                     params.extend(kind_list)
-                    
+
             where_sql = f"WHERE {' AND '.join(where_clauses)}"
-            
             nodes_query = f"""
-                SELECT id, kind, name, qualified_name, file_path, language, 
-                       start_line, end_line, docstring, signature 
+                SELECT id, kind, name, qualified_name, file_path, language,
+                       start_line, end_line, docstring, signature
                 FROM project_nodes
                 {where_sql}
-                LIMIT {("%s" if db.is_postgres else "?")}
+                LIMIT ?
             """
-            
-            cursor.execute(nodes_query, params + [limit])
-            rows = cursor.fetchall()
-            
-            nodes = []
-            node_ids = set()
-            for r in rows:
-                if db.is_postgres:
-                    node_data = {
-                        "id": r[0], "kind": r[1], "name": r[2], "qualified_name": r[3],
-                        "file_path": r[4], "language": r[5], "start_line": r[6], "end_line": r[7],
-                        "docstring": r[8], "signature": r[9]
-                    }
-                else:
-                    node_data = dict(r)
-                nodes.append(node_data)
-                node_ids.add(node_data["id"])
-                
-            if not nodes:
-                cursor.close()
-                return {"nodes": [], "edges": []}
-                
-            # Query edges connecting to/from these nodes
-            placeholders = ",".join(["%s" if db.is_postgres else "?"] * len(node_ids))
-            edge_op = "LIKE" if ("%" in project_id or "_" in project_id) else "="
-            edges_query = f"""
-                SELECT id, source, target, kind, metadata, line, col
-                FROM project_edges
-                WHERE project_id {edge_op} {("%s" if db.is_postgres else "?")} 
-                  AND (source IN ({placeholders}) OR target IN ({placeholders}))
-                LIMIT 2000
-            """
-            
-            edge_params = [project_id] + list(node_ids) + list(node_ids)
-            cursor.execute(edges_query, edge_params)
-            rows = cursor.fetchall()
-            
-            edges = []
-            all_referenced_node_ids = set()
-            for r in rows:
-                if db.is_postgres:
-                    meta_raw = r[4]
-                    meta = json.loads(meta_raw) if meta_raw else None
-                    edge_data = {
-                        "id": r[0], "source": r[1], "target": r[2], "kind": r[3],
-                        "metadata": meta, "line": r[5], "col": r[6]
-                    }
-                else:
+
+            with ctx:
+                rows = db.fetchall(nodes_query, tuple(params + [limit]))
+                nodes = [dict(r) for r in rows]
+                node_ids = {n["id"] for n in nodes}
+
+                if not nodes:
+                    return {"nodes": [], "edges": []}
+
+                placeholders = ",".join(["?"] * len(node_ids))
+                edge_op = "LIKE" if is_like else "="
+                edges_query = f"""
+                    SELECT id, source, target, kind, metadata, line, col
+                    FROM project_edges
+                    WHERE project_id {edge_op} ?
+                      AND (source IN ({placeholders}) OR target IN ({placeholders}))
+                    LIMIT 2000
+                """
+                edge_params = tuple([project_id] + list(node_ids) + list(node_ids))
+                edge_rows = db.fetchall(edges_query, edge_params)
+
+                edges = []
+                all_referenced_node_ids = set()
+                for r in edge_rows:
                     edge_data = dict(r)
-                    if edge_data.get("metadata"):
+                    if isinstance(edge_data.get("metadata"), str) and edge_data["metadata"]:
                         try:
                             edge_data["metadata"] = json.loads(edge_data["metadata"])
-                        except:
+                        except Exception:
                             pass
-                edges.append(edge_data)
-                all_referenced_node_ids.add(edge_data["source"])
-                all_referenced_node_ids.add(edge_data["target"])
-                
-            # Fetch any missing referenced nodes (parents/connects) so they are not isolated in graph view
-            missing_node_ids = all_referenced_node_ids - node_ids
-            if missing_node_ids:
-                missing_placeholders = ",".join(["%s" if db.is_postgres else "?"] * len(missing_node_ids))
-                missing_query = f"""
-                    SELECT id, kind, name, qualified_name, file_path, language, 
-                           start_line, end_line, docstring, signature 
-                    FROM project_nodes
-                    WHERE project_id {edge_op} {("%s" if db.is_postgres else "?")}
-                      AND id IN ({missing_placeholders})
-                """
-                cursor.execute(missing_query, [project_id] + list(missing_node_ids))
-                missing_rows = cursor.fetchall()
-                for r in missing_rows:
-                    if db.is_postgres:
-                        node_data = {
-                            "id": r[0], "kind": r[1], "name": r[2], "qualified_name": r[3],
-                            "file_path": r[4], "language": r[5], "start_line": r[6], "end_line": r[7],
-                            "docstring": r[8], "signature": r[9]
-                        }
-                    else:
-                        node_data = dict(r)
-                    nodes.append(node_data)
-                    
-            cursor.close()
+                    edges.append(edge_data)
+                    all_referenced_node_ids.add(edge_data["source"])
+                    all_referenced_node_ids.add(edge_data["target"])
+
+                missing_node_ids = all_referenced_node_ids - node_ids
+                if missing_node_ids:
+                    missing_placeholders = ",".join(["?"] * len(missing_node_ids))
+                    missing_query = f"""
+                        SELECT id, kind, name, qualified_name, file_path, language,
+                               start_line, end_line, docstring, signature
+                        FROM project_nodes
+                        WHERE project_id {edge_op} ?
+                          AND id IN ({missing_placeholders})
+                    """
+                    missing_rows = db.fetchall(
+                        missing_query, tuple([project_id] + list(missing_node_ids))
+                    )
+                    for r in missing_rows:
+                        nodes.append(dict(r))
+
             return {
                 "nodes": nodes,
                 "edges": edges
@@ -669,111 +896,20 @@ async def sync_codegraph_data(req: SyncRequest, request: Request = None):
 
     
     try:
-        cursor = db.conn.cursor()
-        
-        # Dialect-safe delete and insert pattern
-        if db.is_postgres:
-            # Delete old nodes, edges and project info
-            cursor.execute("DELETE FROM project_edges WHERE project_id = %s", (req.project_id,))
-            cursor.execute("DELETE FROM project_nodes WHERE project_id = %s", (req.project_id,))
-            cursor.execute("DELETE FROM projects WHERE id = %s", (req.project_id,))
-            
-            # Insert project
-            cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip, sync_author, project_path) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts, client_ip, req.author or "anonymous", req.project_path)
-            )
-            
-            # Batch insert nodes
-            if req.nodes:
-                node_tuples = [
-                    (
-                        req.project_id, n.get("id"), n.get("kind"), n.get("name"), n.get("qualified_name"),
-                        n.get("file_path"), n.get("language"), n.get("start_line", 0), n.get("end_line", 0),
-                        n.get("docstring"), n.get("signature"), n.get("updated_at", ts)
-                    )
-                    for n in req.nodes
-                ]
-                from psycopg2.extras import execute_values
-                execute_values(
-                    cursor,
-                    """
-                    INSERT INTO project_nodes 
-                    (project_id, id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at)
-                    VALUES %s
-                    """,
-                    node_tuples
-                )
-                
-            # Batch insert edges
-            if req.edges:
-                edge_tuples = [
-                    (
-                        req.project_id, e.get("id"), e.get("source"), e.get("target"), e.get("kind"),
-                        json.dumps(e.get("metadata")) if isinstance(e.get("metadata"), (dict, list)) else e.get("metadata"),
-                        e.get("line"), e.get("col")
-                    )
-                    for e in req.edges
-                ]
-                from psycopg2.extras import execute_values
-                execute_values(
-                    cursor,
-                    """
-                    INSERT INTO project_edges 
-                    (project_id, id, source, target, kind, metadata, line, col)
-                    VALUES %s
-                    """,
-                    edge_tuples
-                )
-        else:
-            # SQLite batch insert
-            cursor.execute("DELETE FROM project_edges WHERE project_id = ?", (req.project_id,))
-            cursor.execute("DELETE FROM project_nodes WHERE project_id = ?", (req.project_id,))
-            cursor.execute("DELETE FROM projects WHERE id = ?", (req.project_id,))
-            
-            cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip, sync_author, project_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (req.project_id, req.project_name, f"Synced project {req.project_name}", ts, ts, client_ip, req.author or "anonymous", req.project_path)
-            )
-            
-            if req.nodes:
-                node_tuples = [
-                    (
-                        req.project_id, n.get("id"), n.get("kind"), n.get("name"), n.get("qualified_name"),
-                        n.get("file_path"), n.get("language"), n.get("start_line", 0), n.get("end_line", 0),
-                        n.get("docstring"), n.get("signature"), n.get("updated_at", ts)
-                    )
-                    for n in req.nodes
-                ]
-                cursor.executemany(
-                    """
-                    INSERT INTO project_nodes 
-                    (project_id, id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    node_tuples
-                )
-                
-            if req.edges:
-                edge_tuples = [
-                    (
-                        req.project_id, e.get("id"), e.get("source"), e.get("target"), e.get("kind"),
-                        json.dumps(e.get("metadata")) if isinstance(e.get("metadata"), (dict, list)) else e.get("metadata"),
-                        e.get("line"), e.get("col")
-                    )
-                    for e in req.edges
-                ]
-                cursor.executemany(
-                    """
-                    INSERT INTO project_edges 
-                    (project_id, id, source, target, kind, metadata, line, col)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    edge_tuples
-                )
-                
-        db.conn.commit()
-        cursor.close()
+        proj, branch = parse_project_and_branch(req.project_id, default_branch=_effective_root_branch())
+        proj_meta = _replace_codegraph_tables(
+            project_id_key=req.project_id,
+            proj=proj,
+            branch=branch,
+            project_name=req.project_name,
+            description=f"Synced project {req.project_name}",
+            ts=ts,
+            client_ip=client_ip,
+            author=req.author,
+            project_path=req.project_path,
+            nodes=req.nodes,
+            edges=req.edges,
+        )
 
         # Bridge into GraphStore
         try:
@@ -829,6 +965,7 @@ async def sync_codegraph_data(req: SyncRequest, request: Request = None):
         return {
             "status": "success",
             "message": f"Successfully synced project {req.project_id}",
+            "db_name": proj_meta["db_name"],
             "nodes_synced": len(req.nodes),
             "edges_synced": len(req.edges)
         }
@@ -919,105 +1056,20 @@ async def upload_codegraph_db(
     name = project_name or project_id
 
     try:
-        db_cursor = db.conn.cursor()
-        
-        if db.is_postgres:
-            db_cursor.execute("DELETE FROM project_edges WHERE project_id = %s", (project_id,))
-            db_cursor.execute("DELETE FROM project_nodes WHERE project_id = %s", (project_id,))
-            db_cursor.execute("DELETE FROM projects WHERE id = %s", (project_id,))
-            
-            db_cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip, sync_author, project_path) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (project_id, name, f"Uploaded db project {name}", ts, ts, client_ip, author or "anonymous", project_path)
-            )
-            
-            if nodes:
-                node_tuples = [
-                    (
-                        project_id, n.get("id"), n.get("kind"), n.get("name"), n.get("qualified_name"),
-                        n.get("file_path"), n.get("language"), n.get("start_line", 0), n.get("end_line", 0),
-                        n.get("docstring"), n.get("signature"), n.get("updated_at", ts)
-                    )
-                    for n in nodes
-                ]
-                from psycopg2.extras import execute_values
-                execute_values(
-                    db_cursor,
-                    """
-                    INSERT INTO project_nodes 
-                    (project_id, id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at)
-                    VALUES %s
-                    """,
-                    node_tuples
-                )
-                
-            if edges:
-                edge_tuples = [
-                    (
-                        project_id, e.get("id"), e.get("source"), e.get("target"), e.get("kind"),
-                        json.dumps(e.get("metadata")) if isinstance(e.get("metadata"), (dict, list)) else e.get("metadata"),
-                        e.get("line"), e.get("col")
-                    )
-                    for e in edges
-                ]
-                from psycopg2.extras import execute_values
-                execute_values(
-                    db_cursor,
-                    """
-                    INSERT INTO project_edges 
-                    (project_id, id, source, target, kind, metadata, line, col)
-                    VALUES %s
-                    """,
-                    edge_tuples
-                )
-        else:
-            db_cursor.execute("DELETE FROM project_edges WHERE project_id = ?", (project_id,))
-            db_cursor.execute("DELETE FROM project_nodes WHERE project_id = ?", (project_id,))
-            db_cursor.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-            
-            db_cursor.execute(
-                "INSERT INTO projects (id, name, description, created_at, updated_at, sync_ip, sync_author, project_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (project_id, name, f"Uploaded db project {name}", ts, ts, client_ip, author or "anonymous", project_path)
-            )
-            
-            if nodes:
-                node_tuples = [
-                    (
-                        project_id, n.get("id"), n.get("kind"), n.get("name"), n.get("qualified_name"),
-                        n.get("file_path"), n.get("language"), n.get("start_line", 0), n.get("end_line", 0),
-                        n.get("docstring"), n.get("signature"), n.get("updated_at", ts)
-                    )
-                    for n in nodes
-                ]
-                db_cursor.executemany(
-                    """
-                    INSERT INTO project_nodes 
-                    (project_id, id, kind, name, qualified_name, file_path, language, start_line, end_line, docstring, signature, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    node_tuples
-                )
-                
-            if edges:
-                edge_tuples = [
-                    (
-                        project_id, e.get("id"), e.get("source"), e.get("target"), e.get("kind"),
-                        json.dumps(e.get("metadata")) if isinstance(e.get("metadata"), (dict, list)) else e.get("metadata"),
-                        e.get("line"), e.get("col")
-                    )
-                    for e in edges
-                ]
-                db_cursor.executemany(
-                    """
-                    INSERT INTO project_edges 
-                    (project_id, id, source, target, kind, metadata, line, col)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    edge_tuples
-                )
-                
-        db.conn.commit()
-        db_cursor.close()
+        proj, branch = parse_project_and_branch(project_id, default_branch=_effective_root_branch())
+        proj_meta = _replace_codegraph_tables(
+            project_id_key=project_id,
+            proj=proj,
+            branch=branch,
+            project_name=name,
+            description=f"Uploaded db project {name}",
+            ts=ts,
+            client_ip=client_ip,
+            author=author,
+            project_path=project_path,
+            nodes=nodes,
+            edges=edges,
+        )
 
         # Bridge into GraphStore
         try:
@@ -1073,6 +1125,7 @@ async def upload_codegraph_db(
         return {
             "status": "success",
             "message": f"Successfully imported uploaded codegraph database for project {project_id}",
+            "db_name": proj_meta["db_name"],
             "nodes_synced": len(nodes),
             "edges_synced": len(edges)
         }

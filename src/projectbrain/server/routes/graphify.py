@@ -63,6 +63,28 @@ def _check_read_only() -> None:
         )
 
 
+def _resolve_project_db_name(project_id: str) -> str:
+    """Resolve the physical Project DB identifier registered in Master catalog (or deterministic fallback)."""
+    from ...core.tenant_manager import (
+        _effective_root_branch,
+        parse_tenant_from_user_id,
+        sanitize_project_db_name,
+        tenant_manager,
+    )
+
+    clean_proj = parse_tenant_from_user_id(project_id, default_branch=_effective_root_branch())[0]
+    try:
+        row = tenant_manager._master_fetchone(
+            "SELECT db_name FROM master_projects WHERE project_id = ?",
+            (clean_proj,),
+        )
+        if row and row.get("db_name"):
+            return str(row["db_name"])
+    except Exception:
+        pass
+    return sanitize_project_db_name(clean_proj)
+
+
 def _validate_local_path(local_path: Optional[str]) -> Optional[str]:
     """Validate that local_path is within the workspace root to prevent path traversal."""
     if not local_path:
@@ -249,6 +271,9 @@ async def sync_graph(req: SyncBranchRequest, request: Request = None):
             project_path=req.project_path,
         )
 
+        if isinstance(res, dict) and not res.get("db_name"):
+            res["db_name"] = _resolve_project_db_name(req.project_id)
+
         return res
     except Exception as e:
         logger.error(f"Failed to sync graph for {req.project_id}:{req.branch}: {e}", exc_info=True)
@@ -425,7 +450,11 @@ async def list_branches(project_id: str):
         store = _get_store()
         try:
             branches = store.list_branches(project_id)
-            return {"project_id": project_id, "branches": branches}
+            db_name = next(
+                (str(b["db_name"]) for b in branches if isinstance(b, dict) and b.get("db_name")),
+                None,
+            ) or _resolve_project_db_name(project_id)
+            return {"project_id": project_id, "db_name": db_name, "branches": branches}
         finally:
             store.close()
     except Exception as e:
