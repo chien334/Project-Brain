@@ -12,7 +12,7 @@ ProjectBrain v3.0 unifies zero-token AST code graphs, multi-branch PostgreSQL/SQ
 ## Key Capabilities
 
 - **Hybrid Graphify Memory Core**: Replaces legacy codegraph workflows with zero-token Tree-sitter AST extraction across 22+ languages (`GraphifyExtractor`), Leiden community clustering, SHA256 incremental caching, and a **3-Tier Hybrid Resolver** merging `Local Partial (.projectbrain/local_graph/) -> Server Branch Overlay -> Server Root` while preserving legacy Vis.js Web UI graph compatibility.
-- **PostgreSQL Multi-Schema Branch Overlay & `O(Delta)` Diff**: Canonical `pb_root` schema paired with isolated per-branch `pb_br_*` upsert/tombstone delta schemas and virtual SQL resolution views (`v_resolved_*`), plus an automatic SQLite CTE fallback for zero-infrastructure local workspaces.
+- **3-Tier Multi-DB & Per-Branch Schema Isolation (`Master DB -> Project DB -> Branch Schema`)**: Global Master Control-Plane DB (`master_projects`, `master_branches`, IAM/auth) routes each project to a dedicated physical Project Database (`pb_proj_<slug>_<hash8>` in PostgreSQL via `CREATE DATABASE` or `<master_dir>/pb_projects/<db_name>/` in SQLite), and isolates every branch into its own schema (`pb_root` for `main` / `PB_ROOT_BRANCH`, `pb_br_<slug>_<hash8>` for feature branches) across **both Graphify code/doc graphs and HSG Documents/Memories** with virtual SQL resolution views (`v_resolved_*`) and `O(Delta)` diffing.
 - **Multimodal Document Push & Tight Code–Doc Unified KB**: Local parsing for PDF, DOCX, XLSX, PPTX, CSV, Markdown, and offline **PaddleOCR / RapidOCR / Local AI Vision** (`pip install -e ".[ocr-cpu]"` / `".[ocr-gpu]"` / `".[ocr-onnx]"` / `".[ocr-onnx-gpu]"`) pushed to MCP/REST with unit-level versioning and pre-OCR delta reuse; deterministic Wiki, DOCX, XLSX, and PPTX synthesis; `H1 > H2 > H3` hierarchical chunking into HSG cognitive memory + waypoints; bidirectional `Code <-> Doc <-> Endpoint <-> Test` linking and drift detection.
 - **100% Plugin-Driven Microkernel & v3.0 Multi-Device / Embedded Testing Layer 1**: `PluginRegistry` coordinates **26 built-in plugins across 9 categories** (`graph_backend`, `vector_backend`, `etl_parser`, `knowledge_linker`, `doc_exporter`, `script_cache`, `artifact_store`, `brain_consumer`, `webhook`):
   - **Storage & Search**: SQLite Overlay, PostgreSQL Multi-Schema, Neo4j Flow Graph, HSG Memory, and Qdrant hybrid vector backends.
@@ -41,9 +41,10 @@ flowchart TB
         L1["v3.0 Testing Layer 1\nETL · Flow Graph · UDCP Cache · Telemetry\nPlanner · Oracle · RCA"]
     end
 
-    subgraph Stores["Pluggable Storage & Telemetry Backends"]
-        PG["PostgreSQL Multi-Schema\n(pb_root + pb_br_* + v_resolved_*)"]
-        SQL["SQLite Local Overlay\n(CTE Fallback)"]
+    subgraph Stores["3-Tier Pluggable Storage & Telemetry Backends"]
+        MSTR["Master Control-Plane DB\n(IAM · master_projects · master_branches)"]
+        PG["PostgreSQL Per-Project DB (pb_proj_*)\n(pb_root + pb_br_* + v_resolved_*)"]
+        SQL["SQLite Per-Project Dir (pb_projects/pb_proj_*)\n(pb_root.sqlite · pb_br_*.sqlite · graph.sqlite)"]
         VEC["Qdrant / HSG Vector Store"]
         NEO["Neo4j Flow Graph"]
         RED["Redis Script Cache"]
@@ -56,6 +57,7 @@ flowchart TB
     API --> MCP
     API --> Kernel
     MCP --> Kernel
+    API --> MSTR
     GF --> PG
     GF --> SQL
     GF --> NEO
@@ -67,6 +69,12 @@ flowchart TB
     L1 --> RED
     L1 --> MIN
 ```
+
+### 3-Tier Storage Topology (`Master DB -> Project DB -> Branch Schema`)
+
+1. **Tier 1 — Master Control-Plane DB**: Stores global IAM/RBAC, migrations, and the `master_projects` / `master_branches` topology catalog (inspectable via `GET /master/topology` and FastMCP `projectbrain_database_topology`).
+2. **Tier 2 — 1 Project = 1 Physical Database (`pb_proj_<slug>_<hash8>`)**: Provisioned on demand via `POST /master/projects` or `POST /codegraph/projects` (`CREATE DATABASE` on PostgreSQL; `<master_db_dir>/pb_projects/<db_name>/` on SQLite with `graph.sqlite` + branch `.sqlite` files).
+3. **Tier 3 — 1 Branch = 1 Schema (`pb_root` / `pb_br_<slug>_<hash8>`)**: Each branch isolates **both Graphify AST/Doc graphs and HSG Documents/Memories** (`POST /master/projects/{id}/branches`, `DELETE /master/projects/{id}/branches/{branch}`), while preserving cross-schema delta reuse (`reused_units`) and `O(Delta)` branch resolution (`v_resolved_*`).
 
 ## Installation & Quick Start
 
