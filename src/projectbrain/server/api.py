@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 import json
 import logging
@@ -249,10 +249,14 @@ def create_app() -> FastAPI:
         path = request.url.path
         normalized_path = path.rstrip("/") or "/"
 
-        # Exempt public/auth/docs/dashboard/MCP endpoints
+        # Exempt public/auth/docs/Web UI/MCP endpoints
         if (
             normalized_path
             in (
+                "/",
+                "/login",
+                "/register",
+                "/app",
                 "/health",
                 "/auth/config",
                 "/auth/login",
@@ -265,6 +269,8 @@ def create_app() -> FastAPI:
             )
             or path.startswith("/docs/")
             or path.startswith("/redoc/")
+            or path.startswith("/app/")
+            or path.startswith("/static/")
             or path.startswith("/dashboard")
             or path.startswith("/mcp")
         ):
@@ -621,11 +627,57 @@ def create_app() -> FastAPI:
     app.mount("/mcp-http", mcp_server.streamable_http_app())
     logger.info("Mounted MCP SSE app at /mcp and Streamable HTTP app at /mcp-http")
 
-    # Serve static dashboard
+    # Serve static assets and clean multi-route SPA pages
     static_path = Path(__file__).parent / "static"
     if static_path.exists():
-        app.mount("/dashboard", StaticFiles(directory=str(static_path), html=True), name="dashboard")
-        logger.info("Mounted static dashboard at /dashboard")
+        static_root = static_path.resolve()
+        index_html_path = static_root / "index.html"
+
+        def _serve_spa_or_static(route_path: str) -> FileResponse:
+            clean_rel = (route_path or "").lstrip("/")
+            if clean_rel:
+                candidate = (static_root / clean_rel).resolve()
+                if candidate.is_relative_to(static_root) and candidate.is_file():
+                    return FileResponse(str(candidate))
+            return FileResponse(str(index_html_path))
+
+        def _redirect_to_overview(request: Request) -> RedirectResponse:
+            target = "/app/overview"
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            return RedirectResponse(url=target, status_code=307)
+
+        app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
+
+        @app.get("/", include_in_schema=False)
+        async def root_redirect(request: Request):
+            return _redirect_to_overview(request)
+
+        @app.get("/login", include_in_schema=False)
+        async def spa_login():
+            return FileResponse(str(index_html_path))
+
+        @app.get("/register", include_in_schema=False)
+        async def spa_register():
+            return FileResponse(str(index_html_path))
+
+        @app.get("/app", include_in_schema=False)
+        async def app_root_redirect(request: Request):
+            return _redirect_to_overview(request)
+
+        @app.get("/app/{route_path:path}", include_in_schema=False)
+        async def app_spa(route_path: str):
+            return _serve_spa_or_static(route_path)
+
+        @app.get("/dashboard", include_in_schema=False)
+        async def dashboard_root():
+            return FileResponse(str(index_html_path))
+
+        @app.get("/dashboard/{route_path:path}", include_in_schema=False)
+        async def dashboard_spa(route_path: str):
+            return _serve_spa_or_static(route_path)
+
+        logger.info("Mounted static assets at /static and SPA routes at /, /login, /register, /app, /dashboard")
     else:
         logger.warning(f"Static directory not found at {static_path}, dashboard mount skipped.")
 
