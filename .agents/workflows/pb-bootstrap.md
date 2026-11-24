@@ -17,7 +17,8 @@ Initialize or repair the ProjectBrain Multi-Source Hub for the current workspace
    ```text
    projectbrain_discover_workspace_sources(workspace_root=".")
    ```
-   Inspect detected `sources` (e.g., `backend`, `frontend`, `worker`, `infra`) and `shared_docs` (specs, OpenAPI, ADRs, READMEs).
+   Inspect detected `sources` (e.g., `backend`, `frontend`, `worker`, `infra`, or legacy `win_service`, `desktop_client`, `native_lib`, `plc_st`) and `shared_docs` (specs, OpenAPI, ADRs, READMEs).
+   - **Legacy / Industrial / Japanese Workspaces**: `discover_workspace_sources` & `bootstrap_project_hub` also auto-detect `.sln` solutions and `.vcxproj` / `.vcproj` / `.csproj` / `.vbproj` child projects (with `depends_on` edges), PLC Structured Text / LASAL (`.lcp`, `.lxp`, `*.st`, `*.scl`, `*.pou`), VB6 (`.vbp`), Delphi (`.dpr`, `.dproj`), Qt (`.pro`), `CMakeLists.txt`, and `Makefile`, while `legacy_encoding.py` automatically decodes Japanese **CP932 / Shift-JIS**, **EUC-JP**, and **UTF-16 LE/BE** (`.rc`, `.reg`, `.def`, `.idl`, `.st`) without garbling comments.
 3. **Bootstrap the Multi-Source Hub**:
    ```text
    projectbrain_bootstrap_project_hub(

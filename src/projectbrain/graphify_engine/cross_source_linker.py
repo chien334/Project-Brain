@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
@@ -29,6 +30,7 @@ from projectbrain.core.tenant_manager import (
     parse_tenant_from_user_id,
     tenant_manager,
 )
+from projectbrain.graphify_engine.legacy_encoding import read_text_with_encoding
 
 logger = logging.getLogger("cross_source_linker")
 
@@ -47,6 +49,43 @@ _WALK_EXTENSIONS: Set[str] = {
     ".proto",
     ".md",
     ".sql",
+    # Legacy C/C++, C#, Windows IPC/COM/RC/DEF, VB6, Delphi, COBOL, VS projects, PLC/LASAL
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".cc",
+    ".cxx",
+    ".inl",
+    ".tpp",
+    ".cs",
+    ".vb",
+    ".idl",
+    ".def",
+    ".rc",
+    ".reg",
+    ".bat",
+    ".cmd",
+    ".vcxproj",
+    ".vcproj",
+    ".csproj",
+    ".vbproj",
+    ".sln",
+    ".st",
+    ".scl",
+    ".exp",
+    ".pou",
+    ".lcp",
+    ".lxp",
+    ".bas",
+    ".cls",
+    ".frm",
+    ".vbp",
+    ".pas",
+    ".dfm",
+    ".dpr",
+    ".cbl",
+    ".cob",
 }
 
 _SKIP_DIRS: Set[str] = {
@@ -145,8 +184,51 @@ _DOC_STOP_TOKENS: Set[str] = {
     "any",
 }
 
-_BACKEND_EXTS: Set[str] = {".py", ".go", ".java", ".sql", ".proto", ".yaml", ".yml", ".json"}
+_BACKEND_EXTS: Set[str] = {
+    ".py",
+    ".go",
+    ".java",
+    ".sql",
+    ".proto",
+    ".yaml",
+    ".yml",
+    ".json",
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".cc",
+    ".cxx",
+    ".idl",
+    ".def",
+    ".st",
+    ".scl",
+    ".exp",
+    ".pou",
+    ".lcp",
+    ".lxp",
+    ".cs",
+}
 _FRONTEND_EXTS: Set[str] = {".ts", ".tsx", ".js", ".jsx"}
+
+_CPP_CS_EXTS: Set[str] = {".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".inl", ".tpp", ".cs", ".vb"}
+_ST_LASAL_EXTS: Set[str] = {".st", ".scl", ".exp", ".pou", ".lcp", ".lxp"}
+_VB6_DELPHI_EXTS: Set[str] = {".bas", ".cls", ".frm", ".pas"}
+_VS_PROJ_EXTS: Set[str] = {".vcxproj", ".vcproj", ".csproj", ".vbproj"}
+
+_CPP_TOKEN_STOPWORDS: Set[str] = {
+    "int", "void", "char", "bool", "true", "false", "null", "nullptr", "const", "static",
+    "return", "struct", "class", "enum", "typedef", "public", "private", "protected",
+    "virtual", "override", "inline", "extern", "dword", "word", "byte", "handle",
+    "hmodule", "hwnd", "lparam", "wparam", "lresult", "hresult", "lpwstr", "lpcwstr",
+    "lpstr", "lpcstr", "size_t", "uint32_t", "int32_t", "uint16_t", "uint8_t",
+    "include", "define", "ifdef", "ifndef", "endif", "pragma", "using", "namespace",
+    "string", "wstring", "std", "sizeof", "winapi", "stdcall", "cdecl", "callback",
+    "invalid_handle_value", "open_existing", "generic_read", "generic_write",
+    "page_readwrite", "file_map_all_access", "pipe_access_duplex", "pipe_type_message",
+}
+
+_LOCAL_SOCKET_HOSTS: Set[str] = {"", "localhost", "127.0.0.1", "0.0.0.0", "::1", "::"}
 
 
 def _sha256_json(payload: Any) -> str:
@@ -272,6 +354,271 @@ def _extract_balanced_block(text: str, open_idx: int, open_ch: str = "{", close_
 def _strip_c_comments(text: str) -> str:
     no_block = re.sub(r"/\*[\s\S]*?\*/", "", text)
     return re.sub(r"//[^\n]*", "", no_block)
+
+
+def _strip_comments_string_aware(
+    text: str,
+    *,
+    line_prefixes: Tuple[str, ...] = ("//",),
+    block_pairs: Tuple[Tuple[str, str], ...] = (("/*", "*/"),),
+    backslash_escapes: bool = True,
+) -> str:
+    """Strip comments outside string literals while preserving line structure."""
+    out: List[str] = []
+    n = len(text)
+    i = 0
+    block_close: Optional[str] = None
+    in_line = False
+    quote_ch: Optional[str] = None
+
+    while i < n:
+        ch = text[i]
+        if block_close is not None:
+            if text.startswith(block_close, i):
+                out.append(" ")
+                i += len(block_close)
+                block_close = None
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+        elif in_line:
+            if ch == "\n":
+                out.append("\n")
+                in_line = False
+            else:
+                out.append(" ")
+            i += 1
+        elif quote_ch is not None:
+            if backslash_escapes and ch == "\\" and i + 1 < n:
+                out.append(ch + text[i + 1])
+                i += 2
+            elif ch == quote_ch:
+                if not backslash_escapes and i + 1 < n and text[i + 1] == quote_ch:
+                    out.append(ch + ch)
+                    i += 2
+                else:
+                    out.append(ch)
+                    quote_ch = None
+                    i += 1
+            else:
+                out.append(ch)
+                i += 1
+        else:
+            matched_block = False
+            for open_tok, close_tok in block_pairs:
+                if text.startswith(open_tok, i):
+                    out.append(" ")
+                    block_close = close_tok
+                    i += len(open_tok)
+                    matched_block = True
+                    break
+            if matched_block:
+                continue
+
+            matched_line = False
+            for pref in line_prefixes:
+                if text.startswith(pref, i):
+                    out.append(" ")
+                    in_line = True
+                    i += len(pref)
+                    matched_line = True
+                    break
+            if matched_line:
+                continue
+
+            if ch in ('"', "'"):
+                quote_ch = ch
+            out.append(ch)
+            i += 1
+
+    return "".join(out)
+
+
+def _split_top_level_args(arg_str: str) -> List[str]:
+    """Split C/C++/C# call arguments at top-level commas."""
+    args: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    quote_ch: Optional[str] = None
+    i = 0
+    n = len(arg_str)
+    while i < n:
+        ch = arg_str[i]
+        if quote_ch is not None:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < n:
+                buf.append(arg_str[i + 1])
+                i += 2
+                continue
+            if ch == quote_ch:
+                quote_ch = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            quote_ch = ch
+            buf.append(ch)
+        elif ch in ("(", "[", "{"):
+            depth += 1
+            buf.append(ch)
+        elif ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            args.append("".join(buf).strip())
+            buf.clear()
+        else:
+            buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def _unwrap_c_string_literal(expr: str) -> Optional[str]:
+    """Unwrap C/C++/C# string literal wrappers like `L"..."`, `@"..."`, `_T("...")`, `TEXT("...")`."""
+    s = str(expr or "").strip()
+    m_wrap = re.match(r"^(?:_T|TEXT|_TEXT)\s*\(\s*(.+)\s*\)$", s)
+    if m_wrap:
+        s = m_wrap.group(1).strip()
+    m_lit = re.match(r'^(?:u8|u|U|L|@|\$@|@\$)?("(?:[^"\\]|\\.)*")$', s, re.DOTALL)
+    if m_lit:
+        inner = m_lit.group(1)[1:-1]
+        return inner
+    m_raw = re.match(r'^R"[^(]*\(([\s\S]*)\)[^"]*"$', s)
+    if m_raw:
+        return m_raw.group(1)
+    return None
+
+
+def _extract_const_map(clean_text: str) -> Dict[str, str]:
+    """Extract `#define` and `const`/`constexpr`/`static` string and numeric constants."""
+    consts: Dict[str, str] = {}
+    for m in re.finditer(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\s+([^\n]+)", clean_text, re.MULTILINE):
+        name = m.group(1)
+        val = m.group(2).strip()
+        lit = _unwrap_c_string_literal(val)
+        consts[name] = lit if lit is not None else val.strip("()")
+
+    for m in re.finditer(
+        r"\b(?:const|constexpr|static|readonly|final)\b[^;=\n]*\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;\n]+);",
+        clean_text,
+    ):
+        name = m.group(1)
+        val = m.group(2).strip()
+        lit = _unwrap_c_string_literal(val)
+        consts[name] = lit if lit is not None else val.strip("()")
+    return consts
+
+
+def _resolve_str_arg(raw_arg: str, const_map: Dict[str, str]) -> Optional[str]:
+    """Resolve a call argument to its string value via literal unwrapping or `const_map`."""
+    lit = _unwrap_c_string_literal(raw_arg)
+    if lit is not None:
+        return lit
+    ident = str(raw_arg or "").strip()
+    if ident in const_map:
+        val = const_map[ident]
+        lit2 = _unwrap_c_string_literal(val)
+        return lit2 if lit2 is not None else val
+    return None
+
+
+def _normalize_pipe_name(raw: str) -> Optional[Tuple[str, str]]:
+    """Normalize a Windows Named Pipe path into `(norm_key, display_name)`."""
+    s = str(raw or "").strip().strip('"\'`')
+    if not s:
+        return None
+    m = re.search(r"(?:\\\\|\\)+\.(?:\\\\|\\)+pipe(?:\\\\|\\)+([A-Za-z0-9_.\-/\\]+)$", s, re.IGNORECASE)
+    if m:
+        leaf = m.group(1).replace("\\\\", "/").replace("\\", "/").strip("/")
+    elif "/" not in s and "\\" not in s and re.fullmatch(r"[A-Za-z0-9_.\-]+", s):
+        # C# NamedPipeServerStream("MyLegacyPipe") style bare pipe name
+        leaf = s
+    else:
+        return None
+    if not leaf:
+        return None
+    display = "\\\\.\\pipe\\" + leaf.replace("/", "\\")
+    return leaf.lower(), display
+
+
+def _normalize_shm_name(raw: str, *, allow_unscoped: bool = False) -> Optional[Tuple[str, str]]:
+    """Normalize `Global\\...` / `Local\\...` shared memory names into `(norm_key, display_name)`."""
+    s = str(raw or "").strip().strip('"\'`')
+    if not s or s.upper() in ("NULL", "NULLPTR", "0"):
+        return None
+    m = re.match(r"^(Global|Local)(?:\\\\|\\)+([A-Za-z0-9_.\-/]+)$", s, re.IGNORECASE)
+    if m:
+        scope = m.group(1).lower()
+        name = m.group(2).strip()
+        return f"{scope}/{name.lower()}", f"{m.group(1).capitalize()}\\{name}"
+    if allow_unscoped and re.fullmatch(r"[A-Za-z0-9_.\-]+", s):
+        return f"unscoped/{s.lower()}", s
+    return None
+
+
+def _normalize_uuid(raw: str) -> Optional[str]:
+    """Normalize a COM/IDL UUID/GUID string to lowercase hyphenated form."""
+    m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", str(raw or ""))
+    return m.group(1).lower() if m else None
+
+
+def _normalize_dll_stem(raw: str) -> Optional[Tuple[str, str]]:
+    """Normalize a DLL/LIB path or name into `(norm_stem, display_filename)`."""
+    s = str(raw or "").strip().strip('"\'`')
+    if not s:
+        return None
+    leaf = s.replace("\\\\", "/").replace("\\", "/").split("/")[-1].strip()
+    if not leaf:
+        return None
+    stem = re.sub(r"\.(?:dll|lib|so|dylib)$", "", leaf, flags=re.IGNORECASE)
+    if not stem or not re.match(r"^[A-Za-z0-9_.\-]+$", stem):
+        return None
+    return stem.lower(), leaf
+
+
+def _normalize_win32_msg_expr(raw: str, const_map: Optional[Dict[str, str]] = None) -> Optional[Tuple[str, str]]:
+    """Normalize a Win32 message identifier (`WM_COPYDATA`, `WM_USER + N`, `WM_APP + N`)."""
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    if const_map and s in const_map:
+        s = const_map[s]
+    s_clean = re.sub(r"\s+", " ", s.strip("() "))
+    low = s_clean.lower()
+    if low in ("wm_copydata", "0x004a", "0x4a", "74"):
+        return "wm_copydata", "WM_COPYDATA"
+    m_off = re.fullmatch(r"(WM_USER|WM_APP)\s*\+\s*(\d+|0x[0-9a-fA-F]+)", s_clean, re.IGNORECASE)
+    if m_off:
+        base = m_off.group(1).upper()
+        off_raw = m_off.group(2)
+        off_int = int(off_raw, 16) if off_raw.lower().startswith("0x") else int(off_raw)
+        return f"{base.lower()}+{off_int}", f"{base} + {off_int}"
+    if re.fullmatch(r"WM_[A-Z0-9_]+", s_clean) and s_clean not in (
+        "WM_CLOSE", "WM_DESTROY", "WM_PAINT", "WM_CREATE", "WM_COMMAND", "WM_SIZE", "WM_INITDIALOG", "WM_TIMER",
+    ):
+        return s_clean.lower(), s_clean
+    return None
+
+
+def _parse_cpp_struct_fields(body: str) -> List[Tuple[str, str]]:
+    """Parse C/C++/C# struct fields into `(field_name, field_type)` pairs."""
+    fields: List[Tuple[str, str]] = []
+    for raw_stmt in body.split(";"):
+        stmt = " ".join(raw_stmt.strip().split())
+        if not stmt or "{" in stmt or "}" in stmt or "(" in stmt:
+            continue
+        stmt = re.sub(r"\s*:\s*\d+\s*$", "", stmt)
+        stmt = re.sub(r"^(?:public|private|protected|internal|readonly|volatile)\s+", "", stmt)
+        m = re.match(r"^(.+?)\s+([*&\s]*[A-Za-z_][A-Za-z0-9_]*)\s*(\[[^\]]*\])?$", stmt)
+        if m:
+            ftype = m.group(1).strip()
+            fname = m.group(2).lstrip("*& ").strip()
+            arr = (m.group(3) or "").strip()
+            if fname and ftype not in ("typedef", "struct", "union", "enum", "class"):
+                fields.append((fname, f"{ftype}{arr}".strip()))
+    return fields
 
 
 def _is_relevant_api_path(raw_path: str) -> bool:
@@ -1471,6 +1818,1498 @@ class CrossSourceLinker:
                 )
         return artifacts
 
+    # ------------------------------------------------------------------
+    # Legacy Windows Session 0 IPC, COM/IDL, DLL, Socket & PLC/LASAL Extractors
+    # ------------------------------------------------------------------
+    def _extract_from_cpp_cs_legacy(
+        self,
+        content: str,
+        rel_path: str,
+        ext: str,
+        project_id: str,
+        source_id: str,
+        branch: str,
+        sync_gen: int,
+    ) -> List[Dict[str, Any]]:
+        artifacts: List[Dict[str, Any]] = []
+        clean = _strip_comments_string_aware(content)
+        const_map = _extract_const_map(clean)
+        lang = "csharp" if ext == ".cs" else ("vbnet" if ext == ".vb" else "cpp")
+
+        # 1. C/C++/C# Structs -> schema_def (also used to hash shared memory structs)
+        struct_sigs: Dict[str, Tuple[str, List[Tuple[str, str]]]] = {}
+        for m in re.finditer(
+            r"\btypedef\s+struct(?:\s+__declspec\s*\([^)]*\))?(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\s*\{",
+            clean,
+        ):
+            open_b = m.end() - 1
+            body = _extract_balanced_block(clean, open_b, "{", "}")
+            end_pos = open_b + 1 + len(body) + 1
+            tail = clean[end_pos : end_pos + 160].split(";", 1)[0]
+            aliases = [
+                a.strip().lstrip("*&")
+                for a in tail.split(",")
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", a.strip().lstrip("*&"))
+            ]
+            name = next((a for a in aliases if not a.startswith(("P", "LP"))), None) or (
+                aliases[0] if aliases else (m.group(1) or "")
+            )
+            fields = _parse_cpp_struct_fields(body)
+            if name and fields:
+                sig_hash = _schema_signature_hash(fields)
+                struct_sigs[name] = (sig_hash, fields)
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="schema_def",
+                        role="provider",
+                        normalized_key=_normalize_schema_key(name),
+                        file_path=rel_path,
+                        symbol_name=name,
+                        signature_hash=sig_hash,
+                        metadata={
+                            "schema_name": name,
+                            "fields": [{"name": n, "type": t} for n, t in sorted(fields)],
+                            "language": lang,
+                        },
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        for m in re.finditer(
+            r"\bstruct(?:\s+(?:__declspec\s*\([^)]*\)|[A-Z0-9_]+(?:_API|_EXPORT)))*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{",
+            clean,
+        ):
+            name = m.group(1)
+            if name in struct_sigs:
+                continue
+            body = _extract_balanced_block(clean, m.end() - 1, "{", "}")
+            fields = _parse_cpp_struct_fields(body)
+            if name and fields:
+                sig_hash = _schema_signature_hash(fields)
+                struct_sigs[name] = (sig_hash, fields)
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="schema_def",
+                        role="provider",
+                        normalized_key=_normalize_schema_key(name),
+                        file_path=rel_path,
+                        symbol_name=name,
+                        signature_hash=sig_hash,
+                        metadata={
+                            "schema_name": name,
+                            "fields": [{"name": n, "type": t} for n, t in sorted(fields)],
+                            "language": lang,
+                        },
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        # 2. Named Pipes (`named_pipe` -> `calls_pipe`)
+        emitted_pipes: Set[Tuple[str, str]] = set()
+
+        def _emit_pipe(role: str, raw_pipe: str, api_name: str) -> None:
+            norm = _normalize_pipe_name(raw_pipe)
+            if not norm:
+                return
+            nkey, disp = norm
+            if (role, nkey) in emitted_pipes:
+                return
+            emitted_pipes.add((role, nkey))
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="named_pipe",
+                    role=role,
+                    normalized_key=nkey,
+                    file_path=rel_path,
+                    symbol_name=disp,
+                    metadata={
+                        "pipe_name": disp,
+                        "pipe_leaf": nkey,
+                        "api": api_name,
+                        "language": lang,
+                        "doc_tokens": [nkey, disp.lower(), f"\\\\.\\pipe\\{nkey}"],
+                    },
+                    sync_generation=sync_gen,
+                )
+            )
+
+        for m in re.finditer(
+            r"\b(CreateNamedPipe(?:A|W)?|CallNamedPipe(?:A|W)?|WaitNamedPipe(?:A|W)?|CreateFile(?:A|W)?|NamedPipeServerStream|NamedPipeClientStream)\s*\(",
+            clean,
+        ):
+            api = m.group(1)
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            if not args:
+                continue
+            if api.startswith("CreateNamedPipe") or api == "NamedPipeServerStream":
+                val = _resolve_str_arg(args[0], const_map)
+                if val:
+                    _emit_pipe("provider", val, api)
+            elif api.startswith(("CallNamedPipe", "WaitNamedPipe")):
+                val = _resolve_str_arg(args[0], const_map)
+                if val:
+                    _emit_pipe("consumer", val, api)
+            elif api.startswith("CreateFile"):
+                val = _resolve_str_arg(args[0], const_map)
+                if val and "pipe" in val.lower():
+                    _emit_pipe("consumer", val, api)
+            elif api == "NamedPipeClientStream":
+                cand_arg = args[1] if len(args) >= 2 and (_resolve_str_arg(args[0], const_map) in (".", "localhost", "127.0.0.1")) else args[0]
+                val = _resolve_str_arg(cand_arg, const_map)
+                if val:
+                    _emit_pipe("consumer", val, api)
+
+        has_pipe_srv = bool(re.search(r"\b(?:CreateNamedPipe|ConnectNamedPipe|NamedPipeServerStream)", clean))
+        has_pipe_cli = bool(re.search(r"\b(?:CallNamedPipe|WaitNamedPipe|TransactNamedPipe|NamedPipeClientStream|CreateFile)", clean))
+        if has_pipe_srv or has_pipe_cli:
+            for pm in re.finditer(r'["\']((?:\\\\|\\)+\.(?:\\\\|\\)+pipe(?:\\\\|\\)+[^"\']+)["\']', clean, re.IGNORECASE):
+                if has_pipe_srv:
+                    _emit_pipe("provider", pm.group(1), "pipe_literal")
+                if has_pipe_cli and not has_pipe_srv:
+                    _emit_pipe("consumer", pm.group(1), "pipe_literal")
+
+        # 3. Shared Memory / File Mapping (`shared_memory` -> `shares_shm`)
+        mapped_struct_name: Optional[str] = None
+        for cm in re.finditer(
+            r"(?:\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*\)|(?:reinterpret_cast|static_cast)\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*>)\s*(?:\(\s*)?MapViewOfFile",
+            clean,
+        ):
+            cand_s = cm.group(1) or cm.group(2)
+            if cand_s and cand_s in struct_sigs:
+                mapped_struct_name = cand_s
+                break
+        if not mapped_struct_name:
+            for sm in re.finditer(r"\bCreateFileMapping[\s\S]{0,200}?sizeof\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", clean):
+                if sm.group(1) in struct_sigs:
+                    mapped_struct_name = sm.group(1)
+                    break
+
+        emitted_shms: Set[Tuple[str, str]] = set()
+
+        def _emit_shm(role: str, raw_shm: str, api_name: str, allow_unscoped: bool = True) -> None:
+            norm = _normalize_shm_name(raw_shm, allow_unscoped=allow_unscoped)
+            if not norm:
+                return
+            nkey, disp = norm
+            if (role, nkey) in emitted_shms:
+                return
+            emitted_shms.add((role, nkey))
+            sig_payload: Dict[str, Any] = {"kind": "shared_memory", "key": nkey}
+            extra: Dict[str, Any] = {
+                "shm_name": disp,
+                "api": api_name,
+                "language": lang,
+                "doc_tokens": [nkey, disp.lower(), disp.split("\\")[-1].lower()],
+            }
+            if mapped_struct_name and mapped_struct_name in struct_sigs:
+                s_hash, s_fields = struct_sigs[mapped_struct_name]
+                sig_payload["struct"] = mapped_struct_name
+                sig_payload["struct_hash"] = s_hash
+                extra["mapped_struct"] = mapped_struct_name
+                extra["mapped_fields"] = [{"name": n, "type": t} for n, t in sorted(s_fields)]
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="shared_memory",
+                    role=role,
+                    normalized_key=nkey,
+                    file_path=rel_path,
+                    symbol_name=disp,
+                    signature_hash=_sha256_json(sig_payload),
+                    metadata=extra,
+                    sync_generation=sync_gen,
+                )
+            )
+
+        for m in re.finditer(
+            r"\b(CreateFileMapping(?:A|W)?|OpenFileMapping(?:A|W)?|MemoryMappedFile\.(?:CreateNew|CreateOrOpen|OpenExisting))\s*\(",
+            clean,
+        ):
+            api = m.group(1)
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            if api.startswith("CreateFileMapping") and len(args) >= 6:
+                val = _resolve_str_arg(args[5], const_map)
+                if val:
+                    _emit_shm("provider", val, api)
+            elif api.startswith("OpenFileMapping") and len(args) >= 3:
+                val = _resolve_str_arg(args[2], const_map)
+                if val:
+                    _emit_shm("consumer", val, api)
+            elif api.startswith("MemoryMappedFile.") and args:
+                val = _resolve_str_arg(args[0], const_map)
+                if val:
+                    r = "consumer" if api.endswith("OpenExisting") else "provider"
+                    _emit_shm(r, val, api)
+
+        has_shm_prov = bool(re.search(r"\b(?:CreateFileMapping|MemoryMappedFile\.CreateNew|MemoryMappedFile\.CreateOrOpen)", clean))
+        has_shm_cons = bool(re.search(r"\b(?:OpenFileMapping|MemoryMappedFile\.OpenExisting)", clean))
+        if has_shm_prov or has_shm_cons or "MapViewOfFile" in clean:
+            for km in re.finditer(r'["\']((?:Global|Local)(?:\\\\|\\)+[A-Za-z0-9_.\-/]+)["\']', clean, re.IGNORECASE):
+                if has_shm_prov:
+                    _emit_shm("provider", km.group(1), "shm_literal", allow_unscoped=False)
+                if has_shm_cons or (not has_shm_prov and "MapViewOfFile" in clean):
+                    _emit_shm("consumer", km.group(1), "shm_literal", allow_unscoped=False)
+
+        # 4. Windows Service SCM (`scm_service` -> `controls_service`)
+        svc_handles: Dict[str, str] = {}
+        emitted_svcs: Set[Tuple[str, str]] = set()
+
+        def _emit_svc(role: str, svc_name: str, api_name: str, control_code: Optional[str] = None) -> None:
+            clean_svc = str(svc_name or "").strip().strip('"\'')
+            if not clean_svc or clean_svc.upper() in ("NULL", "NULLPTR", "0"):
+                return
+            nkey = clean_svc.lower()
+            if (role, nkey) in emitted_svcs:
+                return
+            emitted_svcs.add((role, nkey))
+            meta: Dict[str, Any] = {
+                "service_name": clean_svc,
+                "api": api_name,
+                "language": lang,
+                "doc_tokens": [nkey],
+            }
+            if control_code:
+                meta["control_code"] = control_code
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="scm_service",
+                    role=role,
+                    normalized_key=nkey,
+                    file_path=rel_path,
+                    symbol_name=clean_svc,
+                    metadata=meta,
+                    sync_generation=sync_gen,
+                )
+            )
+
+        has_svc_impl = bool(re.search(r"\b(?:RegisterServiceCtrlHandler|StartServiceCtrlDispatcher|ServiceMain|ServiceBase)\b", clean))
+        for m in re.finditer(
+            r"\b([A-Za-z_][A-Za-z0-9_]*\s*=\s*)?(RegisterServiceCtrlHandler(?:Ex)?(?:A|W)?|OpenService(?:A|W)?|CreateService(?:A|W)?|StartService(?:A|W)?|ControlService)\s*\(",
+            clean,
+        ):
+            assign_lhs = (m.group(1) or "").split("=")[0].strip()
+            api = m.group(2)
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            if api.startswith("RegisterServiceCtrlHandler") and args:
+                val = _resolve_str_arg(args[0], const_map)
+                if val:
+                    _emit_svc("provider", val, api)
+            elif api.startswith("OpenService") and len(args) >= 2:
+                val = _resolve_str_arg(args[1], const_map)
+                if val:
+                    if assign_lhs:
+                        svc_handles[assign_lhs] = val
+                    _emit_svc("consumer", val, api)
+            elif api.startswith("CreateService") and len(args) >= 2:
+                val = _resolve_str_arg(args[1], const_map)
+                if val:
+                    _emit_svc("provider" if has_svc_impl else "consumer", val, api)
+            elif api.startswith("StartService") and args and not api.startswith("StartServiceCtrl"):
+                h_name = args[0].strip()
+                if h_name in svc_handles:
+                    _emit_svc("consumer", svc_handles[h_name], api)
+            elif api == "ControlService" and len(args) >= 2:
+                h_name = args[0].strip()
+                if h_name in svc_handles:
+                    _emit_svc("consumer", svc_handles[h_name], api, control_code=args[1].strip())
+
+        for m in re.finditer(
+            r'SERVICE_TABLE_ENTRY[AW]?\s+[A-Za-z_][A-Za-z0-9_]*\[\s*\]\s*=\s*\{([\s\S]*?)\};',
+            clean,
+        ):
+            for entry in re.finditer(r'\{\s*(?:\(LPW?STR\)\s*)?(?:L?["\']([^"\']+)["\'])\s*,', m.group(1)):
+                _emit_svc("provider", entry.group(1), "SERVICE_TABLE_ENTRY")
+
+        if ext == ".cs":
+            for m in re.finditer(r"\bServiceName\s*=\s*\"([^\"]+)\"", clean):
+                _emit_svc("provider", m.group(1), "ServiceBase")
+            for m in re.finditer(r"\bnew\s+ServiceController\s*\(\s*\"([^\"]+)\"", clean):
+                _emit_svc("consumer", m.group(1), "ServiceController")
+
+        # 5. COM / UUID / CoCreateInstance (`com_idl` -> `calls_com`)
+        for m in re.finditer(
+            r"(?:\[[^\]]*uuid\s*\(\s*\"?([0-9a-fA-F\-]+)\"?\s*\)[^\]]*\]|\[Guid\s*\(\s*\"([0-9a-fA-F\-]+)\"\s*\)\]|MIDL_INTERFACE\s*\(\s*\"([0-9a-fA-F\-]+)\"\s*\)|__declspec\s*\(\s*uuid\s*\(\s*\"([0-9a-fA-F\-]+)\"\s*\)\s*\))(?:\s*(?:public|internal|sealed|abstract)?\s*(?:interface|dispinterface|coclass|class|struct)\s+([A-Za-z_][A-Za-z0-9_]*))?",
+            clean,
+            re.IGNORECASE,
+        ):
+            raw_u = m.group(1) or m.group(2) or m.group(3) or m.group(4) or ""
+            uid = _normalize_uuid(raw_u)
+            if not uid:
+                continue
+            sym = (m.group(5) or uid).strip()
+            aliases = [uid]
+            if m.group(5):
+                s_low = sym.lower()
+                aliases.extend([s_low, f"iid_{s_low}", f"clsid_{s_low}"])
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="com_idl",
+                    role="provider",
+                    normalized_key=uid,
+                    file_path=rel_path,
+                    symbol_name=sym,
+                    signature_hash=_sha256_json({"uuid": uid, "symbol": sym}),
+                    metadata={"uuid": uid, "symbol": sym, "match_aliases": aliases, "language": lang, "doc_tokens": aliases},
+                    sync_generation=sync_gen,
+                )
+            )
+
+        for m in re.finditer(r"\bDEFINE_GUID\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,", clean):
+            sym = m.group(1)
+            short = re.sub(r"^(?:CLSID|IID)_", "", sym, flags=re.IGNORECASE).lower()
+            aliases = [sym.lower()] + ([short] if short else [])
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="com_idl",
+                    role="provider",
+                    normalized_key=sym.lower(),
+                    file_path=rel_path,
+                    symbol_name=sym,
+                    metadata={"symbol": sym, "match_aliases": aliases, "language": lang, "doc_tokens": aliases},
+                    sync_generation=sync_gen,
+                )
+            )
+
+        for m in re.finditer(r"\b(CoCreateInstance(?:Ex)?|CoGetClassObject)\s*\(", clean):
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            cand_refs: List[str] = []
+            if args:
+                cand_refs.append(args[0])
+            if m.group(1) == "CoCreateInstance" and len(args) >= 4:
+                cand_refs.append(args[3])
+            for raw_ref in cand_refs:
+                ref_clean = raw_ref.strip().lstrip("&")
+                if not ref_clean or ref_clean.upper() in ("NULL", "NULLPTR", "0", "CLSID_NULL", "IID_IUNKNOWN"):
+                    continue
+                uid = _normalize_uuid(_resolve_str_arg(ref_clean, const_map) or ref_clean)
+                if uid:
+                    nkey = uid
+                    disp = uid
+                    aliases = [uid]
+                else:
+                    um = re.match(r"^(?:__uuidof|typeof)\s*\(\s*([A-Za-z_][A-Za-z0-9_:]*)\s*\)$", ref_clean)
+                    tok = um.group(1).split("::")[-1] if um else ref_clean
+                    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", tok):
+                        continue
+                    nkey = tok.lower()
+                    disp = tok
+                    short = re.sub(r"^(?:CLSID|IID)_", "", tok, flags=re.IGNORECASE).lower()
+                    aliases = [nkey] + ([short] if short and short != nkey else [])
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="com_idl",
+                        role="consumer",
+                        normalized_key=nkey,
+                        file_path=rel_path,
+                        symbol_name=disp,
+                        metadata={"com_ref": disp, "match_aliases": aliases, "api": m.group(1), "language": lang, "doc_tokens": aliases},
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        # 6. Win32 Window Messages (`win32_msg` -> `sends_win32_msg`)
+        is_msg_sender = bool(re.search(r"\b(?:SendMessage|PostMessage|PostThreadMessage|BroadcastSystemMessage)", clean))
+        is_msg_receiver = bool(
+            re.search(r"\b(?:WndProc|WindowProc|DefWindowProc|ON_MESSAGE|ON_REGISTERED_MESSAGE|GetMessage|DispatchMessage|COPYDATASTRUCT)\b", clean)
+            or re.search(r"\bcase\s+(?:WM_COPYDATA|WM_USER|WM_APP)\b", clean)
+        )
+
+        for m in re.finditer(r"\bRegisterWindowMessage(?:A|W)?\s*\(", clean):
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            if not args:
+                continue
+            msg_str = _resolve_str_arg(args[0], const_map)
+            if msg_str and msg_str.strip():
+                clean_msg = msg_str.strip()
+                nkey = f"regmsg:{clean_msg.lower()}"
+                if is_msg_sender and not is_msg_receiver:
+                    role = "consumer"
+                elif is_msg_receiver and not is_msg_sender:
+                    role = "provider"
+                else:
+                    role = "shared"
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="win32_msg",
+                        role=role,
+                        normalized_key=nkey,
+                        file_path=rel_path,
+                        symbol_name=clean_msg,
+                        metadata={"msg_kind": "registered", "msg_name": clean_msg, "language": lang, "doc_tokens": [clean_msg.lower()]},
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        for m in re.finditer(r"\b(SendMessage(?:Timeout)?(?:A|W)?|PostMessage(?:A|W)?|PostThreadMessage(?:A|W)?)\s*\(", clean):
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            if len(args) < 2:
+                continue
+            norm_msg = _normalize_win32_msg_expr(args[1], const_map)
+            if norm_msg:
+                nkey, disp = norm_msg
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="win32_msg",
+                        role="consumer",
+                        normalized_key=nkey,
+                        file_path=rel_path,
+                        symbol_name=disp,
+                        metadata={"msg_kind": "window_msg", "msg_name": disp, "api": m.group(1), "language": lang, "doc_tokens": [nkey, disp.lower()]},
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        for m in re.finditer(
+            r"(?:\bcase\s+([^:]+):|\bON_MESSAGE\s*\(\s*([^,]+),|\bON_WM_COPYDATA\s*\(\s*\))",
+            clean,
+        ):
+            raw_msg = "WM_COPYDATA" if m.group(0).startswith("ON_WM_COPYDATA") else (m.group(1) or m.group(2) or "")
+            norm_msg = _normalize_win32_msg_expr(raw_msg, const_map)
+            if norm_msg:
+                nkey, disp = norm_msg
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="win32_msg",
+                        role="provider",
+                        normalized_key=nkey,
+                        file_path=rel_path,
+                        symbol_name=disp,
+                        metadata={"msg_kind": "handler", "msg_name": disp, "language": lang, "doc_tokens": [nkey, disp.lower()]},
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        if is_msg_receiver and "WM_COPYDATA" in clean and not any(a["contract_kind"] == "win32_msg" and a["normalized_key"] == "wm_copydata" and a["role"] == "provider" for a in artifacts):
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="win32_msg",
+                    role="provider",
+                    normalized_key="wm_copydata",
+                    file_path=rel_path,
+                    symbol_name="WM_COPYDATA",
+                    metadata={"msg_kind": "handler", "msg_name": "WM_COPYDATA", "language": lang, "doc_tokens": ["wm_copydata"]},
+                    sync_generation=sync_gen,
+                )
+            )
+
+        for m in re.finditer(r"\bFindWindow(?:Ex)?(?:A|W)?\s*\(", clean):
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            check_args = args[2:4] if "Ex" in m.group(0) else args[:2]
+            for w_arg in check_args:
+                w_str = _resolve_str_arg(w_arg, const_map)
+                if w_str and w_str.strip():
+                    w_clean = w_str.strip()
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="win32_msg",
+                            role="consumer",
+                            normalized_key=f"window:{w_clean.lower()}",
+                            file_path=rel_path,
+                            symbol_name=w_clean,
+                            metadata={"msg_kind": "find_window", "window_name": w_clean, "language": lang, "doc_tokens": [w_clean.lower()]},
+                            sync_generation=sync_gen,
+                        )
+                    )
+
+        for m in re.finditer(r"\bCreateWindow(?:Ex)?(?:A|W)?\s*\(", clean):
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            off = 1 if "Ex" in m.group(0) else 0
+            for idx in (off, off + 1):
+                if idx < len(args):
+                    w_str = _resolve_str_arg(args[idx], const_map)
+                    if w_str and w_str.strip():
+                        w_clean = w_str.strip()
+                        artifacts.append(
+                            _make_artifact(
+                                project_id=project_id,
+                                source_id=source_id,
+                                branch=branch,
+                                contract_kind="win32_msg",
+                                role="provider",
+                                normalized_key=f"window:{w_clean.lower()}",
+                                file_path=rel_path,
+                                symbol_name=w_clean,
+                                metadata={"msg_kind": "window_owner", "window_name": w_clean, "language": lang, "doc_tokens": [w_clean.lower()]},
+                                sync_generation=sync_gen,
+                            )
+                        )
+
+        # 7. DLL Exports & Dynamic Loading (`dll_export` -> `loads_dll`)
+        export_macros: List[str] = []
+        for dm in re.finditer(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\s+[^\n]*__declspec\s*\(\s*dllexport\s*\)", clean, re.MULTILINE):
+            export_macros.append(re.escape(dm.group(1)))
+        export_qual = r"(?:__declspec\s*\(\s*dllexport\s*\)" + (
+            "|" + "|".join(export_macros) if export_macros else ""
+        ) + r")"
+        export_re = re.compile(
+            rf'(?:extern\s+"C"\s+)?{export_qual}\s+(?:(?:extern\s+"C"|WINAPI|__stdcall|__cdecl|CALLBACK|APIENTRY)\s+)*([A-Za-z_][A-Za-z0-9_:<>*&\s]*?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{{}}]*)\)',
+        )
+        for m in export_re.finditer(clean):
+            ret_t = " ".join(m.group(1).split())
+            fn_name = m.group(2).strip()
+            params = " ".join(m.group(3).split())
+            if fn_name.lower() in _CPP_TOKEN_STOPWORDS:
+                continue
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="dll_export",
+                    role="provider",
+                    normalized_key=fn_name.lower(),
+                    file_path=rel_path,
+                    symbol_name=fn_name,
+                    signature_hash=_sha256_json({"export": fn_name, "return": ret_t, "params": params}),
+                    metadata={
+                        "export_kind": "dllexport",
+                        "symbol": fn_name,
+                        "return_type": ret_t,
+                        "params": params,
+                        "language": lang,
+                        "doc_tokens": [fn_name.lower()],
+                    },
+                    sync_generation=sync_gen,
+                )
+            )
+
+        dll_handles: Dict[str, str] = {}
+        for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*\s*=\s*)?(LoadLibrary(?:Ex)?(?:A|W)?)\s*\(", clean):
+            lhs = (m.group(1) or "").split("=")[0].strip()
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            if not args:
+                continue
+            dll_raw = _resolve_str_arg(args[0], const_map)
+            norm = _normalize_dll_stem(dll_raw or "")
+            if norm:
+                stem, disp = norm
+                if lhs:
+                    dll_handles[lhs] = disp
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="dll_export",
+                        role="consumer",
+                        normalized_key=f"dll:{stem}",
+                        file_path=rel_path,
+                        symbol_name=disp,
+                        metadata={"import_kind": "load_library", "dll_name": disp, "dll_stem": stem, "language": lang, "doc_tokens": [stem, disp.lower()]},
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        for m in re.finditer(r"\bGetProcAddress\s*\(", clean):
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            if len(args) < 2:
+                continue
+            proc_raw = _resolve_str_arg(args[1], const_map)
+            if proc_raw and proc_raw.strip():
+                proc = proc_raw.strip()
+                dll_ref = dll_handles.get(args[0].strip(), "")
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="dll_export",
+                        role="consumer",
+                        normalized_key=proc.lower(),
+                        file_path=rel_path,
+                        symbol_name=proc,
+                        metadata={"import_kind": "get_proc_address", "symbol": proc, "dll_name": dll_ref, "language": lang, "doc_tokens": [proc.lower()]},
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        if ext == ".cs":
+            for m in re.finditer(
+                r'\[DllImport\s*\(\s*"([^"]+)"([^]]*)\)\s*\][^;{]*?\b([A-Za-z_][A-Za-z0-9_]*)\s*\(',
+                clean,
+                re.DOTALL,
+            ):
+                norm = _normalize_dll_stem(m.group(1))
+                ep_m = re.search(r'EntryPoint\s*=\s*"([^"]+)"', m.group(2) or "")
+                fn_name = ep_m.group(1) if ep_m else m.group(3)
+                if norm:
+                    stem, disp = norm
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="dll_export",
+                            role="consumer",
+                            normalized_key=f"dll:{stem}",
+                            file_path=rel_path,
+                            symbol_name=disp,
+                            metadata={"import_kind": "dllimport", "dll_name": disp, "dll_stem": stem, "language": lang},
+                            sync_generation=sync_gen,
+                        )
+                    )
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="dll_export",
+                        role="consumer",
+                        normalized_key=fn_name.lower(),
+                        file_path=rel_path,
+                        symbol_name=fn_name,
+                        metadata={"import_kind": "dllimport", "symbol": fn_name, "dll_name": m.group(1), "language": lang},
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        # 8. Winsock / TCP Socket IPC (`socket_ipc` -> `calls_socket`)
+        socket_ports: List[int] = []
+        for pm in re.finditer(r"\bhtons\s*\(\s*([A-Za-z0-9_]+)\s*\)", clean):
+            raw_p = pm.group(1).strip()
+            resolved_p = const_map.get(raw_p, raw_p)
+            if str(resolved_p).isdigit():
+                socket_ports.append(int(resolved_p))
+        for pm in re.finditer(r"\b(?:TcpListener|TcpClient)\s*\([^,)]*,\s*([A-Za-z0-9_]+)\s*\)", clean):
+            raw_p = pm.group(1).strip()
+            resolved_p = const_map.get(raw_p, raw_p)
+            if str(resolved_p).isdigit():
+                socket_ports.append(int(resolved_p))
+        socket_hosts: List[str] = []
+        for hm in re.finditer(r'\b(?:inet_addr|inet_pton|getaddrinfo|TcpClient)\s*\([^)]*["\']([A-Za-z0-9_.\-]+)["\']', clean):
+            socket_hosts.append(hm.group(1).lower())
+        eff_host = socket_hosts[0] if socket_hosts else ""
+
+        is_sock_srv = bool(re.search(r"\b(?:bind\s*\(|listen\s*\(|TcpListener)\b", clean)) and bool(
+            re.search(r"\b(?:WSAStartup|socket\s*\(|listen\s*\(|TcpListener)\b", clean)
+        )
+        is_sock_cli = bool(re.search(r"\b(?:connect\s*\(|TcpClient)\b", clean)) and bool(
+            re.search(r"\b(?:WSAStartup|socket\s*\(|TcpClient|connect\s*\()\b", clean)
+        )
+        for port in sorted(set(socket_ports)):
+            if is_sock_srv:
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="socket_ipc",
+                        role="provider",
+                        normalized_key=f"port:{port}",
+                        file_path=rel_path,
+                        symbol_name=f"tcp:{port}",
+                        metadata={"port": port, "host": eff_host, "language": lang, "doc_tokens": [f":{port}", f"port:{port}"]},
+                        sync_generation=sync_gen,
+                    )
+                )
+            if is_sock_cli:
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="socket_ipc",
+                        role="consumer",
+                        normalized_key=f"port:{port}",
+                        file_path=rel_path,
+                        symbol_name=f"tcp:{port}",
+                        metadata={"port": port, "host": eff_host, "language": lang, "doc_tokens": [f":{port}", f"port:{port}"]},
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        # 9. Explicit PLC/LASAL Client Calls & Candidate Token Index (`plc_lasal_channel`)
+        plc_call_re = re.compile(
+            r"\b((?:Lasal|Lsl|Plc|Opc|Ads|Modbus)[A-Za-z0-9_]*|(?:Read|Write|Subscribe|Get|Set|Bind|Register)(?:Plc|Lasal|Server|Channel|Tag)[A-Za-z0-9_]*)\s*\(",
+            re.IGNORECASE,
+        )
+        for m in plc_call_re.finditer(clean):
+            api = m.group(1)
+            args = _split_top_level_args(_extract_balanced_block(clean, m.end() - 1, "(", ")"))
+            for a in args[:2]:
+                val = _resolve_str_arg(a, const_map)
+                if not val or not val.strip():
+                    continue
+                vclean = val.strip()
+                if re.match(r"^\d+\.\d+\.\d+\.\d+$", vclean):
+                    continue
+                leaf = vclean.split(".")[-1]
+                is_tag_call = "tag" in api.lower() or leaf.startswith("g_") or leaf.startswith("%")
+                prefix = "tag" if is_tag_call else "channel"
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="plc_lasal_channel",
+                        role="consumer",
+                        normalized_key=f"{prefix}:{leaf.lower()}",
+                        file_path=rel_path,
+                        symbol_name=vclean,
+                        metadata={
+                            "plc_kind": "client_call",
+                            "raw_ref": vclean,
+                            "leaf": leaf,
+                            "api": api,
+                            "language": lang,
+                            "doc_tokens": [leaf.lower(), vclean.lower()],
+                        },
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        # Collect clean string literals and non-stopword identifiers for cross-language PLC channel/tag matching
+        str_tokens: Set[str] = set()
+        for sm in re.finditer(r'L?["\']([^"\'\n]{3,80})["\']', clean):
+            s_val = sm.group(1).strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?", s_val):
+                leaf = s_val.split(".")[-1]
+                if leaf.lower() not in _CPP_TOKEN_STOPWORDS and not leaf.lower().endswith((".dll", ".exe", ".lib")):
+                    str_tokens.add(leaf.lower())
+        ident_tokens: Set[str] = set()
+        for im in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]{4,})\b", clean):
+            tok = im.group(1)
+            tlow = tok.lower()
+            if tlow not in _CPP_TOKEN_STOPWORDS:
+                if tok.startswith("g_") or "_" in tok or any(c.isupper() for c in tok[1:]):
+                    ident_tokens.add(tlow)
+
+        if str_tokens or ident_tokens:
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="plc_token_index",
+                    role="consumer",
+                    normalized_key=f"tokens:{rel_path}",
+                    file_path=rel_path,
+                    symbol_name=Path(rel_path).name,
+                    metadata={
+                        "string_tokens": sorted(str_tokens)[:200],
+                        "ident_tokens": sorted(ident_tokens)[:300],
+                        "language": lang,
+                    },
+                    sync_generation=sync_gen,
+                )
+            )
+
+        return artifacts
+
+    @staticmethod
+    def _extract_from_idl(
+        content: str,
+        rel_path: str,
+        project_id: str,
+        source_id: str,
+        branch: str,
+        sync_gen: int,
+    ) -> List[Dict[str, Any]]:
+        artifacts: List[Dict[str, Any]] = []
+        clean = _strip_comments_string_aware(content)
+        decl_re = re.compile(
+            r"(?:\[([^\]]*)\]\s*)?\b(dispinterface|interface|coclass|library)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^{;]+)?\{",
+            re.IGNORECASE,
+        )
+        for m in decl_re.finditer(clean):
+            attrs = m.group(1) or ""
+            kind_kw = m.group(2).lower()
+            name = m.group(3)
+            um = re.search(r"uuid\s*\(\s*([0-9a-fA-F\-]+)\s*\)", attrs)
+            uid = _normalize_uuid(um.group(1)) if um else None
+            body = _extract_balanced_block(clean, m.end() - 1, "{", "}")
+            methods = re.findall(
+                r"(?:\[[^\]]*\]\s*)?(?:HRESULT|void|long|int|BOOL|BSTR|VARIANT)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)",
+                body,
+            )
+            nkey = uid or name.lower()
+            s_low = name.lower()
+            aliases = [s_low, f"iid_{s_low}", f"clsid_{s_low}"]
+            if uid:
+                aliases.insert(0, uid)
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="com_idl",
+                    role="provider",
+                    normalized_key=nkey,
+                    file_path=rel_path,
+                    symbol_name=name,
+                    signature_hash=_sha256_json({"uuid": uid or "", "kind": kind_kw, "name": name, "methods": sorted(methods)}),
+                    metadata={
+                        "uuid": uid,
+                        "idl_kind": kind_kw,
+                        "symbol": name,
+                        "match_aliases": aliases,
+                        "language": "idl",
+                        "doc_tokens": aliases,
+                    },
+                    sync_generation=sync_gen,
+                )
+            )
+        return artifacts
+
+    @staticmethod
+    def _extract_from_def(
+        content: str,
+        rel_path: str,
+        project_id: str,
+        source_id: str,
+        branch: str,
+        sync_gen: int,
+    ) -> List[Dict[str, Any]]:
+        artifacts: List[Dict[str, Any]] = []
+        lib_stem = Path(rel_path).stem.lower()
+        lib_disp = Path(rel_path).stem
+        in_exports = False
+        section_stop = {"SECTIONS", "SEGMENTS", "HEAPSIZE", "STACKSIZE", "STUB", "VERSION", "DESCRIPTION"}
+
+        for raw_ln in content.splitlines():
+            code = raw_ln.split(";", 1)[0].strip()
+            if not code:
+                continue
+            m_lib = re.match(r'^(?:LIBRARY|NAME)\s+"?([A-Za-z0-9_.\-]+)"?', code, re.IGNORECASE)
+            if m_lib:
+                in_exports = False
+                lib_disp = m_lib.group(1)
+                norm = _normalize_dll_stem(lib_disp)
+                if norm:
+                    lib_stem = norm[0]
+                continue
+            if re.match(r"^EXPORTS\b", code, re.IGNORECASE):
+                in_exports = True
+                rest = code[len("EXPORTS"):].strip()
+                if not rest:
+                    continue
+                code = rest
+            if code.split()[0].upper() in section_stop:
+                in_exports = False
+                continue
+            if in_exports:
+                m_exp = re.match(r"^([A-Za-z_@?][A-Za-z0-9_@?$]*)(?:\s*=\s*([A-Za-z_][A-Za-z0-9_.]*))?(.*)$", code)
+                if m_exp:
+                    exp_sym = m_exp.group(1)
+                    ord_m = re.search(r"@(\d+)", m_exp.group(3) or "")
+                    ordinal = int(ord_m.group(1)) if ord_m else None
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="dll_export",
+                            role="provider",
+                            normalized_key=exp_sym.lower(),
+                            file_path=rel_path,
+                            symbol_name=exp_sym,
+                            signature_hash=_sha256_json({"def_export": exp_sym, "ordinal": ordinal}),
+                            metadata={
+                                "export_kind": "def_export",
+                                "symbol": exp_sym,
+                                "ordinal": ordinal,
+                                "dll_name": lib_disp,
+                                "language": "def",
+                                "doc_tokens": [exp_sym.lower()],
+                            },
+                            sync_generation=sync_gen,
+                        )
+                    )
+
+        if lib_stem:
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="dll_export",
+                    role="provider",
+                    normalized_key=f"dll:{lib_stem}",
+                    file_path=rel_path,
+                    symbol_name=f"{lib_disp}.dll" if not lib_disp.lower().endswith(".dll") else lib_disp,
+                    metadata={
+                        "export_kind": "def_library",
+                        "dll_name": lib_disp,
+                        "dll_stem": lib_stem,
+                        "language": "def",
+                        "doc_tokens": [lib_stem, f"{lib_stem}.dll"],
+                    },
+                    sync_generation=sync_gen,
+                )
+            )
+        return artifacts
+
+    @staticmethod
+    def _extract_from_rc(
+        content: str,
+        rel_path: str,
+        project_id: str,
+        source_id: str,
+        branch: str,
+        sync_gen: int,
+    ) -> List[Dict[str, Any]]:
+        artifacts: List[Dict[str, Any]] = []
+        clean = _strip_comments_string_aware(content)
+        for m in re.finditer(r'^\s*CAPTION\s+"([^"]+)"', clean, re.IGNORECASE | re.MULTILINE):
+            cap = m.group(1).strip()
+            if cap:
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="win32_msg",
+                        role="provider",
+                        normalized_key=f"window:{cap.lower()}",
+                        file_path=rel_path,
+                        symbol_name=cap,
+                        metadata={"msg_kind": "rc_caption", "window_name": cap, "language": "rc"},
+                        sync_generation=sync_gen,
+                    )
+                )
+        return artifacts
+
+    @staticmethod
+    def _extract_from_vb6_delphi(
+        content: str,
+        rel_path: str,
+        ext: str,
+        project_id: str,
+        source_id: str,
+        branch: str,
+        sync_gen: int,
+    ) -> List[Dict[str, Any]]:
+        artifacts: List[Dict[str, Any]] = []
+        lang = "delphi" if ext == ".pas" else "vb6"
+
+        if lang == "vb6":
+            decl_re = re.compile(
+                r'^\s*(?:(?:Public|Private)\s+)?Declare\s+(?:Function|Sub)\s+([A-Za-z_][A-Za-z0-9_]*)\s+Lib\s+"([^"]+)"(?:\s+Alias\s+"([^"]+)")?',
+                re.IGNORECASE | re.MULTILINE,
+            )
+            for m in decl_re.finditer(content):
+                fn_name = m.group(1)
+                lib_raw = m.group(2)
+                alias_name = m.group(3) or fn_name
+                norm = _normalize_dll_stem(lib_raw)
+                if norm:
+                    stem, disp = norm
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="dll_export",
+                            role="consumer",
+                            normalized_key=f"dll:{stem}",
+                            file_path=rel_path,
+                            symbol_name=disp,
+                            metadata={"import_kind": "vb6_declare", "dll_name": disp, "dll_stem": stem, "language": "vb6"},
+                            sync_generation=sync_gen,
+                        )
+                    )
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="dll_export",
+                        role="consumer",
+                        normalized_key=alias_name.lower(),
+                        file_path=rel_path,
+                        symbol_name=alias_name,
+                        metadata={"import_kind": "vb6_declare", "symbol": alias_name, "dll_name": lib_raw, "language": "vb6"},
+                        sync_generation=sync_gen,
+                    )
+                )
+        else:
+            for m in re.finditer(
+                r"\b(?:function|procedure)\s+([A-Za-z_][A-Za-z0-9_]*)[^;]*;\s*[^;]*\bexternal\s+'([^']+)'(?:\s+name\s+'([^']+)')?",
+                content,
+                re.IGNORECASE,
+            ):
+                fn_name = m.group(3) or m.group(1)
+                lib_raw = m.group(2)
+                norm = _normalize_dll_stem(lib_raw)
+                if norm:
+                    stem, disp = norm
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="dll_export",
+                            role="consumer",
+                            normalized_key=f"dll:{stem}",
+                            file_path=rel_path,
+                            symbol_name=disp,
+                            metadata={"import_kind": "delphi_external", "dll_name": disp, "dll_stem": stem, "language": "delphi"},
+                            sync_generation=sync_gen,
+                        )
+                    )
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="dll_export",
+                        role="consumer",
+                        normalized_key=fn_name.lower(),
+                        file_path=rel_path,
+                        symbol_name=fn_name,
+                        metadata={"import_kind": "delphi_external", "symbol": fn_name, "dll_name": lib_raw, "language": "delphi"},
+                        sync_generation=sync_gen,
+                    )
+                )
+
+        # Also extract literal string tokens & CreateObject COM calls
+        for m in re.finditer(r"\bCreate(?:Ole)?Object\s*\(\s*[\"']([^\"']+)[\"']\s*\)", content, re.IGNORECASE):
+            progid = m.group(1).strip()
+            cls_leaf = progid.split(".")[-1]
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="com_idl",
+                    role="consumer",
+                    normalized_key=cls_leaf.lower(),
+                    file_path=rel_path,
+                    symbol_name=progid,
+                    metadata={"com_ref": progid, "match_aliases": [progid.lower(), cls_leaf.lower()], "language": lang},
+                    sync_generation=sync_gen,
+                )
+            )
+
+        str_tokens = {
+            s.split(".")[-1].lower()
+            for s in re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]{2,}(?:\.[A-Za-z_][A-Za-z0-9_]*)?)["\']', content)
+        }
+        if str_tokens:
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="plc_token_index",
+                    role="consumer",
+                    normalized_key=f"tokens:{rel_path}",
+                    file_path=rel_path,
+                    symbol_name=Path(rel_path).name,
+                    metadata={"string_tokens": sorted(str_tokens)[:200], "ident_tokens": [], "language": lang},
+                    sync_generation=sync_gen,
+                )
+            )
+        return artifacts
+
+    @staticmethod
+    def _extract_from_plc_st_lasal(
+        content: str,
+        rel_path: str,
+        project_id: str,
+        source_id: str,
+        branch: str,
+        sync_gen: int,
+    ) -> List[Dict[str, Any]]:
+        artifacts: List[Dict[str, Any]] = []
+
+        def _parse_st_chunk(st_text: str) -> None:
+            clean = _strip_comments_string_aware(
+                st_text,
+                line_prefixes=("//",),
+                block_pairs=(("(*", "*)"),),
+                backslash_escapes=False,
+            )
+            lines = clean.splitlines()
+            active_section: Optional[str] = None
+            active_struct_name: Optional[str] = None
+            struct_fields: List[Tuple[str, str]] = []
+            pending_type: Optional[str] = None
+
+            inline_sc_re = re.compile(r"^\s*(SERVER|CLIENT)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^;]+);?", re.IGNORECASE)
+            sec_re = re.compile(r"^\s*(SERVER|CLIENT|VAR_SERVER|VAR_CLIENT|VAR_GLOBAL|VAR_EXTERNAL)\b", re.IGNORECASE)
+            end_sec_re = re.compile(r"^\s*END_(SERVER|CLIENT|VAR)\b", re.IGNORECASE)
+            var_re = re.compile(
+                r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+                r"(?:\s+AT\s+(%[IQMXiqmx][A-Za-z0-9_.]+))?"
+                r"\s*:\s*([^:;]+?)(?:\s*:=\s*([^;]+))?;",
+                re.IGNORECASE,
+            )
+
+            for raw_ln in lines:
+                s = raw_ln.strip()
+                if not s:
+                    continue
+
+                if active_struct_name is not None:
+                    if re.match(r"^\s*END_STRUCT\b", s, re.IGNORECASE):
+                        artifacts.append(
+                            _make_artifact(
+                                project_id=project_id,
+                                source_id=source_id,
+                                branch=branch,
+                                contract_kind="schema_def",
+                                role="provider",
+                                normalized_key=_normalize_schema_key(active_struct_name),
+                                file_path=rel_path,
+                                symbol_name=active_struct_name,
+                                signature_hash=_schema_signature_hash(struct_fields),
+                                metadata={
+                                    "schema_name": active_struct_name,
+                                    "fields": [{"name": n, "type": t} for n, t in sorted(struct_fields)],
+                                    "language": "st",
+                                },
+                                sync_generation=sync_gen,
+                            )
+                        )
+                        active_struct_name = None
+                        struct_fields = []
+                        pending_type = None
+                        continue
+                    vm = var_re.match(s)
+                    if vm:
+                        ftype = vm.group(3).strip()
+                        for fn in vm.group(1).split(","):
+                            if fn.strip():
+                                struct_fields.append((fn.strip(), ftype))
+                    continue
+
+                m_tsi = re.match(r"^\s*TYPE\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*STRUCT\b", s, re.IGNORECASE)
+                if m_tsi:
+                    active_struct_name = m_tsi.group(1)
+                    struct_fields = []
+                    continue
+                m_th = re.match(r"^\s*TYPE\s+([A-Za-z_][A-Za-z0-9_]*)\b", s, re.IGNORECASE)
+                if m_th:
+                    pending_type = m_th.group(1)
+                    continue
+                if pending_type and re.match(r"^\s*STRUCT\b", s, re.IGNORECASE):
+                    active_struct_name = pending_type
+                    struct_fields = []
+                    pending_type = None
+                    continue
+                if re.match(r"^\s*END_TYPE\b", s, re.IGNORECASE):
+                    pending_type = None
+                    continue
+
+                m_isc = inline_sc_re.match(s)
+                if m_isc:
+                    kw = m_isc.group(1).upper()
+                    cname = m_isc.group(2)
+                    dtype = m_isc.group(3).strip()
+                    is_srv = kw == "SERVER"
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="plc_lasal_channel",
+                            role="provider" if is_srv else "consumer",
+                            normalized_key=f"channel:{cname.lower()}",
+                            file_path=rel_path,
+                            symbol_name=cname,
+                            signature_hash=_sha256_json({"plc_kind": "lasal_server" if is_srv else "lasal_client", "name": cname, "type": dtype}),
+                            metadata={
+                                "plc_kind": "lasal_server" if is_srv else "lasal_client",
+                                "channel_name": cname,
+                                "data_type": dtype,
+                                "language": "st",
+                                "doc_tokens": [cname.lower()],
+                            },
+                            sync_generation=sync_gen,
+                        )
+                    )
+                    continue
+
+                m_sec = sec_re.match(s)
+                if m_sec:
+                    active_section = m_sec.group(1).upper()
+                    continue
+                if end_sec_re.match(s) or re.match(r"^\s*(?:VAR|VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_TEMP)\b", s, re.IGNORECASE):
+                    active_section = None
+                    continue
+
+                if active_section and ":" in s:
+                    vm = var_re.match(s)
+                    if vm:
+                        io_addr = (vm.group(2) or "").strip()
+                        dtype = vm.group(3).strip()
+                        for raw_name in vm.group(1).split(","):
+                            vname = raw_name.strip()
+                            if not vname:
+                                continue
+                            if "SERVER" in active_section:
+                                pkind, role, prefix = "lasal_server", "provider", "channel"
+                            elif "CLIENT" in active_section:
+                                pkind, role, prefix = "lasal_client", "consumer", "channel"
+                            elif active_section == "VAR_GLOBAL":
+                                pkind, role, prefix = "var_global", "provider", "tag"
+                            else:
+                                pkind, role, prefix = "var_external", "consumer", "tag"
+                            artifacts.append(
+                                _make_artifact(
+                                    project_id=project_id,
+                                    source_id=source_id,
+                                    branch=branch,
+                                    contract_kind="plc_lasal_channel",
+                                    role=role,
+                                    normalized_key=f"{prefix}:{vname.lower()}",
+                                    file_path=rel_path,
+                                    symbol_name=vname,
+                                    signature_hash=_sha256_json({"plc_kind": pkind, "name": vname, "type": dtype, "io": io_addr}),
+                                    metadata={
+                                        "plc_kind": pkind,
+                                        "channel_name": vname if prefix == "channel" else None,
+                                        "tag_name": vname if prefix == "tag" else None,
+                                        "data_type": dtype,
+                                        "io_address": io_addr,
+                                        "language": "st",
+                                        "doc_tokens": [vname.lower()] + ([io_addr.lower()] if io_addr else []),
+                                    },
+                                    sync_generation=sync_gen,
+                                )
+                            )
+
+        stripped = content.lstrip()
+        if stripped.startswith("<"):
+            try:
+                root_elem = ET.fromstring(content)
+                for elem in root_elem.iter():
+                    tag = elem.tag.split("}")[-1].lower()
+                    if tag in ("server", "client"):
+                        name = elem.get("Name") or elem.get("ID")
+                        if name:
+                            dtype = elem.get("DataType") or "ANY"
+                            is_srv = tag == "server"
+                            artifacts.append(
+                                _make_artifact(
+                                    project_id=project_id,
+                                    source_id=source_id,
+                                    branch=branch,
+                                    contract_kind="plc_lasal_channel",
+                                    role="provider" if is_srv else "consumer",
+                                    normalized_key=f"channel:{name.lower()}",
+                                    file_path=rel_path,
+                                    symbol_name=name,
+                                    signature_hash=_sha256_json({"plc_kind": f"lasal_{tag}", "name": name, "type": dtype}),
+                                    metadata={"plc_kind": f"lasal_{tag}", "channel_name": name, "data_type": dtype, "language": "lasal", "doc_tokens": [name.lower()]},
+                                    sync_generation=sync_gen,
+                                )
+                            )
+                    elif tag in ("network", "plc", "target", "comm", "endpoint"):
+                        port = elem.get("Port") or elem.get("TcpPort")
+                        host = elem.get("IpAddress") or elem.get("Host") or elem.get("IP") or ""
+                        if port and str(port).isdigit():
+                            artifacts.append(
+                                _make_artifact(
+                                    project_id=project_id,
+                                    source_id=source_id,
+                                    branch=branch,
+                                    contract_kind="plc_lasal_channel",
+                                    role="provider",
+                                    normalized_key=f"port:{int(port)}",
+                                    file_path=rel_path,
+                                    symbol_name=f"{host}:{port}" if host else f"plc:{port}",
+                                    metadata={"plc_kind": "plc_endpoint", "port": int(port), "host": host.lower(), "language": "lasal"},
+                                    sync_generation=sync_gen,
+                                )
+                            )
+                    elif tag in ("st", "declaration", "implementation"):
+                        inner = "".join(elem.itertext()).strip()
+                        if inner:
+                            _parse_st_chunk(inner)
+            except Exception:
+                _parse_st_chunk(content)
+        else:
+            _parse_st_chunk(content)
+            for xm in re.finditer(r"\(\*!(.*?)\*\)", content, re.DOTALL):
+                _parse_st_chunk(xm.group(1))
+        return artifacts
+
+    @staticmethod
+    def _extract_from_vs_project(
+        content: str,
+        rel_path: str,
+        project_id: str,
+        source_id: str,
+        branch: str,
+        sync_gen: int,
+    ) -> List[Dict[str, Any]]:
+        artifacts: List[Dict[str, Any]] = []
+        proj_stem = Path(rel_path).stem
+        artifacts.append(
+            _make_artifact(
+                project_id=project_id,
+                source_id=source_id,
+                branch=branch,
+                contract_kind="project_dep",
+                role="provider",
+                normalized_key=proj_stem.lower(),
+                file_path=rel_path,
+                symbol_name=proj_stem,
+                metadata={"project_name": proj_stem},
+                sync_generation=sync_gen,
+            )
+        )
+        try:
+            root_elem = ET.fromstring(content)
+        except Exception:
+            return artifacts
+
+        config_type = ""
+        output_type = ""
+        target_name = proj_stem
+        for elem in root_elem.iter():
+            tag = elem.tag.split("}", 1)[-1]
+            txt = (elem.text or "").strip()
+            if tag == "ConfigurationType" and txt:
+                config_type = txt
+            elif tag == "OutputType" and txt:
+                output_type = txt
+            elif tag in ("TargetName", "AssemblyName") and txt:
+                target_name = txt
+            elif tag == "ProjectReference":
+                inc = (elem.get("Include") or "").strip().replace("\\", "/")
+                if inc:
+                    ref_stem = Path(inc).stem
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="project_dep",
+                            role="consumer",
+                            normalized_key=ref_stem.lower(),
+                            file_path=rel_path,
+                            symbol_name=ref_stem,
+                            metadata={"via": "vcxproj_project_reference", "target_project_file": inc},
+                            sync_generation=sync_gen,
+                        )
+                    )
+            elif tag == "AdditionalDependencies" and txt:
+                for tok in txt.split(";"):
+                    norm = _normalize_dll_stem(tok)
+                    if norm and not tok.strip().startswith("%"):
+                        stem, disp = norm
+                        if stem in ("kernel32", "user32", "gdi32", "advapi32", "ole32", "oleaut32", "ws2_32", "shell32", "uuid"):
+                            continue
+                        artifacts.append(
+                            _make_artifact(
+                                project_id=project_id,
+                                source_id=source_id,
+                                branch=branch,
+                                contract_kind="dll_export",
+                                role="consumer",
+                                normalized_key=f"dll:{stem}",
+                                file_path=rel_path,
+                                symbol_name=disp,
+                                metadata={"import_kind": "lib_link", "dll_name": disp, "dll_stem": stem},
+                                sync_generation=sync_gen,
+                            )
+                        )
+
+        if config_type.lower() == "dynamiclibrary" or output_type.lower() == "library":
+            artifacts.append(
+                _make_artifact(
+                    project_id=project_id,
+                    source_id=source_id,
+                    branch=branch,
+                    contract_kind="dll_export",
+                    role="provider",
+                    normalized_key=f"dll:{target_name.lower()}",
+                    file_path=rel_path,
+                    symbol_name=f"{target_name}.dll",
+                    metadata={"export_kind": "vcxproj_dll", "dll_name": f"{target_name}.dll", "dll_stem": target_name.lower()},
+                    sync_generation=sync_gen,
+                )
+            )
+        return artifacts
+
+    @staticmethod
+    def _extract_from_script_reg(
+        content: str,
+        rel_path: str,
+        ext: str,
+        project_id: str,
+        source_id: str,
+        branch: str,
+        sync_gen: int,
+    ) -> List[Dict[str, Any]]:
+        artifacts: List[Dict[str, Any]] = []
+        if ext in (".bat", ".cmd"):
+            for m in re.finditer(r'\b(?:sc(?:\.exe)?\s+(?:create|start|stop|control|config|delete)|net\s+(?:start|stop))\s+"?([A-Za-z0-9_.\-]+)"?', content, re.IGNORECASE):
+                svc = m.group(1).strip()
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="scm_service",
+                        role="consumer",
+                        normalized_key=svc.lower(),
+                        file_path=rel_path,
+                        symbol_name=svc,
+                        metadata={"service_name": svc, "api": "sc_script", "language": "bat"},
+                        sync_generation=sync_gen,
+                    )
+                )
+        elif ext == ".reg":
+            for m in re.finditer(r"CurrentControlSet\\Services\\([A-Za-z0-9_.\-]+)", content, re.IGNORECASE):
+                svc = m.group(1).strip()
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="scm_service",
+                        role="consumer",
+                        normalized_key=svc.lower(),
+                        file_path=rel_path,
+                        symbol_name=svc,
+                        metadata={"service_name": svc, "api": "reg_service", "language": "reg"},
+                        sync_generation=sync_gen,
+                    )
+                )
+        return artifacts
+
     @staticmethod
     def _extract_from_shared_doc(
         content: str,
@@ -1532,10 +3371,37 @@ class CrossSourceLinker:
             norm_p, _ = _normalize_http_path(raw_p)
             _emit_spec("endpoint", norm_p, f"endpoint:{norm_p}", [norm_p])
 
+        # 2b. Named Pipes (\\.\pipe\...), Shared Memory (Global\..., Local\...), and COM UUIDs in specs
+        for pm in re.finditer(r"((?:\\\\|\\)+\.(?:\\\\|\\)+pipe(?:\\\\|\\)+[A-Za-z0-9_.\-/\\]+)", content, re.IGNORECASE):
+            norm_p = _normalize_pipe_name(pm.group(1))
+            if norm_p:
+                leaf, disp = norm_p
+                _emit_spec("pipe", disp, f"pipe:{leaf}", [leaf, disp.lower(), pm.group(1).lower()])
+
+        for sm in re.finditer(r"\b((?:Global|Local)(?:\\\\|\\)+[A-Za-z0-9_.\-/]+)", content, re.IGNORECASE):
+            norm_s = _normalize_shm_name(sm.group(1))
+            if norm_s:
+                nkey, disp = norm_s
+                _emit_spec("shm", disp, f"shm:{nkey}", [nkey, disp.lower(), disp.split("\\")[-1].lower()])
+
+        for um in re.finditer(r"\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b", content):
+            uid = um.group(1).lower()
+            _emit_spec("uuid", uid, f"uuid:{uid}", [uid])
+
         # 3. Backticked symbols
         for raw_cand in re.findall(r"`([^`\n]+)`", content):
             cand = raw_cand.strip()
             if not cand or len(cand) < 2 or cand.lower() in _DOC_STOP_TOKENS:
+                continue
+            norm_pipe = _normalize_pipe_name(cand) if "pipe" in cand.lower() else None
+            if norm_pipe:
+                leaf, disp = norm_pipe
+                _emit_spec("pipe", disp, f"pipe:{leaf}", [leaf, disp.lower()])
+                continue
+            norm_shm = _normalize_shm_name(cand) if ("global\\" in cand.lower() or "local\\" in cand.lower()) else None
+            if norm_shm:
+                nkey, disp = norm_shm
+                _emit_spec("shm", disp, f"shm:{nkey}", [nkey, disp.lower(), disp.split("\\")[-1].lower()])
                 continue
             if cand.startswith("/"):
                 norm_p, _ = _normalize_http_path(cand)
@@ -1649,29 +3515,159 @@ class CrossSourceLinker:
                         sync_generation=sync_gen,
                     )
                 )
-            elif kind in ("schema", "interface", "table") or (
+            elif kind in ("schema", "interface", "table", "struct") or (
                 kind == "class" and (meta.get("fields") or lbl.endswith(_SCHEMA_SUFFIXES))
             ):
-                raw_fields = meta.get("fields") or []
-                fields = [
-                    (str(f.get("name") or ""), str(f.get("type") or "Any"))
-                    for f in raw_fields
-                    if isinstance(f, dict)
-                ]
-                sig_hash = _schema_signature_hash(fields) if fields else _sha256_json({"name": lbl, "sig": meta.get("signature") or ""})
+                if kind == "interface" and meta.get("uuid"):
+                    uid = _normalize_uuid(str(meta["uuid"])) or lbl.lower()
+                    s_low = lbl.lower()
+                    aliases = [uid, s_low, f"iid_{s_low}", f"clsid_{s_low}"]
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="com_idl",
+                            role="provider",
+                            normalized_key=uid,
+                            node_id=nid or None,
+                            file_path=src_file,
+                            symbol_name=lbl,
+                            signature_hash=_sha256_json({"uuid": uid, "symbol": lbl}),
+                            metadata={"uuid": uid, "symbol": lbl, "match_aliases": aliases, "doc_tokens": aliases},
+                            sync_generation=sync_gen,
+                        )
+                    )
+                else:
+                    raw_fields = meta.get("fields") or []
+                    fields = [
+                        (str(f.get("name") or ""), str(f.get("type") or "Any"))
+                        for f in raw_fields
+                        if isinstance(f, dict)
+                    ]
+                    sig_hash = _schema_signature_hash(fields) if fields else _sha256_json({"name": lbl, "sig": meta.get("signature") or ""})
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="schema_def",
+                            role="provider",
+                            normalized_key=_normalize_schema_key(lbl),
+                            node_id=nid or None,
+                            file_path=src_file,
+                            symbol_name=lbl,
+                            signature_hash=sig_hash,
+                            metadata={"schema_name": lbl, "fields": raw_fields},
+                            sync_generation=sync_gen,
+                        )
+                    )
+            elif kind == "coclass" and meta.get("uuid"):
+                uid = _normalize_uuid(str(meta["uuid"])) or lbl.lower()
+                s_low = lbl.lower()
+                aliases = [uid, s_low, f"clsid_{s_low}", f"iid_{s_low}"]
                 artifacts.append(
                     _make_artifact(
                         project_id=project_id,
                         source_id=source_id,
                         branch=branch,
-                        contract_kind="schema_def",
+                        contract_kind="com_idl",
                         role="provider",
-                        normalized_key=_normalize_schema_key(lbl),
+                        normalized_key=uid,
                         node_id=nid or None,
                         file_path=src_file,
                         symbol_name=lbl,
-                        signature_hash=sig_hash,
-                        metadata={"schema_name": lbl, "fields": raw_fields},
+                        signature_hash=_sha256_json({"uuid": uid, "symbol": lbl}),
+                        metadata={"uuid": uid, "symbol": lbl, "match_aliases": aliases, "doc_tokens": aliases},
+                        sync_generation=sync_gen,
+                    )
+                )
+            elif kind in ("server", "client"):
+                pkind = f"lasal_{kind}"
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="plc_lasal_channel",
+                        role="provider" if kind == "server" else "consumer",
+                        normalized_key=f"channel:{lbl.lower()}",
+                        node_id=nid or None,
+                        file_path=src_file,
+                        symbol_name=lbl,
+                        signature_hash=_sha256_json({"plc_kind": pkind, "name": lbl, "type": meta.get("data_type") or ""}),
+                        metadata={"plc_kind": pkind, "channel_name": lbl, "data_type": meta.get("data_type") or "ANY", "doc_tokens": [lbl.lower()]},
+                        sync_generation=sync_gen,
+                    )
+                )
+            elif kind == "variable" and str(meta.get("var_scope") or "").upper() in ("VAR_GLOBAL", "VAR_EXTERNAL"):
+                vscope = str(meta.get("var_scope") or "").upper()
+                pkind = "var_global" if vscope == "VAR_GLOBAL" else "var_external"
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="plc_lasal_channel",
+                        role="provider" if pkind == "var_global" else "consumer",
+                        normalized_key=f"tag:{lbl.lower()}",
+                        node_id=nid or None,
+                        file_path=src_file,
+                        symbol_name=lbl,
+                        signature_hash=_sha256_json({"plc_kind": pkind, "name": lbl, "type": meta.get("data_type") or ""}),
+                        metadata={"plc_kind": pkind, "tag_name": lbl, "data_type": meta.get("data_type") or "ANY", "doc_tokens": [lbl.lower()]},
+                        sync_generation=sync_gen,
+                    )
+                )
+            elif kind == "export" or meta.get("dllexport"):
+                clean_sym = lbl.rstrip("()")
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="dll_export",
+                        role="provider",
+                        normalized_key=clean_sym.lower(),
+                        node_id=nid or None,
+                        file_path=src_file,
+                        symbol_name=clean_sym,
+                        signature_hash=_sha256_json({"export": clean_sym, "params": meta.get("params") or ""}),
+                        metadata={"export_kind": kind or "dllexport", "symbol": clean_sym, "doc_tokens": [clean_sym.lower()]},
+                        sync_generation=sync_gen,
+                    )
+                )
+            elif meta.get("is_declare") and meta.get("dll_lib"):
+                clean_sym = lbl.rstrip("()")
+                norm = _normalize_dll_stem(str(meta["dll_lib"]))
+                if norm:
+                    artifacts.append(
+                        _make_artifact(
+                            project_id=project_id,
+                            source_id=source_id,
+                            branch=branch,
+                            contract_kind="dll_export",
+                            role="consumer",
+                            normalized_key=f"dll:{norm[0]}",
+                            node_id=nid or None,
+                            file_path=src_file,
+                            symbol_name=norm[1],
+                            metadata={"import_kind": "vb6_declare", "dll_name": norm[1], "dll_stem": norm[0]},
+                            sync_generation=sync_gen,
+                        )
+                    )
+                artifacts.append(
+                    _make_artifact(
+                        project_id=project_id,
+                        source_id=source_id,
+                        branch=branch,
+                        contract_kind="dll_export",
+                        role="consumer",
+                        normalized_key=clean_sym.lower(),
+                        node_id=nid or None,
+                        file_path=src_file,
+                        symbol_name=clean_sym,
+                        metadata={"import_kind": "vb6_declare", "symbol": clean_sym},
                         sync_generation=sync_gen,
                     )
                 )
@@ -1781,7 +3777,7 @@ class CrossSourceLinker:
 
             for fpath, rel_path in file_iter:
                 try:
-                    text = fpath.read_text(encoding="utf-8", errors="replace")
+                    text, _enc = read_text_with_encoding(fpath)
                 except Exception:
                     continue
                 ext = fpath.suffix.lower()
@@ -1832,6 +3828,54 @@ class CrossSourceLinker:
                     extracted.extend(
                         self._extract_from_env_file(
                             text, rel_path, proj, eff_src, eff_branch, sync_gen
+                        )
+                    )
+                elif ext in _CPP_CS_EXTS:
+                    extracted.extend(
+                        self._extract_from_cpp_cs_legacy(
+                            text, rel_path, ext, proj, eff_src, eff_branch, sync_gen
+                        )
+                    )
+                elif ext == ".idl":
+                    extracted.extend(
+                        self._extract_from_idl(
+                            text, rel_path, proj, eff_src, eff_branch, sync_gen
+                        )
+                    )
+                elif ext == ".def":
+                    extracted.extend(
+                        self._extract_from_def(
+                            text, rel_path, proj, eff_src, eff_branch, sync_gen
+                        )
+                    )
+                elif ext == ".rc":
+                    extracted.extend(
+                        self._extract_from_rc(
+                            text, rel_path, proj, eff_src, eff_branch, sync_gen
+                        )
+                    )
+                elif ext in _VB6_DELPHI_EXTS:
+                    extracted.extend(
+                        self._extract_from_vb6_delphi(
+                            text, rel_path, ext, proj, eff_src, eff_branch, sync_gen
+                        )
+                    )
+                elif ext in _ST_LASAL_EXTS:
+                    extracted.extend(
+                        self._extract_from_plc_st_lasal(
+                            text, rel_path, proj, eff_src, eff_branch, sync_gen
+                        )
+                    )
+                elif ext in _VS_PROJ_EXTS:
+                    extracted.extend(
+                        self._extract_from_vs_project(
+                            text, rel_path, proj, eff_src, eff_branch, sync_gen
+                        )
+                    )
+                elif ext in (".bat", ".cmd", ".reg"):
+                    extracted.extend(
+                        self._extract_from_script_reg(
+                            text, rel_path, ext, proj, eff_src, eff_branch, sync_gen
                         )
                     )
                 elif ext == ".md":
@@ -2229,8 +4273,54 @@ class CrossSourceLinker:
                         drift_reason_default="Deployment manifest changed",
                     )
 
+        # 4b. project_dep (.vcxproj <ProjectReference> & .sln ProjectDependencies -> depends_on)
+        proj_provs: Dict[str, List[Dict[str, Any]]] = {}
+        for pa in by_kind.get("project_dep", []):
+            if pa["role"] == "provider":
+                proj_provs.setdefault(str(pa["normalized_key"]), []).append(pa)
+        for pa in by_kind.get("project_dep", []):
+            if pa["role"] != "consumer":
+                continue
+            key = str(pa["normalized_key"])
+            matched_provs = [p for p in proj_provs.get(key, []) if p["source_id"] != pa["source_id"]]
+            for prov in matched_provs:
+                _add_candidate(
+                    src_art=pa,
+                    dst_source_id=str(prov["source_id"]),
+                    dst_branch=str(prov.get("branch") or eff_branch),
+                    dst_node_id=str(prov.get("node_id") or ""),
+                    dst_doc_key=None,
+                    relation_type="depends_on",
+                    contract_key=f"project_ref:{prov['source_id']}",
+                    confidence="high",
+                    confidence_score=0.95,
+                    provider_signature_hash=str(prov.get("signature_hash") or ""),
+                    drift_reason_default="Referenced project manifest changed",
+                    extra_meta={**(pa.get("metadata") or {}), "dst_file_path": prov.get("file_path")},
+                )
+            if not matched_provs and key in reg_src_map and reg_src_map[key] != pa["source_id"]:
+                dst_sid = reg_src_map[key]
+                _add_candidate(
+                    src_art=pa,
+                    dst_source_id=dst_sid,
+                    dst_branch=eff_branch,
+                    dst_node_id="",
+                    dst_doc_key=None,
+                    relation_type="depends_on",
+                    contract_key=f"project_ref:{dst_sid}",
+                    confidence="high",
+                    confidence_score=0.90,
+                    provider_signature_hash=str(pa.get("signature_hash") or ""),
+                    drift_reason_default="Referenced project dependency changed",
+                    extra_meta=dict(pa.get("metadata") or {}),
+                )
+
         # 5. spec_req (from __shared__ docs) -> matching code/contract artifacts (documented_by)
-        non_shared = [a for a in artifacts if a["source_id"] != "__shared__" and a["contract_kind"] != "spec_req"]
+        non_shared = [
+            a
+            for a in artifacts
+            if a["source_id"] != "__shared__" and a["contract_kind"] not in ("spec_req", "plc_token_index")
+        ]
         target_by_token: Dict[str, List[Dict[str, Any]]] = {}
         for t_art in non_shared:
             t_meta = t_art.get("metadata") or {}
@@ -2243,10 +4333,24 @@ class CrossSourceLinker:
                 tokens.add(str(t_art["normalized_key"]))
                 if t_art.get("symbol_name"):
                     tokens.add(str(t_art["symbol_name"]).lower())
-            elif t_art["contract_kind"] in ("event_pub", "event_sub"):
+            elif t_art["contract_kind"] in ("event_pub", "event_sub", "infra_deploy"):
                 tokens.add(str(t_art["normalized_key"]))
-            elif t_art["contract_kind"] == "infra_deploy":
+            elif t_art["contract_kind"] in (
+                "named_pipe",
+                "shared_memory",
+                "scm_service",
+                "com_idl",
+                "win32_msg",
+                "dll_export",
+                "socket_ipc",
+                "plc_lasal_channel",
+            ):
                 tokens.add(str(t_art["normalized_key"]))
+                if t_art.get("symbol_name"):
+                    tokens.add(str(t_art["symbol_name"]).lower())
+                for dt in t_meta.get("doc_tokens") or []:
+                    if dt:
+                        tokens.add(str(dt).lower())
             for tok in tokens:
                 if tok:
                     target_by_token.setdefault(tok, []).append(t_art)
@@ -2275,8 +4379,8 @@ class CrossSourceLinker:
                     dst_doc_key=doc_key,
                     relation_type="documented_by",
                     contract_key=f"spec:{doc_key}:{t_art['normalized_key']}",
-                    confidence="high" if ref_kind in ("endpoint", "symbol") else "medium",
-                    confidence_score=1.0 if ref_kind in ("endpoint", "symbol") else 0.8,
+                    confidence="high" if ref_kind in ("endpoint", "symbol", "pipe", "shm", "uuid") else "medium",
+                    confidence_score=1.0 if ref_kind in ("endpoint", "symbol", "pipe", "shm", "uuid") else 0.8,
                     provider_signature_hash=str(t_art.get("signature_hash") or ""),
                     drift_reason_default="Documented artifact signature changed",
                     extra_meta={
@@ -2286,6 +4390,419 @@ class CrossSourceLinker:
                         "target_symbol": target_label,
                     },
                 )
+
+        # 6. named_pipe -> calls_pipe
+        pipe_provs: Dict[str, List[Dict[str, Any]]] = {}
+        for pa in by_kind.get("named_pipe", []):
+            if pa["role"] == "provider":
+                pipe_provs.setdefault(str(pa["normalized_key"]), []).append(pa)
+        for ca in by_kind.get("named_pipe", []):
+            if ca["role"] != "consumer":
+                continue
+            for prov in pipe_provs.get(str(ca["normalized_key"]), []):
+                if prov["source_id"] == ca["source_id"]:
+                    continue
+                disp = str(prov.get("symbol_name") or ca.get("symbol_name") or ca["normalized_key"])
+                _add_candidate(
+                    src_art=ca,
+                    dst_source_id=str(prov["source_id"]),
+                    dst_branch=str(prov.get("branch") or eff_branch),
+                    dst_node_id=str(prov.get("node_id") or ""),
+                    dst_doc_key=None,
+                    relation_type="calls_pipe",
+                    contract_key=f"pipe:{disp}",
+                    confidence="high",
+                    confidence_score=0.95,
+                    provider_signature_hash=str(prov.get("signature_hash") or ""),
+                    drift_reason_default="Named pipe server contract changed",
+                    extra_meta={"pipe_name": disp, "dst_file_path": prov.get("file_path")},
+                )
+
+        # 7. shared_memory -> shares_shm
+        shm_arts = by_kind.get("shared_memory", [])
+        shm_provs: Dict[str, List[Dict[str, Any]]] = {}
+        for sa in shm_arts:
+            if sa["role"] == "provider":
+                shm_provs.setdefault(str(sa["normalized_key"]), []).append(sa)
+        for sa in shm_arts:
+            nkey = str(sa["normalized_key"])
+            provs = [p for p in shm_provs.get(nkey, []) if p["source_id"] != sa["source_id"]]
+            if sa["role"] == "consumer":
+                for prov in provs:
+                    disp = str(prov.get("symbol_name") or sa.get("symbol_name") or nkey)
+                    _add_candidate(
+                        src_art=sa,
+                        dst_source_id=str(prov["source_id"]),
+                        dst_branch=str(prov.get("branch") or eff_branch),
+                        dst_node_id=str(prov.get("node_id") or ""),
+                        dst_doc_key=None,
+                        relation_type="shares_shm",
+                        contract_key=f"shm:{disp}",
+                        confidence="high",
+                        confidence_score=0.95,
+                        provider_signature_hash=str(prov.get("signature_hash") or ""),
+                        drift_reason_default="Shared memory layout or mapping changed",
+                        extra_meta={"shm_name": disp, "dst_file_path": prov.get("file_path")},
+                    )
+            elif sa["role"] == "provider" and len(provs) > 0:
+                # Peer CreateFileMapping / CreateOrOpen across sources
+                for prov in provs:
+                    if str(sa["source_id"]) < str(prov["source_id"]):
+                        disp = str(prov.get("symbol_name") or sa.get("symbol_name") or nkey)
+                        _add_candidate(
+                            src_art=sa,
+                            dst_source_id=str(prov["source_id"]),
+                            dst_branch=str(prov.get("branch") or eff_branch),
+                            dst_node_id=str(prov.get("node_id") or ""),
+                            dst_doc_key=None,
+                            relation_type="shares_shm",
+                            contract_key=f"shm:{disp}",
+                            confidence="high",
+                            confidence_score=0.90,
+                            provider_signature_hash=str(prov.get("signature_hash") or ""),
+                            drift_reason_default="Shared memory layout changed",
+                            is_bidirectional=True,
+                            extra_meta={"shm_name": disp, "dst_file_path": prov.get("file_path")},
+                        )
+
+        # 8. scm_service -> controls_service
+        svc_provs: Dict[str, List[Dict[str, Any]]] = {}
+        for sa in by_kind.get("scm_service", []):
+            if sa["role"] == "provider":
+                svc_provs.setdefault(str(sa["normalized_key"]), []).append(sa)
+        for sa in by_kind.get("scm_service", []):
+            if sa["role"] != "consumer":
+                continue
+            nkey = str(sa["normalized_key"])
+            matched_provs = [p for p in svc_provs.get(nkey, []) if p["source_id"] != sa["source_id"]]
+            for prov in matched_provs:
+                disp = str(prov.get("symbol_name") or sa.get("symbol_name") or nkey)
+                _add_candidate(
+                    src_art=sa,
+                    dst_source_id=str(prov["source_id"]),
+                    dst_branch=str(prov.get("branch") or eff_branch),
+                    dst_node_id=str(prov.get("node_id") or ""),
+                    dst_doc_key=None,
+                    relation_type="controls_service",
+                    contract_key=f"service:{disp}",
+                    confidence="high",
+                    confidence_score=0.95,
+                    provider_signature_hash=str(prov.get("signature_hash") or ""),
+                    drift_reason_default="Windows Service handler changed",
+                    extra_meta={"service_name": disp, "dst_file_path": prov.get("file_path")},
+                )
+            if not matched_provs and nkey in reg_src_map and reg_src_map[nkey] != sa["source_id"]:
+                dst_sid = reg_src_map[nkey]
+                disp = str(sa.get("symbol_name") or dst_sid)
+                _add_candidate(
+                    src_art=sa,
+                    dst_source_id=dst_sid,
+                    dst_branch=eff_branch,
+                    dst_node_id="",
+                    dst_doc_key=None,
+                    relation_type="controls_service",
+                    contract_key=f"service:{disp}",
+                    confidence="medium",
+                    confidence_score=0.80,
+                    provider_signature_hash=str(sa.get("signature_hash") or ""),
+                    drift_reason_default="Target Windows Service changed",
+                    extra_meta={"service_name": disp},
+                )
+
+        # 9. com_idl -> calls_com
+        com_provs_by_alias: Dict[str, List[Dict[str, Any]]] = {}
+        com_arts = by_kind.get("com_idl", [])
+        for ca in com_arts:
+            if ca["role"] == "provider":
+                aliases = set([str(ca["normalized_key"])] + [str(x).lower() for x in ((ca.get("metadata") or {}).get("match_aliases") or [])])
+                for al in aliases:
+                    if al:
+                        com_provs_by_alias.setdefault(al, []).append(ca)
+        for ca in com_arts:
+            aliases = [str(ca["normalized_key"])] + [str(x).lower() for x in ((ca.get("metadata") or {}).get("match_aliases") or [])]
+            matched: List[Dict[str, Any]] = []
+            seen_ids: Set[str] = set()
+            for al in aliases:
+                for prov in com_provs_by_alias.get(al, []):
+                    if prov["source_id"] == ca["source_id"]:
+                        continue
+                    pid = str(prov["id"])
+                    if pid not in seen_ids:
+                        seen_ids.add(pid)
+                        matched.append(prov)
+            if ca["role"] == "consumer":
+                for prov in matched:
+                    disp = str(prov.get("symbol_name") or ca.get("symbol_name") or prov["normalized_key"])
+                    _add_candidate(
+                        src_art=ca,
+                        dst_source_id=str(prov["source_id"]),
+                        dst_branch=str(prov.get("branch") or eff_branch),
+                        dst_node_id=str(prov.get("node_id") or ""),
+                        dst_doc_key=None,
+                        relation_type="calls_com",
+                        contract_key=f"com:{disp}",
+                        confidence="high",
+                        confidence_score=0.95,
+                        provider_signature_hash=str(prov.get("signature_hash") or ""),
+                        drift_reason_default="COM/IDL interface contract changed",
+                        extra_meta={"com_target": disp, "uuid": (prov.get("metadata") or {}).get("uuid"), "dst_file_path": prov.get("file_path")},
+                    )
+            elif ca["role"] == "provider":
+                for prov in matched:
+                    if str(ca["source_id"]) < str(prov["source_id"]):
+                        disp = str(prov.get("symbol_name") or ca.get("symbol_name") or prov["normalized_key"])
+                        _add_candidate(
+                            src_art=ca,
+                            dst_source_id=str(prov["source_id"]),
+                            dst_branch=str(prov.get("branch") or eff_branch),
+                            dst_node_id=str(prov.get("node_id") or ""),
+                            dst_doc_key=None,
+                            relation_type="calls_com",
+                            contract_key=f"com:{disp}",
+                            confidence="medium",
+                            confidence_score=0.85,
+                            provider_signature_hash=str(prov.get("signature_hash") or ""),
+                            drift_reason_default="COM UUID definition changed",
+                            is_bidirectional=True,
+                            extra_meta={"com_target": disp, "uuid": (prov.get("metadata") or {}).get("uuid"), "dst_file_path": prov.get("file_path")},
+                        )
+
+        # 10. win32_msg -> sends_win32_msg
+        msg_arts = by_kind.get("win32_msg", [])
+        msg_by_key: Dict[str, List[Dict[str, Any]]] = {}
+        for ma in msg_arts:
+            msg_by_key.setdefault(str(ma["normalized_key"]), []).append(ma)
+        for nkey, group in msg_by_key.items():
+            senders = [a for a in group if a["role"] == "consumer"]
+            receivers = [a for a in group if a["role"] == "provider"]
+            peers = [a for a in group if a["role"] == "shared"]
+            for snd in senders:
+                for rcv in receivers + peers:
+                    if snd["source_id"] == rcv["source_id"]:
+                        continue
+                    disp = str(rcv.get("symbol_name") or snd.get("symbol_name") or nkey)
+                    _add_candidate(
+                        src_art=snd,
+                        dst_source_id=str(rcv["source_id"]),
+                        dst_branch=str(rcv.get("branch") or eff_branch),
+                        dst_node_id=str(rcv.get("node_id") or ""),
+                        dst_doc_key=None,
+                        relation_type="sends_win32_msg",
+                        contract_key=f"win32_msg:{disp}",
+                        confidence="high",
+                        confidence_score=0.95,
+                        provider_signature_hash=str(rcv.get("signature_hash") or ""),
+                        drift_reason_default="Win32 window message contract changed",
+                        extra_meta={"message": disp, "dst_file_path": rcv.get("file_path")},
+                    )
+            for p_a in peers:
+                for rcv in receivers:
+                    if p_a["source_id"] == rcv["source_id"]:
+                        continue
+                    disp = str(rcv.get("symbol_name") or p_a.get("symbol_name") or nkey)
+                    _add_candidate(
+                        src_art=p_a,
+                        dst_source_id=str(rcv["source_id"]),
+                        dst_branch=str(rcv.get("branch") or eff_branch),
+                        dst_node_id=str(rcv.get("node_id") or ""),
+                        dst_doc_key=None,
+                        relation_type="sends_win32_msg",
+                        contract_key=f"win32_msg:{disp}",
+                        confidence="medium",
+                        confidence_score=0.85,
+                        provider_signature_hash=str(rcv.get("signature_hash") or ""),
+                        drift_reason_default="Win32 registered message handler changed",
+                        extra_meta={"message": disp, "dst_file_path": rcv.get("file_path")},
+                    )
+            if not senders and not receivers and len(peers) >= 2:
+                for idx_i, pa in enumerate(peers):
+                    for pb in peers[idx_i + 1 :]:
+                        if pa["source_id"] == pb["source_id"]:
+                            continue
+                        disp = str(pb.get("symbol_name") or pa.get("symbol_name") or nkey)
+                        _add_candidate(
+                            src_art=pa,
+                            dst_source_id=str(pb["source_id"]),
+                            dst_branch=str(pb.get("branch") or eff_branch),
+                            dst_node_id=str(pb.get("node_id") or ""),
+                            dst_doc_key=None,
+                            relation_type="sends_win32_msg",
+                            contract_key=f"win32_msg:{disp}",
+                            confidence="medium",
+                            confidence_score=0.85,
+                            provider_signature_hash=str(pb.get("signature_hash") or ""),
+                            drift_reason_default="Win32 registered message changed",
+                            is_bidirectional=True,
+                            extra_meta={"message": disp, "dst_file_path": pb.get("file_path")},
+                        )
+
+        # 11. dll_export -> loads_dll (prefer dllexport C++ signature provider over .def for drift precision)
+        dll_provs: Dict[str, List[Dict[str, Any]]] = {}
+        for da in by_kind.get("dll_export", []):
+            if da["role"] == "provider":
+                dll_provs.setdefault(str(da["normalized_key"]), []).append(da)
+        for key, plist in dll_provs.items():
+            plist.sort(
+                key=lambda a: 2 if (a.get("metadata") or {}).get("export_kind") == "dllexport" else 1,
+                reverse=True,
+            )
+        for da in by_kind.get("dll_export", []):
+            if da["role"] != "consumer":
+                continue
+            nkey = str(da["normalized_key"])
+            matched_provs = [p for p in dll_provs.get(nkey, []) if p["source_id"] != da["source_id"]]
+            seen_dst_sources: Set[str] = set()
+            for prov in matched_provs:
+                dsid = str(prov["source_id"])
+                if dsid in seen_dst_sources:
+                    continue
+                seen_dst_sources.add(dsid)
+                disp = str(da.get("symbol_name") or prov.get("symbol_name") or nkey)
+                ck_prefix = "dll" if nkey.startswith("dll:") else "export"
+                ck = f"dll:{disp}" if ck_prefix == "dll" else f"export:{disp}"
+                _add_candidate(
+                    src_art=da,
+                    dst_source_id=dsid,
+                    dst_branch=str(prov.get("branch") or eff_branch),
+                    dst_node_id=str(prov.get("node_id") or ""),
+                    dst_doc_key=None,
+                    relation_type="loads_dll",
+                    contract_key=ck,
+                    confidence="high",
+                    confidence_score=0.95,
+                    provider_signature_hash=str(prov.get("signature_hash") or ""),
+                    drift_reason_default="DLL export signature changed",
+                    extra_meta={"export_or_dll": disp, "dst_file_path": prov.get("file_path")},
+                )
+            if not matched_provs and nkey.startswith("dll:"):
+                dll_stem = nkey.split(":", 1)[1]
+                if dll_stem in reg_src_map and reg_src_map[dll_stem] != da["source_id"]:
+                    dst_sid = reg_src_map[dll_stem]
+                    disp = str(da.get("symbol_name") or dll_stem)
+                    _add_candidate(
+                        src_art=da,
+                        dst_source_id=dst_sid,
+                        dst_branch=eff_branch,
+                        dst_node_id="",
+                        dst_doc_key=None,
+                        relation_type="loads_dll",
+                        contract_key=f"dll:{disp}",
+                        confidence="medium",
+                        confidence_score=0.80,
+                        provider_signature_hash=str(da.get("signature_hash") or ""),
+                        drift_reason_default="Target DLL source changed",
+                        extra_meta={"export_or_dll": disp},
+                    )
+
+        # 12. socket_ipc -> calls_socket
+        sock_provs: Dict[str, List[Dict[str, Any]]] = {}
+        for sa in by_kind.get("socket_ipc", []):
+            if sa["role"] == "provider":
+                sock_provs.setdefault(str(sa["normalized_key"]), []).append(sa)
+        for sa in by_kind.get("socket_ipc", []):
+            if sa["role"] != "consumer":
+                continue
+            c_host = str((sa.get("metadata") or {}).get("host") or "").lower()
+            for prov in sock_provs.get(str(sa["normalized_key"]), []):
+                if prov["source_id"] == sa["source_id"]:
+                    continue
+                p_host = str((prov.get("metadata") or {}).get("host") or "").lower()
+                if c_host not in _LOCAL_SOCKET_HOSTS and p_host not in _LOCAL_SOCKET_HOSTS and c_host != p_host:
+                    continue
+                _add_candidate(
+                    src_art=sa,
+                    dst_source_id=str(prov["source_id"]),
+                    dst_branch=str(prov.get("branch") or eff_branch),
+                    dst_node_id=str(prov.get("node_id") or ""),
+                    dst_doc_key=None,
+                    relation_type="calls_socket",
+                    contract_key=f"socket:{sa['normalized_key']}",
+                    confidence="high",
+                    confidence_score=0.90,
+                    provider_signature_hash=str(prov.get("signature_hash") or ""),
+                    drift_reason_default="Socket IPC endpoint changed",
+                    extra_meta={"port": (prov.get("metadata") or {}).get("port"), "dst_file_path": prov.get("file_path")},
+                )
+
+        # 13. plc_lasal_channel -> links_plc_channel (LASAL SERVER/endpoint) / shares_plc_tag (VAR_GLOBAL/IO)
+        plc_arts = by_kind.get("plc_lasal_channel", [])
+        plc_provs_by_key: Dict[str, List[Dict[str, Any]]] = {}
+        plc_provs_by_leaf: Dict[str, List[Dict[str, Any]]] = {}
+        for pa in plc_arts:
+            if pa["role"] != "provider":
+                continue
+            plc_provs_by_key.setdefault(str(pa["normalized_key"]), []).append(pa)
+            leaf = str(pa.get("symbol_name") or "").split(".")[-1].strip().lower()
+            if leaf:
+                plc_provs_by_leaf.setdefault(leaf, []).append(pa)
+
+        def _plc_rel_for_provider(prov: Dict[str, Any]) -> Tuple[str, str]:
+            pkind = str((prov.get("metadata") or {}).get("plc_kind") or "")
+            if pkind in ("var_global", "var_external", "io_address"):
+                return "shares_plc_tag", f"plc_tag:{prov.get('symbol_name') or prov['normalized_key']}"
+            return "links_plc_channel", f"plc_channel:{prov.get('symbol_name') or prov['normalized_key']}"
+
+        for ca in plc_arts:
+            if ca["role"] != "consumer":
+                continue
+            nkey = str(ca["normalized_key"])
+            leaf = str((ca.get("metadata") or {}).get("leaf") or ca.get("symbol_name") or "").split(".")[-1].strip().lower()
+            matched = list(plc_provs_by_key.get(nkey, []))
+            if not matched and leaf:
+                matched = list(plc_provs_by_leaf.get(leaf, []))
+            for prov in matched:
+                if prov["source_id"] == ca["source_id"]:
+                    continue
+                rel_t, c_key = _plc_rel_for_provider(prov)
+                _add_candidate(
+                    src_art=ca,
+                    dst_source_id=str(prov["source_id"]),
+                    dst_branch=str(prov.get("branch") or eff_branch),
+                    dst_node_id=str(prov.get("node_id") or ""),
+                    dst_doc_key=None,
+                    relation_type=rel_t,
+                    contract_key=c_key,
+                    confidence="high",
+                    confidence_score=0.95,
+                    provider_signature_hash=str(prov.get("signature_hash") or ""),
+                    drift_reason_default="PLC channel or tag signature changed",
+                    extra_meta={"plc_kind": (prov.get("metadata") or {}).get("plc_kind"), "dst_file_path": prov.get("file_path")},
+                )
+
+        # Also link C++/HMI/VB6 files referencing PLC SERVER channels / VAR_GLOBAL tags via plc_token_index
+        for tok_art in by_kind.get("plc_token_index", []):
+            t_meta = tok_art.get("metadata") or {}
+            str_toks = {str(t).lower() for t in (t_meta.get("string_tokens") or [])}
+            id_toks = {str(t).lower() for t in (t_meta.get("ident_tokens") or [])}
+            for leaf, provs in plc_provs_by_leaf.items():
+                if not leaf or len(leaf) < 3:
+                    continue
+                is_str_hit = leaf in str_toks
+                is_ident_hit = leaf in id_toks and (leaf.startswith("g_") or len(leaf) >= 6)
+                if not (is_str_hit or is_ident_hit):
+                    continue
+                for prov in provs:
+                    if prov["source_id"] == tok_art["source_id"]:
+                        continue
+                    rel_t, c_key = _plc_rel_for_provider(prov)
+                    _add_candidate(
+                        src_art=tok_art,
+                        dst_source_id=str(prov["source_id"]),
+                        dst_branch=str(prov.get("branch") or eff_branch),
+                        dst_node_id=str(prov.get("node_id") or ""),
+                        dst_doc_key=None,
+                        relation_type=rel_t,
+                        contract_key=c_key,
+                        confidence="high" if is_str_hit else "medium",
+                        confidence_score=0.90 if is_str_hit else 0.80,
+                        provider_signature_hash=str(prov.get("signature_hash") or ""),
+                        drift_reason_default="PLC channel or tag signature changed",
+                        extra_meta={
+                            "match_mode": "string_literal" if is_str_hit else "identifier",
+                            "plc_kind": (prov.get("metadata") or {}).get("plc_kind"),
+                            "dst_file_path": prov.get("file_path"),
+                        },
+                    )
 
         return candidates
 
@@ -2512,6 +5029,116 @@ class CrossSourceLinker:
             "relations": updated_rels,
         }
 
+    @staticmethod
+    def _collect_sln_project_dep_artifacts(
+        proj: str,
+        eff_branch: str,
+        eff_map: Dict[str, Optional[Union[str, Path]]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Parse parent `.sln` files for `ProjectSection(ProjectDependencies)` mapped to `eff_map` sources."""
+        dir_to_sid: Dict[Path, str] = {}
+        parent_dirs: Set[Path] = set()
+        for sid, raw_p in eff_map.items():
+            if sid == "__shared__" or not raw_p:
+                continue
+            p = Path(raw_p)
+            if p.is_dir():
+                res = p.resolve()
+                dir_to_sid[res] = sid
+                if res.parent != res:
+                    parent_dirs.add(res.parent)
+
+        if len(dir_to_sid) < 2:
+            return {}
+
+        sln_files: Set[Path] = set()
+        for pdir in sorted(parent_dirs):
+            try:
+                for cand in pdir.iterdir():
+                    if cand.is_file() and cand.suffix.lower() == ".sln":
+                        sln_files.add(cand.resolve())
+            except Exception:
+                continue
+
+        if not sln_files:
+            return {}
+
+        proj_re = re.compile(
+            r'^\s*Project\(\s*"\{?([0-9A-Fa-f-]+)\}?"\s*\)\s*=\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"\{?([0-9A-Fa-f-]+)\}?"',
+            re.IGNORECASE,
+        )
+        dep_re = re.compile(r"^\s*\{?([0-9A-Fa-f-]+)\}?\s*=\s*\{?[0-9A-Fa-f-]+\}?\s*$")
+        out: Dict[str, List[Dict[str, Any]]] = {}
+
+        for sln_path in sorted(sln_files):
+            try:
+                content, _ = read_text_with_encoding(sln_path)
+            except Exception:
+                continue
+            guid_to_sid: Dict[str, str] = {}
+            raw_deps: List[Tuple[str, str]] = []
+            lines = content.splitlines()
+            idx = 0
+            while idx < len(lines):
+                m_proj = proj_re.match(lines[idx])
+                if not m_proj:
+                    idx += 1
+                    continue
+                type_guid = m_proj.group(1).upper()
+                raw_rel = m_proj.group(3).strip().replace("\\", "/")
+                proj_guid = m_proj.group(4).upper()
+                idx += 1
+
+                dep_guids: List[str] = []
+                in_deps = False
+                while idx < len(lines):
+                    ls = lines[idx].strip()
+                    if ls.startswith("EndProject"):
+                        idx += 1
+                        break
+                    if re.match(r"^ProjectSection\s*\(\s*ProjectDependencies\s*\)", ls, re.IGNORECASE):
+                        in_deps = True
+                    elif ls.startswith("EndProjectSection"):
+                        in_deps = False
+                    elif in_deps:
+                        dm = dep_re.match(ls)
+                        if dm:
+                            dep_guids.append(dm.group(1).upper())
+                    idx += 1
+
+                if type_guid == "2150E333-8FDC-42A3-9474-1A3956D46DE8" or not raw_rel:
+                    continue
+                if ".." in Path(raw_rel).parts or Path(raw_rel).is_absolute():
+                    continue
+                target = (sln_path.parent / raw_rel).resolve()
+                if not target.is_relative_to(sln_path.parent.resolve()):
+                    continue
+                proj_dir = target if target.is_dir() else target.parent
+                sid = dir_to_sid.get(proj_dir)
+                if sid:
+                    guid_to_sid[proj_guid] = sid
+                    for dg in dep_guids:
+                        raw_deps.append((sid, dg))
+
+            for src_sid, dst_guid in raw_deps:
+                dst_sid = guid_to_sid.get(dst_guid)
+                if not dst_sid or dst_sid == src_sid:
+                    continue
+                out.setdefault(src_sid, []).append(
+                    _make_artifact(
+                        project_id=proj,
+                        source_id=src_sid,
+                        branch=eff_branch,
+                        contract_kind="project_dep",
+                        role="consumer",
+                        normalized_key=dst_sid.lower(),
+                        file_path=sln_path.name,
+                        symbol_name=dst_sid,
+                        metadata={"via": "sln_project_dependencies", "sln_file": sln_path.name, "target_guid": dst_guid},
+                    )
+                )
+        return out
+
     # ------------------------------------------------------------------
     # Combined Auto-Link Orchestrator (Phase A + Phase B)
     # ------------------------------------------------------------------
@@ -2551,6 +5178,8 @@ class CrossSourceLinker:
             else:
                 eff_map[sid] = None
 
+        sln_dep_arts = self._collect_sln_project_dep_artifacts(proj, eff_branch, eff_map)
+
         total_artifacts = 0
         scanned_sources: List[str] = []
 
@@ -2563,6 +5192,46 @@ class CrossSourceLinker:
                 branch=eff_branch,
                 workspace_path=ws_path,
             )
+            extra_sln = sln_dep_arts.get(sid) or []
+            if extra_sln:
+                now_ms = int(time.time() * 1000)
+                for art in extra_sln:
+                    meta_json = json.dumps(art.get("metadata") or {})
+                    tenant_manager._project_root_execute(
+                        proj,
+                        """
+                        INSERT INTO cross_source_contract_artifacts (
+                            id, project_id, source_id, branch, contract_kind, role,
+                            normalized_key, node_id, file_path, symbol_name, signature_hash,
+                            metadata_json, sync_generation, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (project_id, source_id, branch, contract_kind, role, normalized_key, node_id)
+                        DO UPDATE SET
+                            file_path = excluded.file_path,
+                            symbol_name = excluded.symbol_name,
+                            signature_hash = excluded.signature_hash,
+                            metadata_json = excluded.metadata_json,
+                            sync_generation = excluded.sync_generation,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            art["id"],
+                            proj,
+                            sid,
+                            eff_branch,
+                            art["contract_kind"],
+                            art["role"],
+                            art["normalized_key"],
+                            art["node_id"],
+                            art["file_path"],
+                            art["symbol_name"],
+                            art["signature_hash"],
+                            meta_json,
+                            art["sync_generation"],
+                            now_ms,
+                        ),
+                    )
+                total_artifacts += len(extra_sln)
             total_artifacts += len(arts)
             scanned_sources.append(sid)
 

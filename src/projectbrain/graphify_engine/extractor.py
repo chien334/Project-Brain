@@ -10,25 +10,32 @@ clustering, architectural God-node & cross-community bridge analysis, and local 
 from __future__ import annotations
 
 import ast
+import bisect
 import concurrent.futures
 import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import networkx as nx
 
-logger = logging.getLogger(__name__)
+from projectbrain.graphify_engine.extractor_registry import get_default_registry
+from projectbrain.graphify_engine.legacy_encoding import (
+    decode_legacy_bytes,
+    read_text_with_encoding,
+)
 
-# Guard external graphify.extract calls in case Tree-sitter reuses module-level C Parser state.
-_TREE_SITTER_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Concurrency-Safe Defensive DTO Import Pattern
@@ -114,7 +121,13 @@ CODE_EXTENSIONS: Set[str] = {
     ".go",
     ".rs",
     ".java",
-    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".inl", ".tpp",
+    ".idl", ".def", ".rc",
+    ".st", ".scl", ".exp", ".pou",
+    ".bas", ".cls", ".frm",
+    ".pas", ".dfm",
+    ".cbl", ".cob",
+    ".sql", ".bat", ".cmd", ".reg",
     ".cs",
     ".rb",
     ".php",
@@ -128,6 +141,17 @@ CODE_EXTENSIONS: Set[str] = {
     ".ps1",
     ".m",
 }
+
+_CPP_LEGACY_EXTS: Set[str] = {".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".inl", ".tpp"}
+_ST_LASAL_EXTS: Set[str] = {".st", ".scl", ".exp", ".pou"}
+_IDL_EXTS: Set[str] = {".idl"}
+_DEF_EXTS: Set[str] = {".def"}
+_RC_EXTS: Set[str] = {".rc"}
+_VB6_EXTS: Set[str] = {".bas", ".cls", ".frm"}
+_DELPHI_EXTS: Set[str] = {".pas", ".dfm"}
+_COBOL_EXTS: Set[str] = {".cbl", ".cob"}
+_SQL_EXTS: Set[str] = {".sql"}
+_SCRIPT_REG_EXTS: Set[str] = {".bat", ".cmd", ".reg"}
 
 DOC_EXTENSIONS: Set[str] = {
     ".md", ".markdown", ".mdown",
@@ -160,7 +184,7 @@ IGNORED_DIRS: Set[str] = {
 
 def _strip_markdown_frontmatter(content: bytes) -> bytes:
     """Strip YAML frontmatter from Markdown bytes before computing semantic hash."""
-    text = content.decode("utf-8", errors="replace")
+    text, _ = decode_legacy_bytes(content)
     if text.startswith("---"):
         end = text.find("\n---", 3)
         if end != -1:
@@ -173,6 +197,2414 @@ def _slugify(val: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", val.strip()).lower()
     cleaned = re.sub(r"_+", "_", cleaned).strip("_")
     return cleaned or "entity"
+
+
+# ---------------------------------------------------------------------------
+# Legacy Language & Resource Heuristic Parsers
+# ---------------------------------------------------------------------------
+_WIN32_SESSION0_APIS: Dict[str, str] = {
+    # Named Pipes
+    "CreateNamedPipe": "named_pipe",
+    "CallNamedPipe": "named_pipe",
+    "ConnectNamedPipe": "named_pipe",
+    "DisconnectNamedPipe": "named_pipe",
+    "WaitNamedPipe": "named_pipe",
+    "PeekNamedPipe": "named_pipe",
+    "SetNamedPipeHandleState": "named_pipe",
+    "GetNamedPipeClientProcessId": "named_pipe",
+    "ImpersonateNamedPipeClient": "named_pipe",
+    "TransactNamedPipe": "named_pipe",
+    "CreateFile": "named_pipe",
+    "ReadFile": "named_pipe",
+    "WriteFile": "named_pipe",
+    # Shared Memory / File Mapping
+    "CreateFileMapping": "shared_memory",
+    "OpenFileMapping": "shared_memory",
+    "MapViewOfFile": "shared_memory",
+    "MapViewOfFileEx": "shared_memory",
+    "UnmapViewOfFile": "shared_memory",
+    "FlushViewOfFile": "shared_memory",
+    # Windows Service Control Manager (SCM)
+    "OpenSCManager": "scm_service",
+    "CreateService": "scm_service",
+    "OpenService": "scm_service",
+    "StartService": "scm_service",
+    "ControlService": "scm_service",
+    "DeleteService": "scm_service",
+    "CloseServiceHandle": "scm_service",
+    "RegisterServiceCtrlHandler": "scm_service",
+    "RegisterServiceCtrlHandlerEx": "scm_service",
+    "SetServiceStatus": "scm_service",
+    "StartServiceCtrlDispatcher": "scm_service",
+    "QueryServiceStatus": "scm_service",
+    "QueryServiceStatusEx": "scm_service",
+    "ChangeServiceConfig": "scm_service",
+    # Win32 Window Messages & UI IPC
+    "SendMessage": "win32_msg",
+    "SendMessageTimeout": "win32_msg",
+    "PostMessage": "win32_msg",
+    "PostThreadMessage": "win32_msg",
+    "RegisterWindowMessage": "win32_msg",
+    "FindWindow": "win32_msg",
+    "FindWindowEx": "win32_msg",
+    "BroadcastSystemMessage": "win32_msg",
+    # COM / DCOM / RPC
+    "CoInitialize": "com",
+    "CoInitializeEx": "com",
+    "CoUninitialize": "com",
+    "CoCreateInstance": "com",
+    "CoCreateInstanceEx": "com",
+    "CoGetClassObject": "com",
+    "CoRegisterClassObject": "com",
+    "CoRevokeClassObject": "com",
+    "CoInitializeSecurity": "com",
+    "RpcServerListen": "rpc",
+    "RpcServerUseProtseqEp": "rpc",
+    # Dynamic DLL Loading
+    "LoadLibrary": "dll_loader",
+    "LoadLibraryEx": "dll_loader",
+    "GetProcAddress": "dll_loader",
+    "FreeLibrary": "dll_loader",
+    "GetModuleHandle": "dll_loader",
+    # Winsock / Sockets
+    "WSAStartup": "winsock",
+    "WSACleanup": "winsock",
+    "WSASocket": "winsock",
+    "socket": "winsock",
+    "bind": "winsock",
+    "listen": "winsock",
+    "accept": "winsock",
+    "connect": "winsock",
+    "send": "winsock",
+    "recv": "winsock",
+    # Synchronization & Session 0 Bridging
+    "CreateMutex": "sync_session0",
+    "OpenMutex": "sync_session0",
+    "CreateEvent": "sync_session0",
+    "OpenEvent": "sync_session0",
+    "SetEvent": "sync_session0",
+    "ResetEvent": "sync_session0",
+    "CreateSemaphore": "sync_session0",
+    "OpenSemaphore": "sync_session0",
+    "WaitForSingleObject": "sync_session0",
+    "WaitForMultipleObjects": "sync_session0",
+    "WTSQueryUserToken": "sync_session0",
+    "WTSEnumerateSessions": "sync_session0",
+    "WTSSendMessage": "sync_session0",
+    "CreateProcessAsUser": "sync_session0",
+    "DuplicateTokenEx": "sync_session0",
+    "DeviceIoControl": "sync_session0",
+}
+
+_ST_IGNORED_CALLS: Set[str] = {
+    "if", "elsif", "else", "case", "of", "for", "while", "repeat", "until",
+    "return", "exit", "continue", "and", "or", "xor", "not", "mod",
+    "adr", "sizeof", "ref", "super", "this", "array", "string", "wstring",
+    "abs", "sqrt", "sin", "cos", "tan", "min", "max", "limit", "sel", "mux",
+    "move", "shl", "shr", "rol", "ror", "len", "concat", "find",
+}
+
+_ST_PRIMITIVE_TYPES: Set[str] = {
+    "bool", "byte", "word", "dword", "lword", "sint", "usint", "int", "uint",
+    "dint", "udint", "lint", "ulint", "real", "lreal", "time", "ltime",
+    "date", "tod", "dt", "string", "wstring", "char", "wchar", "any", "pointer",
+}
+
+_CPP_IGNORED_NAMES: Set[str] = {
+    "if", "else", "for", "while", "switch", "case", "catch", "return",
+    "sizeof", "alignof", "decltype", "typedef", "struct", "class", "enum",
+    "union", "namespace", "using", "delete", "new", "throw", "public",
+    "private", "protected", "do", "goto", "break", "continue", "defined",
+}
+
+
+def _lookup_win32_api(name: str) -> Optional[str]:
+    """Return Win32 IPC/Session-0 category if ``name`` matches a known API (A/W aware)."""
+    if name in _WIN32_SESSION0_APIS:
+        return _WIN32_SESSION0_APIS[name]
+    if len(name) > 2 and name[-1] in ("A", "W") and name[0].isupper():
+        base = name[:-1]
+        if base in _WIN32_SESSION0_APIS:
+            return _WIN32_SESSION0_APIS[base]
+    return None
+
+
+def _strip_comments_preserve_lines(
+    text: str,
+    *,
+    line_prefixes: Tuple[str, ...] = ("//",),
+    block_pairs: Tuple[Tuple[str, str], ...] = (("/*", "*/"),),
+    string_delims: Tuple[str, ...] = ('"', "'"),
+    backslash_escapes: bool = True,
+) -> Tuple[str, str]:
+    """Strip comments (and optionally string interiors) while keeping exact line numbers."""
+    n = len(text)
+    no_comments: List[str] = []
+    no_strings: List[str] = []
+    i = 0
+    block_close: Optional[str] = None
+    in_line_comment = False
+    quote_char: Optional[str] = None
+
+    while i < n:
+        ch = text[i]
+        if block_close is not None:
+            if text.startswith(block_close, i):
+                pad = " " * len(block_close)
+                no_comments.append(pad)
+                no_strings.append(pad)
+                i += len(block_close)
+                block_close = None
+            else:
+                out = "\n" if ch == "\n" else " "
+                no_comments.append(out)
+                no_strings.append(out)
+                i += 1
+        elif in_line_comment:
+            if ch == "\n":
+                no_comments.append("\n")
+                no_strings.append("\n")
+                in_line_comment = False
+            else:
+                no_comments.append(" ")
+                no_strings.append(" ")
+            i += 1
+        elif quote_char is not None:
+            if backslash_escapes and ch == "\\" and i + 1 < n:
+                nxt = text[i + 1]
+                no_comments.append(ch + nxt)
+                no_strings.append(" " + ("\n" if nxt == "\n" else " "))
+                i += 2
+            elif ch == quote_char:
+                if not backslash_escapes and i + 1 < n and text[i + 1] == quote_char:
+                    no_comments.append(ch + ch)
+                    no_strings.append("  ")
+                    i += 2
+                else:
+                    no_comments.append(ch)
+                    no_strings.append(ch)
+                    quote_char = None
+                    i += 1
+            else:
+                no_comments.append(ch)
+                no_strings.append("\n" if ch == "\n" else " ")
+                i += 1
+        else:
+            matched_block = False
+            for open_tok, close_tok in block_pairs:
+                if text.startswith(open_tok, i):
+                    pad = " " * len(open_tok)
+                    no_comments.append(pad)
+                    no_strings.append(pad)
+                    block_close = close_tok
+                    i += len(open_tok)
+                    matched_block = True
+                    break
+            if matched_block:
+                continue
+
+            matched_line = False
+            for pref in line_prefixes:
+                if text.startswith(pref, i):
+                    pad = " " * len(pref)
+                    no_comments.append(pad)
+                    no_strings.append(pad)
+                    in_line_comment = True
+                    i += len(pref)
+                    matched_line = True
+                    break
+            if matched_line:
+                continue
+
+            if ch in string_delims:
+                quote_char = ch
+                no_comments.append(ch)
+                no_strings.append(ch)
+                i += 1
+            else:
+                no_comments.append(ch)
+                no_strings.append(ch)
+                i += 1
+
+    return "".join(no_comments), "".join(no_strings)
+
+
+def _compute_line_starts(text: str) -> List[int]:
+    """Return 0-based byte/char offsets where each 1-based line begins."""
+    starts = [0]
+    for m in re.finditer("\n", text):
+        starts.append(m.end())
+    return starts
+
+
+def _line_of_offset(line_starts: List[int], offset: int) -> int:
+    """Map character offset to 1-based line number."""
+    return bisect.bisect_right(line_starts, offset)
+
+
+def _find_matching_delimiter(text: str, open_idx: int, open_ch: str = "{", close_ch: str = "}") -> int:
+    """Find matching closing delimiter from ``open_idx``; returns ``-1`` if unmatched."""
+    depth = 0
+    n = len(text)
+    for idx in range(open_idx, n):
+        c = text[idx]
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _clean_comment_fragment(raw_line: str) -> str:
+    """Strip common comment markers from a single comment line."""
+    s = raw_line.strip()
+    for prefix in ("///", "//!", "//", "*>", "/*", "(*", ";", "'"):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+    for suffix in ("*/", "*)"):
+        if s.endswith(suffix):
+            s = s[:-len(suffix)].strip()
+    if s.startswith("*") and not s.startswith("*/"):
+        s = s[1:].strip()
+    if s.startswith("{") and s.endswith("}") and not s.startswith("{$"):
+        s = s[1:-1].strip()
+    return s
+
+
+def _extract_inline_comment(line: str, prefixes: Tuple[str, ...] = ("//", "(*", ";", "'", "*>")) -> str:
+    """Extract an inline trailing comment outside string literals on ``line``."""
+    in_quote: Optional[str] = None
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if in_quote is not None:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == in_quote:
+                in_quote = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+            i += 1
+            continue
+        if line.startswith("/*", i):
+            end = line.find("*/", i + 2)
+            body = line[i + 2:end] if end != -1 else line[i + 2:]
+            return body.strip()
+        if line.startswith("(*", i):
+            end = line.find("*)", i + 2)
+            body = line[i + 2:end] if end != -1 else line[i + 2:]
+            return body.strip()
+        for pref in prefixes:
+            if pref not in ("(*",) and line.startswith(pref, i):
+                return line[i + len(pref):].strip()
+        i += 1
+    return ""
+
+
+def _extract_comment_near_line(
+    lines: List[str],
+    line_num: int,
+    *,
+    line_prefixes: Tuple[str, ...] = ("//",),
+    block_open: str = "/*",
+    block_close: str = "*/",
+    skip_directives: bool = False,
+) -> str:
+    """Extract inline or immediately preceding comments as a clean symbol docstring."""
+    if line_num < 1 or line_num > len(lines):
+        return ""
+
+    inline = _extract_inline_comment(lines[line_num - 1], prefixes=line_prefixes + (block_open,))
+    collected: List[str] = []
+    idx = line_num - 2
+    in_block = False
+    steps = 0
+
+    while idx >= 0 and steps < 10:
+        raw = lines[idx].strip()
+        if not raw:
+            if collected:
+                break
+            idx -= 1
+            steps += 1
+            continue
+        if skip_directives and not in_block and raw.startswith("#pragma"):
+            idx -= 1
+            steps += 1
+            continue
+        if raw.endswith(block_close):
+            in_block = True
+            cleaned = _clean_comment_fragment(raw)
+            if cleaned:
+                collected.append(cleaned)
+            if raw.startswith(block_open):
+                in_block = False
+            idx -= 1
+            steps += 1
+            continue
+        if in_block:
+            cleaned = _clean_comment_fragment(raw)
+            if cleaned:
+                collected.append(cleaned)
+            if block_open in raw:
+                in_block = False
+            idx -= 1
+            steps += 1
+            continue
+        if any(raw.startswith(p) for p in line_prefixes) or (
+            raw.startswith(block_open) and raw.endswith(block_close)
+        ):
+            cleaned = _clean_comment_fragment(raw)
+            if cleaned:
+                collected.append(cleaned)
+            idx -= 1
+            steps += 1
+            continue
+        break
+
+    collected.reverse()
+    if inline and inline not in collected:
+        collected.append(inline)
+    return " ".join(c for c in collected if c).strip()
+
+
+class _LegacyParseContext:
+    """Shared GraphNode/GraphEdge accumulator with deduplication and tree-sitter merging."""
+
+    def __init__(
+        self,
+        project_id: str,
+        rel_path: str,
+        language: str,
+        encoding: str,
+        existing_nodes: Optional[List[GraphNode]] = None,
+        existing_edges: Optional[List[GraphEdge]] = None,
+    ):
+        self.project_id = project_id
+        self.rel_path = rel_path
+        self.language = language
+        self.encoding = encoding
+        self.rel_slug = _slugify(rel_path)
+        self.nodes: List[GraphNode] = list(existing_nodes or [])
+        self.edges: List[GraphEdge] = list(existing_edges or [])
+        self.nodes_by_id: Dict[str, GraphNode] = {n.id: n for n in self.nodes}
+        self.edges_seen: Set[Tuple[str, str, str]] = {
+            (e.source, e.target, e.relation) for e in self.edges
+        }
+        self.label_index: Dict[str, List[GraphNode]] = {}
+        for n in self.nodes:
+            self.label_index.setdefault(n.label.rstrip("()").lower(), []).append(n)
+
+    def ensure_file_node(self, docstring: str = "") -> str:
+        """Return existing file node ID or create a new file root node."""
+        file_name = Path(self.rel_path).name
+        for n in self.nodes:
+            if n.label == file_name and n.source_file == self.rel_path:
+                n.metadata.setdefault("kind", "file")
+                n.metadata.setdefault("language", self.language)
+                n.metadata.setdefault("encoding", self.encoding)
+                if docstring and not n.metadata.get("docstring"):
+                    n.metadata["docstring"] = docstring
+                return n.id
+
+        file_node_id = f"file_{self.rel_slug}"
+        meta: Dict[str, Any] = {
+            "kind": "file",
+            "language": self.language,
+            "encoding": self.encoding,
+        }
+        if docstring:
+            meta["docstring"] = docstring
+        return self.add_symbol(
+            file_node_id,
+            file_name,
+            "file",
+            line=1,
+            parent_id=None,
+            extra_meta=meta,
+        )
+
+    def _find_reconcilable_node(self, clean_label: str, kind: str) -> Optional[GraphNode]:
+        """Find an existing node from tree-sitter that represents the same symbol."""
+        cands = self.label_index.get(clean_label.rstrip("()").lower(), [])
+        for cand in cands:
+            if cand.metadata.get("kind") == "file":
+                continue
+            cand_kind = str(cand.metadata.get("kind") or "").lower()
+            if not cand_kind or cand_kind == kind or {cand_kind, kind} <= {"function", "method"}:
+                return cand
+        return None
+
+    def add_symbol(
+        self,
+        nid: str,
+        label: str,
+        kind: str,
+        line: int,
+        parent_id: Optional[str] = None,
+        relation: str = "contains",
+        extra_meta: Optional[Dict[str, Any]] = None,
+        reconcile_by_label: bool = False,
+    ) -> str:
+        """Add or merge a symbol node and optionally connect it to ``parent_id``."""
+        meta: Dict[str, Any] = {
+            "kind": kind,
+            "language": self.language,
+            "encoding": self.encoding,
+        }
+        if extra_meta:
+            for k, v in extra_meta.items():
+                if v is not None and v != "":
+                    meta[k] = v
+
+        target_node = self.nodes_by_id.get(nid)
+        if target_node is None and reconcile_by_label:
+            target_node = self._find_reconcilable_node(label, kind)
+
+        if target_node is not None:
+            for k, v in meta.items():
+                if k not in target_node.metadata or not target_node.metadata[k]:
+                    target_node.metadata[k] = v
+            resolved_id = target_node.id
+        else:
+            node = GraphNode(
+                id=nid,
+                project_id=self.project_id,
+                label=label,
+                file_type="code",
+                source_file=self.rel_path,
+                source_location=f"L{max(1, line)}",
+                metadata=meta,
+            )
+            self.nodes.append(node)
+            self.nodes_by_id[nid] = node
+            self.label_index.setdefault(label.rstrip("()").lower(), []).append(node)
+            resolved_id = nid
+
+        if parent_id and parent_id != resolved_id:
+            self.add_edge(parent_id, resolved_id, relation, line=line)
+        return resolved_id
+
+    def add_edge(
+        self,
+        source: str,
+        target: str,
+        relation: str,
+        line: int = 1,
+        confidence: str = "EXTRACTED",
+        confidence_score: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Add a deduplicated ``GraphEdge``."""
+        if not source or not target or source == target:
+            return
+        key = (source, target, relation)
+        if key in self.edges_seen:
+            return
+        self.edges_seen.add(key)
+        kwargs: Dict[str, Any] = {
+            "project_id": self.project_id,
+            "source": source,
+            "target": target,
+            "relation": relation,
+            "confidence": confidence,
+            "confidence_score": confidence_score,
+            "source_file": self.rel_path,
+            "source_location": f"L{max(1, line)}",
+        }
+        if metadata:
+            kwargs["metadata"] = metadata
+        self.edges.append(GraphEdge(**kwargs))
+
+
+def _parse_st_lasal(
+    text: str,
+    rel_path: str,
+    project_id: str,
+    encoding: str,
+) -> Tuple[List[GraphNode], List[GraphEdge]]:
+    """Parse IEC 61131-3 Structured Text (.st/.scl/.exp/.pou) and PLC LASAL blocks/XML."""
+    ctx = _LegacyParseContext(project_id, rel_path, "structured_text", encoding)
+    lines = text.splitlines()
+    file_doc = _extract_comment_near_line(lines, 1, line_prefixes=("//",), block_open="(*", block_close="*)")
+    file_id = ctx.ensure_file_node(docstring=file_doc)
+
+    local_symbols: Dict[str, str] = {}
+    fb_instances: Dict[str, str] = {}
+
+    def _parse_lasal_xml_fragment(xml_text: str) -> List[str]:
+        st_snippets: List[str] = []
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return st_snippets
+
+        def _walk(elem: ET.Element, parent_id: str, parent_obj: Optional[str]) -> None:
+            tag = elem.tag.split("}")[-1].lower()
+            curr_parent = parent_id
+            curr_obj = parent_obj
+
+            if tag in ("class", "component", "object", "program", "functionblock"):
+                name = elem.get("Name") or elem.get("ID") or elem.get("Type")
+                if name:
+                    cls_id = f"{ctx.rel_slug}_cls_{_slugify(name)}"
+                    cls_type = elem.get("Class") or elem.get("BaseClass")
+                    st_kind = "program" if tag == "program" else ("function_block" if tag == "functionblock" else "class")
+                    curr_parent = ctx.add_symbol(
+                        cls_id,
+                        name,
+                        "class",
+                        line=1,
+                        parent_id=file_id,
+                        extra_meta={
+                            "st_kind": st_kind,
+                            "symbol_type": st_kind,
+                            "docstring": elem.get("Comment") or "",
+                            "base_class": cls_type or "",
+                        },
+                    )
+                    local_symbols[name.lower()] = curr_parent
+                    if cls_type and tag == "object":
+                        fb_instances[name.lower()] = cls_type
+                        ctx.add_edge(curr_parent, _slugify(cls_type), "instantiates", line=1)
+                    elif cls_type:
+                        ctx.add_edge(curr_parent, _slugify(cls_type), "inherits", line=1)
+                    curr_obj = "this" if tag == "class" else name
+            elif tag in ("server", "client", "var", "channel"):
+                name = elem.get("Name") or elem.get("ID")
+                if name:
+                    vkind = "server" if tag == "server" else ("client" if tag == "client" else "variable")
+                    full_name = f"{curr_obj}.{name}" if curr_obj and curr_obj != "this" else name
+                    vnid = f"{ctx.rel_slug}_{vkind}_{_slugify(full_name)}"
+                    ctx.add_symbol(
+                        vnid,
+                        full_name,
+                        vkind,
+                        line=1,
+                        parent_id=curr_parent,
+                        extra_meta={
+                            "data_type": elem.get("DataType") or "ANY",
+                            "docstring": elem.get("Comment") or "",
+                        },
+                    )
+                    local_symbols[full_name.lower()] = vnid
+                    local_symbols[name.lower()] = vnid
+            elif tag in ("connection", "link"):
+                src = elem.get("Source") or elem.get("Client") or elem.get("From") or elem.get("ClientName")
+                dest = elem.get("Destination") or elem.get("Server") or elem.get("To") or elem.get("ServerName")
+                if src and dest:
+                    src_id = local_symbols.get(src.lower(), f"{ctx.rel_slug}_client_{_slugify(src)}")
+                    tgt_id = local_symbols.get(dest.lower(), _slugify(dest))
+                    ctx.add_edge(src_id, tgt_id, "calls", line=1)
+            elif tag in ("st", "declaration", "implementation"):
+                inner = "".join(elem.itertext()).strip()
+                if inner:
+                    st_snippets.append(inner)
+
+            for child in elem:
+                _walk(child, curr_parent, curr_obj)
+
+        _walk(root, file_id, None)
+        return st_snippets
+
+    def _parse_st_code(st_code: str) -> None:
+        st_lines = st_code.splitlines()
+        no_comm, no_str = _strip_comments_preserve_lines(
+            st_code,
+            line_prefixes=("//",),
+            block_pairs=(("(*", "*)"),),
+            string_delims=("'", '"'),
+            backslash_escapes=False,
+        )
+        clean_lines = no_comm.splitlines()
+
+        block_re = re.compile(
+            r"^\s*(PROGRAM|FUNCTION_BLOCK|CLASS|INTERFACE)\s+"
+            r"(?:(?:FINAL|ABSTRACT)\s+)?([A-Za-z_][A-Za-z0-9_]*)"
+            r"(?:\s*(?::|EXTENDS)\s*([A-Za-z_][A-Za-z0-9_]*))?",
+            re.IGNORECASE,
+        )
+        fn_re = re.compile(
+            r"^\s*(FUNCTION|METHOD)\s+"
+            r"(?:(?:PUBLIC|PRIVATE|PROTECTED|INTERNAL|VIRTUAL|FINAL|OVERRIDE|GLOBAL)\s+)*"
+            r"(?:([A-Za-z_][A-Za-z0-9_]*)\s*::\s*)?([A-Za-z_][A-Za-z0-9_]*)"
+            r"(?:\s*:\s*([A-Za-z_][A-Za-z0-9_\[\]]*))?",
+            re.IGNORECASE,
+        )
+        end_block_re = re.compile(
+            r"^\s*END_(PROGRAM|FUNCTION_BLOCK|CLASS|INTERFACE|FUNCTION|METHOD)\b",
+            re.IGNORECASE,
+        )
+        inline_srv_cli_re = re.compile(
+            r"^\s*(SERVER|CLIENT)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^;]+);?",
+            re.IGNORECASE,
+        )
+        section_srv_cli_re = re.compile(r"^\s*(SERVER|CLIENT|VAR_SERVER|VAR_CLIENT)\b", re.IGNORECASE)
+        end_srv_cli_re = re.compile(r"^\s*END_(SERVER|CLIENT|VAR)\b", re.IGNORECASE)
+        var_start_re = re.compile(
+            r"^\s*(VAR_GLOBAL|VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_TEMP|VAR_EXTERNAL|VAR_STAT|VAR)\b",
+            re.IGNORECASE,
+        )
+        var_decl_re = re.compile(
+            r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+            r"(?:\s+AT\s+(%[IQMXiqmx][A-Za-z0-9_.]+))?"
+            r"\s*:\s*([^:;]+?)(?:\s*:=\s*([^;]+))?;",
+            re.IGNORECASE,
+        )
+        type_struct_inline_re = re.compile(
+            r"^\s*TYPE\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*STRUCT\b",
+            re.IGNORECASE,
+        )
+        type_header_re = re.compile(r"^\s*TYPE\s+([A-Za-z_][A-Za-z0-9_]*)\s*:?\s*(.*)$", re.IGNORECASE)
+        struct_only_re = re.compile(r"^\s*STRUCT(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\b", re.IGNORECASE)
+
+        scope_stack: List[Tuple[str, str, int]] = []  # (node_id, kind_label, start_line)
+        body_ranges: List[Tuple[str, int, int]] = []
+        active_var_scope: Optional[str] = None
+        active_channel_kind: Optional[str] = None
+        pending_type_name: Optional[str] = None
+        active_struct: Optional[Tuple[str, int, List[Dict[str, str]], str]] = None
+        pending_enum: Optional[Tuple[str, int, List[str], str]] = None
+
+        for idx, raw_clean in enumerate(clean_lines):
+            line_num = idx + 1
+            cleaned = raw_clean.strip()
+            if not cleaned:
+                continue
+
+            parent_id = scope_stack[-1][0] if scope_stack else file_id
+
+            # Close active enum capture
+            if pending_enum is not None:
+                ename, eline, members, edoc = pending_enum
+                chunk = cleaned.split(")")[0]
+                for part in chunk.split(","):
+                    m_tok = part.strip().split(":=")[0].strip()
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", m_tok):
+                        members.append(m_tok)
+                if ")" in cleaned or "END_TYPE" in cleaned.upper():
+                    enid = f"{ctx.rel_slug}_enum_{_slugify(ename)}"
+                    ctx.add_symbol(
+                        enid,
+                        ename,
+                        "enum",
+                        line=eline,
+                        parent_id=file_id,
+                        extra_meta={"members": members, "docstring": edoc},
+                    )
+                    local_symbols[ename.lower()] = enid
+                    pending_enum = None
+                continue
+
+            # Inside TYPE ... STRUCT ... END_STRUCT
+            if active_struct is not None:
+                sname, sline, fields, sdoc = active_struct
+                if re.match(r"^\s*END_STRUCT\b", cleaned, re.IGNORECASE):
+                    snid = f"{ctx.rel_slug}_struct_{_slugify(sname)}"
+                    ctx.add_symbol(
+                        snid,
+                        sname,
+                        "struct",
+                        line=sline,
+                        parent_id=file_id,
+                        extra_meta={"fields": fields, "docstring": sdoc},
+                    )
+                    local_symbols[sname.lower()] = snid
+                    active_struct = None
+                    pending_type_name = None
+                    continue
+                m_fld = var_decl_re.match(cleaned)
+                if m_fld:
+                    ftype = m_fld.group(3).strip()
+                    for fname in m_fld.group(1).split(","):
+                        fn = fname.strip()
+                        if fn:
+                            fields.append({"name": fn, "type": ftype})
+                continue
+
+            if re.match(r"^\s*END_TYPE\b", cleaned, re.IGNORECASE):
+                pending_type_name = None
+                continue
+
+            m_tsi = type_struct_inline_re.match(cleaned)
+            if m_tsi:
+                sname = m_tsi.group(1)
+                doc = _extract_comment_near_line(st_lines, line_num, line_prefixes=("//",), block_open="(*", block_close="*)")
+                active_struct = (sname, line_num, [], doc)
+                pending_type_name = None
+                continue
+
+            if pending_type_name and struct_only_re.match(cleaned):
+                doc = _extract_comment_near_line(st_lines, line_num - 1, line_prefixes=("//",), block_open="(*", block_close="*)")
+                active_struct = (pending_type_name, line_num, [], doc)
+                pending_type_name = None
+                continue
+
+            m_so = struct_only_re.match(cleaned)
+            if m_so and m_so.group(1):
+                doc = _extract_comment_near_line(st_lines, line_num, line_prefixes=("//",), block_open="(*", block_close="*)")
+                active_struct = (m_so.group(1), line_num, [], doc)
+                continue
+
+            m_th = type_header_re.match(cleaned)
+            if m_th:
+                tname = m_th.group(1)
+                rest = m_th.group(2).strip()
+                doc = _extract_comment_near_line(st_lines, line_num, line_prefixes=("//",), block_open="(*", block_close="*)")
+                if rest.startswith("("):
+                    members: List[str] = []
+                    after_paren = rest[1:]
+                    chunk = after_paren.split(")")[0]
+                    for part in chunk.split(","):
+                        m_tok = part.strip().split(":=")[0].strip()
+                        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", m_tok):
+                            members.append(m_tok)
+                    if ")" in after_paren:
+                        enid = f"{ctx.rel_slug}_enum_{_slugify(tname)}"
+                        ctx.add_symbol(
+                            enid,
+                            tname,
+                            "enum",
+                            line=line_num,
+                            parent_id=file_id,
+                            extra_meta={"members": members, "docstring": doc},
+                        )
+                        local_symbols[tname.lower()] = enid
+                    else:
+                        pending_enum = (tname, line_num, members, doc)
+                else:
+                    pending_type_name = tname
+                continue
+
+            # Close block scopes
+            if end_block_re.match(cleaned):
+                active_var_scope = None
+                active_channel_kind = None
+                if scope_stack:
+                    closed_id, _, start_ln = scope_stack.pop()
+                    body_ranges.append((closed_id, start_ln, line_num))
+                continue
+
+            # Block declarations: PROGRAM / FUNCTION_BLOCK / CLASS / INTERFACE
+            m_blk = block_re.match(cleaned)
+            if m_blk:
+                active_var_scope = None
+                active_channel_kind = None
+                kw = m_blk.group(1).upper()
+                bname = m_blk.group(2)
+                base_name = m_blk.group(3)
+                doc = _extract_comment_near_line(st_lines, line_num, line_prefixes=("//",), block_open="(*", block_close="*)")
+                if kw == "INTERFACE":
+                    node_kind, st_kind = "interface", "interface"
+                else:
+                    node_kind, st_kind = "class", kw.lower()
+                bnid = f"{ctx.rel_slug}_{st_kind}_{_slugify(bname)}"
+                ctx.add_symbol(
+                    bnid,
+                    bname,
+                    node_kind,
+                    line=line_num,
+                    parent_id=file_id,
+                    extra_meta={
+                        "st_kind": st_kind,
+                        "symbol_type": st_kind,
+                        "signature": st_lines[idx].strip(),
+                        "docstring": doc,
+                    },
+                )
+                local_symbols[bname.lower()] = bnid
+                if base_name:
+                    ctx.add_edge(bnid, local_symbols.get(base_name.lower(), _slugify(base_name)), "inherits", line=line_num)
+                scope_stack.append((bnid, st_kind, line_num))
+                continue
+
+            # FUNCTION / METHOD
+            m_fn = fn_re.match(cleaned)
+            if m_fn:
+                active_var_scope = None
+                active_channel_kind = None
+                kw = m_fn.group(1).upper()
+                owner_cls = m_fn.group(2)
+                fn_name = m_fn.group(3)
+                ret_type = (m_fn.group(4) or "").strip()
+                if fn_name.lower() in _ST_IGNORED_CALLS:
+                    continue
+                doc = _extract_comment_near_line(st_lines, line_num, line_prefixes=("//",), block_open="(*", block_close="*)")
+                if owner_cls:
+                    owner_id = local_symbols.get(owner_cls.lower())
+                    if owner_id is None:
+                        owner_id = f"{ctx.rel_slug}_class_{_slugify(owner_cls)}"
+                        ctx.add_symbol(owner_id, owner_cls, "class", line=line_num, parent_id=file_id, extra_meta={"st_kind": "class"})
+                        local_symbols[owner_cls.lower()] = owner_id
+                    qual_name = f"{owner_cls}.{fn_name}"
+                    fn_kind = "method"
+                    fn_parent = owner_id
+                elif scope_stack and kw == "METHOD":
+                    owner_lbl = ctx.nodes_by_id[parent_id].label
+                    qual_name = f"{owner_lbl}.{fn_name}"
+                    fn_kind = "method"
+                    fn_parent = parent_id
+                else:
+                    qual_name = fn_name
+                    fn_kind = "method" if scope_stack else "function"
+                    fn_parent = parent_id
+
+                fn_id = f"{ctx.rel_slug}_{fn_kind}_{_slugify(qual_name)}"
+                ctx.add_symbol(
+                    fn_id,
+                    f"{qual_name}()",
+                    fn_kind,
+                    line=line_num,
+                    parent_id=fn_parent,
+                    extra_meta={
+                        "st_kind": kw.lower(),
+                        "qualified_name": qual_name,
+                        "return_type": ret_type,
+                        "signature": st_lines[idx].strip(),
+                        "docstring": doc,
+                    },
+                )
+                local_symbols[qual_name.lower()] = fn_id
+                local_symbols.setdefault(fn_name.lower(), fn_id)
+                scope_stack.append((fn_id, fn_kind, line_num))
+                continue
+
+            # Inline LASAL SERVER / CLIENT declaration
+            m_isc = inline_srv_cli_re.match(cleaned)
+            if m_isc:
+                ch_kind = m_isc.group(1).lower()
+                ch_name = m_isc.group(2)
+                ch_type = m_isc.group(3).strip()
+                doc = _extract_comment_near_line(st_lines, line_num, line_prefixes=("//",), block_open="(*", block_close="*)")
+                ch_id = f"{ctx.rel_slug}_{ch_kind}_{_slugify(ch_name)}"
+                ctx.add_symbol(
+                    ch_id,
+                    ch_name,
+                    ch_kind,
+                    line=line_num,
+                    parent_id=parent_id,
+                    extra_meta={"data_type": ch_type, "channel_type": ch_kind, "docstring": doc},
+                )
+                local_symbols[ch_name.lower()] = ch_id
+                base_ch_type = ch_type.split("[")[0].strip()
+                if base_ch_type and base_ch_type.lower() not in _ST_PRIMITIVE_TYPES:
+                    fb_instances[ch_name.lower()] = base_ch_type
+                continue
+
+            # LASAL SERVER / CLIENT block headers
+            m_ssc = section_srv_cli_re.match(cleaned)
+            if m_ssc:
+                active_var_scope = None
+                tok = m_ssc.group(1).upper()
+                active_channel_kind = "server" if "SERVER" in tok else "client"
+                continue
+
+            if end_srv_cli_re.match(cleaned):
+                active_var_scope = None
+                active_channel_kind = None
+                continue
+
+            m_vs = var_start_re.match(cleaned)
+            if m_vs:
+                active_channel_kind = None
+                active_var_scope = m_vs.group(1).upper()
+                continue
+
+            # Declarations inside SERVER/CLIENT or VAR* blocks
+            if (active_channel_kind or active_var_scope) and ":" in cleaned:
+                m_vd = var_decl_re.match(cleaned)
+                if m_vd:
+                    raw_names = m_vd.group(1)
+                    io_addr = m_vd.group(2) or ""
+                    vtype = m_vd.group(3).strip()
+                    init_val = (m_vd.group(4) or "").strip()
+                    doc = _extract_comment_near_line(st_lines, line_num, line_prefixes=("//",), block_open="(*", block_close="*)")
+                    sym_kind = active_channel_kind if active_channel_kind else "variable"
+                    base_type = re.sub(r"^ARRAY\s*\[[^\]]+\]\s*OF\s+", "", vtype, flags=re.IGNORECASE).strip()
+                    for raw_v in raw_names.split(","):
+                        vname = raw_v.strip()
+                        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", vname):
+                            continue
+                        vid = f"{ctx.rel_slug}_{sym_kind}_{_slugify(vname)}"
+                        extra: Dict[str, Any] = {
+                            "data_type": vtype,
+                            "io_address": io_addr,
+                            "initial_value": init_val,
+                            "docstring": doc,
+                        }
+                        if active_var_scope:
+                            extra["var_scope"] = active_var_scope
+                        if active_channel_kind:
+                            extra["channel_type"] = active_channel_kind
+                        ctx.add_symbol(vid, vname, sym_kind, line=line_num, parent_id=parent_id, extra_meta=extra)
+                        local_symbols[vname.lower()] = vid
+                        if base_type and base_type.lower() not in _ST_PRIMITIVE_TYPES:
+                            fb_instances[vname.lower()] = base_type
+                            target_fb = local_symbols.get(base_type.lower(), _slugify(base_type))
+                            ctx.add_edge(vid, target_fb, "instantiates", line=line_num)
+
+        # Close any unclosed scopes at EOF
+        while scope_stack:
+            closed_id, _, start_ln = scope_stack.pop()
+            body_ranges.append((closed_id, start_ln, len(clean_lines)))
+
+        # Second pass: resolve calls between ST blocks / FBs / functions
+        no_str_lines = no_str.splitlines()
+        call_re = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\(")
+        for caller_id, start_ln, end_ln in body_ranges:
+            in_decl = False
+            for ln in range(start_ln + 1, min(end_ln, len(no_str_lines)) + 1):
+                s = no_str_lines[ln - 1].strip()
+                if not s:
+                    continue
+                if var_start_re.match(s) or section_srv_cli_re.match(s):
+                    in_decl = True
+                    continue
+                if end_srv_cli_re.match(s):
+                    in_decl = False
+                    continue
+                if in_decl:
+                    continue
+                for cm in call_re.finditer(s):
+                    callee = cm.group(1)
+                    if callee.lower() in _ST_IGNORED_CALLS:
+                        continue
+                    if "." in callee:
+                        inst, meth = callee.split(".", 1)
+                        cls_type = fb_instances.get(inst.lower(), inst)
+                        target = (
+                            local_symbols.get(f"{cls_type}.{meth}".lower())
+                            or local_symbols.get(cls_type.lower())
+                            or local_symbols.get(meth.lower())
+                            or _slugify(f"{cls_type}_{meth}")
+                        )
+                    else:
+                        inst_type = fb_instances.get(callee.lower())
+                        if inst_type:
+                            target = local_symbols.get(inst_type.lower(), _slugify(inst_type))
+                        else:
+                            target = local_symbols.get(callee.lower(), _slugify(callee))
+                    ctx.add_edge(caller_id, target, "calls", line=ln)
+
+    stripped = text.lstrip()
+    if stripped.startswith("<"):
+        for snippet in _parse_lasal_xml_fragment(text):
+            _parse_st_code(snippet)
+    else:
+        _parse_st_code(text)
+        xml_match = re.search(r"\(\*!(.*?)\*\)", text, re.DOTALL)
+        if xml_match:
+            for snippet in _parse_lasal_xml_fragment(xml_match.group(1).strip()):
+                _parse_st_code(snippet)
+
+    return ctx.nodes, ctx.edges
+
+
+def _parse_cpp_fields(body: str) -> List[Dict[str, str]]:
+    """Extract struct fields from a C/C++ struct body."""
+    fields: List[Dict[str, str]] = []
+    for stmt in body.split(";"):
+        s = " ".join(stmt.strip().split())
+        if not s or "{" in s or "}" in s or "(" in s:
+            continue
+        # Strip bitfield width `: N`
+        s = re.sub(r"\s*:\s*\d+\s*$", "", s)
+        m = re.match(r"^(.+?)\s+([*&\s]*[A-Za-z_][A-Za-z0-9_]*)\s*(\[[^\]]*\])?$", s)
+        if m:
+            ftype = m.group(1).strip()
+            fname = m.group(2).lstrip("*& ").strip()
+            arr = (m.group(3) or "").strip()
+            if fname and ftype not in ("typedef", "struct", "union", "enum"):
+                fields.append({"name": fname, "type": f"{ftype}{arr}".strip()})
+    return fields
+
+
+def _parse_cpp_legacy(
+    text: str,
+    rel_path: str,
+    project_id: str,
+    encoding: str,
+    existing_nodes: Optional[List[GraphNode]] = None,
+    existing_edges: Optional[List[GraphEdge]] = None,
+) -> Tuple[List[GraphNode], List[GraphEdge]]:
+    """Parse or augment C/C++ legacy files (#pragma pack, structs, macros, enums, Win32 APIs)."""
+    lang = "c" if Path(rel_path).suffix.lower() == ".c" else "cpp"
+    ctx = _LegacyParseContext(
+        project_id,
+        rel_path,
+        lang,
+        encoding,
+        existing_nodes=existing_nodes,
+        existing_edges=existing_edges,
+    )
+    lines = text.splitlines()
+    file_doc = _extract_comment_near_line(lines, 1)
+    file_id = ctx.ensure_file_node(docstring=file_doc)
+
+    no_comm, no_str = _strip_comments_preserve_lines(text)
+    line_starts = _compute_line_starts(no_str)
+    clean_lines = no_comm.splitlines()
+
+    # 1. Track #pragma pack state across lines
+    pack_stack: List[Optional[int]] = []
+    current_pack: Optional[int] = None
+    pack_at_line: Dict[int, Optional[int]] = {}
+    pragma_pack_re = re.compile(r"^\s*#\s*pragma\s+pack\s*\(([^)]*)\)")
+    for ln_idx, ln_str in enumerate(clean_lines, start=1):
+        pm = pragma_pack_re.match(ln_str)
+        if pm:
+            args = [a.strip() for a in pm.group(1).split(",") if a.strip()]
+            if not args:
+                current_pack = None
+            elif args[0].lower() == "push":
+                pack_stack.append(current_pack)
+                nums = [int(a) for a in args[1:] if a.isdigit()]
+                if nums:
+                    current_pack = nums[-1]
+            elif args[0].lower() == "pop":
+                current_pack = pack_stack.pop() if pack_stack else None
+            elif args[0].isdigit():
+                current_pack = int(args[0])
+        pack_at_line[ln_idx] = current_pack
+
+    # 2. #include directives
+    inc_re = re.compile(r'^\s*#\s*include\s+[<"]([^>"]+)[>"]', re.MULTILINE)
+    for m in inc_re.finditer(no_comm):
+        ln = _line_of_offset(line_starts, m.start())
+        ctx.add_edge(file_id, _slugify(Path(m.group(1)).stem), "imports", line=ln)
+
+    # 3. #define macros / error constants (with backslash continuation)
+    idx = 0
+    prev_ifndef_sym: Optional[str] = None
+    define_re = re.compile(
+        r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)(?:\(([^)]*)\))?(?:\s+(.*))?$"
+    )
+    ifndef_re = re.compile(r"^\s*#\s*ifndef\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
+    while idx < len(lines):
+        raw_line = lines[idx]
+        ln = idx + 1
+        m_ifn = ifndef_re.match(clean_lines[idx] if idx < len(clean_lines) else raw_line)
+        if m_ifn:
+            prev_ifndef_sym = m_ifn.group(1)
+            idx += 1
+            continue
+
+        joined = clean_lines[idx] if idx < len(clean_lines) else raw_line
+        raw_joined = raw_line
+        while joined.rstrip().endswith("\\") and idx + 1 < len(lines):
+            idx += 1
+            joined = joined.rstrip()[:-1] + " " + (clean_lines[idx] if idx < len(clean_lines) else lines[idx]).strip()
+            raw_joined = raw_joined.rstrip()[:-1] + " " + lines[idx].strip()
+
+        m_def = define_re.match(joined)
+        if m_def:
+            mname = m_def.group(1)
+            mparams = m_def.group(2)
+            # Re-extract value from raw_joined so string values stay intact
+            m_raw = define_re.match(raw_joined)
+            raw_val = (m_raw.group(3) if m_raw and m_raw.group(3) else "").strip()
+            inline_comm = _extract_inline_comment(raw_joined, prefixes=("//",))
+            if inline_comm and "//" in raw_val:
+                raw_val = raw_val.split("//", 1)[0].strip()
+            raw_val = re.sub(r"/\*.*?\*/", "", raw_val).strip()
+
+            # Skip pure header include guards (#ifndef FOO_H \n #define FOO_H)
+            if prev_ifndef_sym == mname and not raw_val and mparams is None:
+                prev_ifndef_sym = None
+                idx += 1
+                continue
+
+            doc = _extract_comment_near_line(lines, ln)
+            ctx.add_symbol(
+                f"{ctx.rel_slug}_macro_{_slugify(mname)}",
+                mname,
+                "macro",
+                line=ln,
+                parent_id=file_id,
+                extra_meta={
+                    "value": raw_val,
+                    "params": mparams or "",
+                    "docstring": doc,
+                    "signature": raw_joined.strip(),
+                },
+            )
+        prev_ifndef_sym = None
+        idx += 1
+
+    # 4. Enums (typedef enum and enum / enum class)
+    enum_spans: Set[int] = set()
+    t_enum_re = re.compile(r"\btypedef\s+enum(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\s*\{")
+    for m in t_enum_re.finditer(no_str):
+        open_b = no_str.find("{", m.start())
+        close_b = _find_matching_delimiter(no_str, open_b)
+        if close_b == -1:
+            continue
+        enum_spans.add(open_b)
+        ln = _line_of_offset(line_starts, m.start())
+        tail = no_str[close_b + 1:close_b + 120].split(";", 1)[0]
+        aliases = [a.strip().lstrip("*") for a in tail.split(",") if a.strip()]
+        ename = next((a for a in aliases if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", a)), None) or m.group(1)
+        if ename:
+            body = no_str[open_b + 1:close_b]
+            members = [p.strip().split("=")[0].strip() for p in body.split(",") if p.strip()]
+            members = [mb for mb in members if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", mb)]
+            doc = _extract_comment_near_line(lines, ln)
+            ctx.add_symbol(
+                f"{ctx.rel_slug}_enum_{_slugify(ename)}",
+                ename,
+                "enum",
+                line=ln,
+                parent_id=file_id,
+                extra_meta={"members": members, "docstring": doc},
+            )
+
+    enum_re = re.compile(r"\benum(?:\s+class)?\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[A-Za-z0-9_:]+)?\s*\{")
+    for m in enum_re.finditer(no_str):
+        open_b = no_str.find("{", m.start())
+        if open_b in enum_spans:
+            continue
+        close_b = _find_matching_delimiter(no_str, open_b)
+        if close_b == -1:
+            continue
+        enum_spans.add(open_b)
+        ln = _line_of_offset(line_starts, m.start())
+        ename = m.group(1)
+        body = no_str[open_b + 1:close_b]
+        members = [p.strip().split("=")[0].strip() for p in body.split(",") if p.strip()]
+        members = [mb for mb in members if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", mb)]
+        doc = _extract_comment_near_line(lines, ln)
+        ctx.add_symbol(
+            f"{ctx.rel_slug}_enum_{_slugify(ename)}",
+            ename,
+            "enum",
+            line=ln,
+            parent_id=file_id,
+            extra_meta={"members": members, "docstring": doc},
+        )
+
+    # 5. Structs (typedef struct and struct)
+    struct_spans: Set[int] = set()
+    t_struct_re = re.compile(
+        r"\btypedef\s+struct(?:\s+__declspec\s*\([^)]*\))?(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\s*\{"
+    )
+    for m in t_struct_re.finditer(no_str):
+        open_b = no_str.find("{", m.start())
+        close_b = _find_matching_delimiter(no_str, open_b)
+        if close_b == -1:
+            continue
+        struct_spans.add(open_b)
+        ln = _line_of_offset(line_starts, m.start())
+        tag_name = m.group(1) or ""
+        tail = no_str[close_b + 1:close_b + 160].split(";", 1)[0]
+        aliases = [
+            a.strip().lstrip("*&")
+            for a in tail.split(",")
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", a.strip().lstrip("*&"))
+        ]
+        # Prefer non-pointer alias (doesn't start with P/LP unless only alias)
+        primary = next((a for a in aliases if not a.startswith(("P", "LP"))), None) or (aliases[0] if aliases else tag_name)
+        if primary:
+            fields = _parse_cpp_fields(no_str[open_b + 1:close_b])
+            pack_val = pack_at_line.get(ln)
+            packed = pack_val == 1 or "__attribute__" in tail or "packed" in tail
+            doc = _extract_comment_near_line(lines, ln, skip_directives=True)
+            ctx.add_symbol(
+                f"{ctx.rel_slug}_struct_{_slugify(primary)}",
+                primary,
+                "struct",
+                line=ln,
+                parent_id=file_id,
+                reconcile_by_label=True,
+                extra_meta={
+                    "struct_tag": tag_name,
+                    "aliases": aliases,
+                    "fields": fields,
+                    "pack": pack_val,
+                    "packed": packed,
+                    "docstring": doc,
+                },
+            )
+
+    struct_re = re.compile(
+        r"\bstruct(?:\s+(?:__declspec\s*\([^)]*\)|[A-Z0-9_]+(?:_API|_EXPORT)))*\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*([^{;]+))?\{"
+    )
+    for m in struct_re.finditer(no_str):
+        open_b = no_str.find("{", m.start())
+        if open_b in struct_spans:
+            continue
+        struct_spans.add(open_b)
+        close_b = _find_matching_delimiter(no_str, open_b)
+        if close_b == -1:
+            continue
+        ln = _line_of_offset(line_starts, m.start())
+        sname = m.group(1)
+        fields = _parse_cpp_fields(no_str[open_b + 1:close_b])
+        pack_val = pack_at_line.get(ln)
+        tail = no_str[close_b + 1:close_b + 80]
+        packed = pack_val == 1 or "packed" in tail
+        doc = _extract_comment_near_line(lines, ln, skip_directives=True)
+        snid = ctx.add_symbol(
+            f"{ctx.rel_slug}_struct_{_slugify(sname)}",
+            sname,
+            "struct",
+            line=ln,
+            parent_id=file_id,
+            reconcile_by_label=True,
+            extra_meta={
+                "fields": fields,
+                "pack": pack_val,
+                "packed": packed,
+                "docstring": doc,
+            },
+        )
+        bases = m.group(2) or ""
+        for b in bases.split(","):
+            bname = b.strip().split()[-1] if b.strip() else ""
+            if bname:
+                ctx.add_edge(snid, _slugify(bname), "inherits", line=ln)
+
+    # 6. Classes & inline/declared methods
+    class_spans: Set[int] = set()
+    function_bodies: List[Tuple[str, int, int]] = []
+    local_fn_map: Dict[str, str] = {}
+
+    class_re = re.compile(
+        r"\bclass(?:\s+(?:__declspec\s*\([^)]*\)|[A-Z0-9_]+(?:_API|_EXPORT)))*\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*([^{;]+))?\{"
+    )
+    method_def_re = re.compile(
+        r"(?:^|[;:\n}])\s*(?:(?:static|inline|virtual|explicit|extern|__declspec\s*\([^)]*\))\s+)*"
+        r"([A-Za-z_~][A-Za-z0-9_:<>\*&\s]*?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{}]*)\)\s*(?:const|override|final|noexcept|\s)*\{"
+    )
+    method_decl_re = re.compile(
+        r"(?:^|[;:\n])\s*(?:(?:static|inline|virtual|explicit)\s+)*"
+        r"([A-Za-z_][A-Za-z0-9_:<>\*&\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{}]*)\)\s*(?:const|override|final|noexcept|=\s*0|\s)*;"
+    )
+
+    for m in class_re.finditer(no_str):
+        open_b = no_str.find("{", m.start())
+        close_b = _find_matching_delimiter(no_str, open_b)
+        if close_b == -1:
+            continue
+        class_spans.add(open_b)
+        ln = _line_of_offset(line_starts, m.start())
+        cname = m.group(1)
+        doc = _extract_comment_near_line(lines, ln)
+        cnid = ctx.add_symbol(
+            f"{ctx.rel_slug}_class_{_slugify(cname)}",
+            cname,
+            "class",
+            line=ln,
+            parent_id=file_id,
+            reconcile_by_label=True,
+            extra_meta={"docstring": doc},
+        )
+        local_fn_map[cname.lower()] = cnid
+        for b in (m.group(2) or "").split(","):
+            bname = b.strip().split()[-1] if b.strip() else ""
+            if bname:
+                ctx.add_edge(cnid, _slugify(bname), "inherits", line=ln)
+
+        cls_body = no_str[open_b + 1:close_b]
+        # Extract inline method definitions inside class
+        pos = 0
+        while pos < len(cls_body):
+            mm = method_def_re.search(cls_body, pos)
+            if not mm:
+                break
+            m_open_rel = cls_body.find("{", mm.start())
+            m_close_rel = _find_matching_delimiter(cls_body, m_open_rel)
+            if m_close_rel == -1:
+                break
+            mname = mm.group(2).strip()
+            if mname.lower() not in _CPP_IGNORED_NAMES:
+                mln = _line_of_offset(line_starts, open_b + 1 + mm.start(2))
+                mdoc = _extract_comment_near_line(lines, mln)
+                mnid = ctx.add_symbol(
+                    f"{ctx.rel_slug}_{_slugify(cname)}_{_slugify(mname)}",
+                    f"{mname}()",
+                    "method",
+                    line=mln,
+                    parent_id=cnid,
+                    relation="method",
+                    reconcile_by_label=True,
+                    extra_meta={
+                        "qualified_name": f"{cname}::{mname}",
+                        "return_type": mm.group(1).strip(),
+                        "params": " ".join(mm.group(3).split()),
+                        "docstring": mdoc,
+                    },
+                )
+                local_fn_map[mname.lower()] = mnid
+                local_fn_map[f"{cname}::{mname}".lower()] = mnid
+                function_bodies.append((mnid, open_b + 1 + m_open_rel, open_b + 1 + m_close_rel))
+            pos = m_close_rel + 1
+
+        # Extract pure declarations inside class (only at depth 0 of class body)
+        for dm in method_decl_re.finditer(cls_body):
+            # Ensure offset is not inside a nested inline method body
+            abs_off = open_b + 1 + dm.start(2)
+            if any(b_s <= abs_off <= b_e for _, b_s, b_e in function_bodies):
+                continue
+            mname = dm.group(2).strip()
+            if mname.lower() in _CPP_IGNORED_NAMES:
+                continue
+            mln = _line_of_offset(line_starts, abs_off)
+            mdoc = _extract_comment_near_line(lines, mln)
+            mnid = ctx.add_symbol(
+                f"{ctx.rel_slug}_{_slugify(cname)}_{_slugify(mname)}",
+                f"{mname}()",
+                "method",
+                line=mln,
+                parent_id=cnid,
+                relation="method",
+                reconcile_by_label=True,
+                extra_meta={
+                    "qualified_name": f"{cname}::{mname}",
+                    "return_type": dm.group(1).strip(),
+                    "params": " ".join(dm.group(3).split()),
+                    "declaration_only": True,
+                    "docstring": mdoc,
+                },
+            )
+            local_fn_map.setdefault(mname.lower(), mnid)
+
+    # 7. Container-level (global / namespace / extern "C") function definitions & declarations
+    top_fn_def_re = re.compile(
+        r"(?:^|[;\n}])\s*(?:(?:extern\s+\"C\"|static|inline|virtual|WINAPI|CALLBACK|APIENTRY|__stdcall|__cdecl|__declspec\s*\([^)]*\))\s+)*"
+        r"([A-Za-z_][A-Za-z0-9_:<>\*&\s]*?)\s+([A-Za-z_][A-Za-z0-9_:~]*)\s*\(([^;{}]*)\)\s*(?:const|noexcept|override|\s)*\{"
+    )
+    top_fn_decl_re = re.compile(
+        r"^\s*(?:(?:extern\s+\"C\"|extern|static|inline|WINAPI|CALLBACK|APIENTRY|__stdcall|__cdecl|__declspec\s*\([^)]*\))\s+)*"
+        r"([A-Za-z_][A-Za-z0-9_:<>\*&\s]+?)\s+([A-Za-z_][A-Za-z0-9_:]*)\s*\(([^;{}]*)\)\s*(?:const|noexcept|\s)*;"
+    )
+    ns_or_extern_re = re.compile(r"^\s*(?:namespace(?:\s+[A-Za-z_][A-Za-z0-9_]*)?|extern\s+\"C\")\s*\{")
+
+    def _scan_container(region_start: int, region_end: int) -> None:
+        pos = region_start
+        while pos < region_end:
+            # Skip whitespace & preprocessor lines
+            while pos < region_end and no_str[pos].isspace():
+                pos += 1
+            if pos >= region_end:
+                break
+            if no_str[pos] == "#":
+                nl = no_str.find("\n", pos)
+                while nl != -1 and nl > 0 and no_str[nl - 1] == "\\":
+                    nl = no_str.find("\n", nl + 1)
+                pos = (nl + 1) if nl != -1 else region_end
+                continue
+
+            # Enter namespace / extern "C" { ... }
+            m_ns = ns_or_extern_re.match(no_str, pos)
+            if m_ns:
+                ob = no_str.find("{", pos)
+                cb = _find_matching_delimiter(no_str, ob)
+                if cb != -1 and cb <= region_end:
+                    _scan_container(ob + 1, cb)
+                    pos = cb + 1
+                    continue
+
+            # Skip previously parsed class / struct / enum brace blocks
+            next_brace = no_str.find("{", pos, region_end)
+            next_semi = no_str.find(";", pos, region_end)
+            if next_brace != -1 and (next_semi == -1 or next_brace < next_semi):
+                if next_brace in class_spans or next_brace in struct_spans or next_brace in enum_spans:
+                    cb = _find_matching_delimiter(no_str, next_brace)
+                    pos = (cb + 1) if cb != -1 else next_brace + 1
+                    continue
+
+            # Try function definition ending at next_brace
+            if next_brace != -1 and (next_semi == -1 or next_brace < next_semi):
+                stmt = no_str[pos:next_brace + 1]
+                m_def = top_fn_def_re.search(stmt)
+                cb = _find_matching_delimiter(no_str, next_brace)
+                if cb == -1:
+                    break
+                if m_def:
+                    ret_t = " ".join(m_def.group(1).split())
+                    fn_raw = m_def.group(2).strip()
+                    params = " ".join(m_def.group(3).split())
+                    short_name = fn_raw.split("::")[-1]
+                    if short_name.lower() not in _CPP_IGNORED_NAMES and not ret_t.startswith(("return", "if", "for", "while", "switch")):
+                        ln = _line_of_offset(line_starts, pos + m_def.start(2))
+                        doc = _extract_comment_near_line(lines, ln)
+                        fn_kind = "method" if "::" in fn_raw else "function"
+                        fn_nid = f"{ctx.rel_slug}_{_slugify(fn_raw)}"
+                        resolved = ctx.add_symbol(
+                            fn_nid,
+                            f"{fn_raw}()",
+                            fn_kind,
+                            line=ln,
+                            parent_id=file_id,
+                            reconcile_by_label=True,
+                            extra_meta={
+                                "qualified_name": fn_raw,
+                                "return_type": ret_t,
+                                "params": params,
+                                "docstring": doc,
+                            },
+                        )
+                        local_fn_map[short_name.lower()] = resolved
+                        local_fn_map[fn_raw.lower()] = resolved
+                        function_bodies.append((resolved, next_brace, cb))
+                pos = cb + 1
+                continue
+
+            # Try declaration/statement ending at next_semi
+            if next_semi != -1:
+                stmt = no_str[pos:next_semi + 1]
+                m_decl = top_fn_decl_re.match(stmt)
+                if m_decl:
+                    ret_t = " ".join(m_decl.group(1).split())
+                    fn_raw = m_decl.group(2).strip()
+                    params = " ".join(m_decl.group(3).split())
+                    short_name = fn_raw.split("::")[-1]
+                    first_ret_tok = ret_t.split()[0].lower() if ret_t else ""
+                    if (
+                        short_name.lower() not in _CPP_IGNORED_NAMES
+                        and first_ret_tok not in _CPP_IGNORED_NAMES
+                        and "=" not in ret_t
+                    ):
+                        ln = _line_of_offset(line_starts, pos + m_decl.start(2))
+                        doc = _extract_comment_near_line(lines, ln)
+                        has_dllexport = "dllexport" in stmt
+                        resolved = ctx.add_symbol(
+                            f"{ctx.rel_slug}_decl_{_slugify(fn_raw)}",
+                            f"{fn_raw}()",
+                            "function",
+                            line=ln,
+                            parent_id=file_id,
+                            reconcile_by_label=True,
+                            extra_meta={
+                                "qualified_name": fn_raw,
+                                "return_type": ret_t,
+                                "params": params,
+                                "declaration_only": True,
+                                "dllexport": has_dllexport,
+                                "docstring": doc,
+                            },
+                        )
+                        local_fn_map.setdefault(short_name.lower(), resolved)
+                pos = next_semi + 1
+                continue
+            break
+
+    _scan_container(0, len(no_str))
+
+    # Also ensure graphify-extracted functions that weren't matched get scanned for Win32 APIs
+    if not function_bodies and existing_nodes:
+        for gn in existing_nodes:
+            if gn.label.endswith("()"):
+                local_fn_map.setdefault(gn.label[:-2].lower(), gn.id)
+
+    # 8. Scan function bodies for Win32 Session 0 APIs & local calls
+    call_pat = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    for caller_id, b_start, b_end in function_bodies:
+        body_slice = no_str[b_start:b_end]
+        for cm in call_pat.finditer(body_slice):
+            callee = cm.group(1)
+            if callee.lower() in _CPP_IGNORED_NAMES:
+                continue
+            ln = _line_of_offset(line_starts, b_start + cm.start())
+            win32_cat = _lookup_win32_api(callee)
+            if win32_cat:
+                api_nid = f"win32_{_slugify(callee)}"
+                ctx.add_symbol(
+                    api_nid,
+                    callee,
+                    "win32_api",
+                    line=ln,
+                    parent_id=None,
+                    extra_meta={"api_category": win32_cat, "external": True},
+                )
+                ctx.add_edge(
+                    caller_id,
+                    api_nid,
+                    "calls",
+                    line=ln,
+                    metadata={"win32_api": callee, "api_category": win32_cat},
+                )
+            elif callee.lower() in local_fn_map:
+                tgt = local_fn_map[callee.lower()]
+                if tgt != caller_id:
+                    ctx.add_edge(caller_id, tgt, "calls", line=ln)
+
+    return ctx.nodes, ctx.edges
+
+
+def _parse_idl(
+    text: str,
+    rel_path: str,
+    project_id: str,
+    encoding: str,
+) -> Tuple[List[GraphNode], List[GraphEdge]]:
+    """Parse COM/MIDL (.idl) interfaces, coclasses, libraries, UUIDs, and methods."""
+    ctx = _LegacyParseContext(project_id, rel_path, "idl", encoding)
+    lines = text.splitlines()
+    file_id = ctx.ensure_file_node(docstring=_extract_comment_near_line(lines, 1))
+    no_comm, no_str = _strip_comments_preserve_lines(text)
+    line_starts = _compute_line_starts(no_str)
+
+    # Imports (import "oaidl.idl"; / importlib("stdole2.tlb");)
+    for m in re.finditer(r'\bimport(?:lib)?\s*\(?\s*"([^"]+)"', no_comm):
+        ln = _line_of_offset(line_starts, m.start())
+        ctx.add_edge(file_id, _slugify(Path(m.group(1)).stem), "imports", line=ln)
+
+    def _parse_attrs(attr_block: str) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {}
+        u = re.search(r"uuid\s*\(\s*([0-9a-fA-F\-]+)\s*\)", attr_block)
+        if u:
+            meta["uuid"] = u.group(1).lower()
+        hs = re.search(r'helpstring\s*\(\s*"([^"]*)"\s*\)', attr_block)
+        if hs:
+            meta["helpstring"] = hs.group(1)
+        ver = re.search(r"version\s*\(\s*([0-9.]+)\s*\)", attr_block)
+        if ver:
+            meta["version"] = ver.group(1)
+        return meta
+
+    decl_re = re.compile(
+        r"(?:\[([^\]]*)\]\s*)?\b(library|dispinterface|interface|coclass)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*([A-Za-z_][A-Za-z0-9_]*))?\s*\{"
+    )
+    iface_ids: Dict[str, str] = {}
+
+    def _scan_idl_region(start: int, end: int, parent_id: str) -> None:
+        pos = start
+        while pos < end:
+            m = decl_re.search(no_comm, pos, end)
+            if not m:
+                break
+            open_b = no_comm.find("{", m.start())
+            close_b = _find_matching_delimiter(no_comm, open_b)
+            if close_b == -1 or close_b > end:
+                break
+            attrs = _parse_attrs(m.group(1) or "")
+            kind_kw = m.group(2).lower()
+            name = m.group(3)
+            base_iface = m.group(4)
+            ln = _line_of_offset(line_starts, m.start())
+            doc = attrs.get("helpstring") or _extract_comment_near_line(lines, ln)
+
+            if kind_kw in ("interface", "dispinterface"):
+                nid = f"{ctx.rel_slug}_iface_{_slugify(name)}"
+                ctx.add_symbol(
+                    nid,
+                    name,
+                    "interface",
+                    line=ln,
+                    parent_id=parent_id,
+                    extra_meta={**attrs, "docstring": doc},
+                )
+                iface_ids[name.lower()] = nid
+                if base_iface:
+                    ctx.add_edge(nid, iface_ids.get(base_iface.lower(), _slugify(base_iface)), "inherits", line=ln)
+                # Methods inside interface
+                body = no_comm[open_b + 1:close_b]
+                for mm in re.finditer(r"(?:\[[^\]]*\]\s*)?(?:HRESULT|void|long|int|BOOL|BSTR|VARIANT)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*;", body):
+                    mname = mm.group(1)
+                    mln = _line_of_offset(line_starts, open_b + 1 + mm.start())
+                    ctx.add_symbol(
+                        f"{ctx.rel_slug}_{_slugify(name)}_{_slugify(mname)}",
+                        f"{mname}()",
+                        "method",
+                        line=mln,
+                        parent_id=nid,
+                        relation="method",
+                        extra_meta={"params": " ".join(mm.group(2).split())},
+                    )
+            elif kind_kw == "library":
+                nid = f"{ctx.rel_slug}_lib_{_slugify(name)}"
+                ctx.add_symbol(
+                    nid,
+                    name,
+                    "library",
+                    line=ln,
+                    parent_id=parent_id,
+                    extra_meta={**attrs, "docstring": doc},
+                )
+                _scan_idl_region(open_b + 1, close_b, nid)
+            elif kind_kw == "coclass":
+                nid = f"{ctx.rel_slug}_coclass_{_slugify(name)}"
+                ctx.add_symbol(
+                    nid,
+                    name,
+                    "coclass",
+                    line=ln,
+                    parent_id=parent_id,
+                    extra_meta={**attrs, "docstring": doc},
+                )
+                body = no_comm[open_b + 1:close_b]
+                for im in re.finditer(r"\b(?:disp)?interface\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", body):
+                    iname = im.group(1)
+                    iln = _line_of_offset(line_starts, open_b + 1 + im.start())
+                    ctx.add_edge(nid, iface_ids.get(iname.lower(), _slugify(iname)), "implements", line=iln)
+
+            pos = close_b + 1
+
+    _scan_idl_region(0, len(no_comm), file_id)
+    return ctx.nodes, ctx.edges
+
+
+def _parse_def(
+    text: str,
+    rel_path: str,
+    project_id: str,
+    encoding: str,
+) -> Tuple[List[GraphNode], List[GraphEdge]]:
+    """Parse Windows DLL Module-Definition (.def) LIBRARY and EXPORTS symbols."""
+    ctx = _LegacyParseContext(project_id, rel_path, "def", encoding)
+    lines = text.splitlines()
+    file_id = ctx.ensure_file_node(docstring=_extract_comment_near_line(lines, 1, line_prefixes=(";",)))
+
+    parent_id = file_id
+    in_exports = False
+    section_stop = {"SECTIONS", "SEGMENTS", "HEAPSIZE", "STACKSIZE", "STUB", "VERSION", "DESCRIPTION"}
+
+    for idx, raw_line in enumerate(lines):
+        ln = idx + 1
+        code_part = raw_line.split(";", 1)[0].strip()
+        if not code_part:
+            continue
+
+        m_lib = re.match(r'^(LIBRARY|NAME)\s+"?([A-Za-z0-9_.-]+)"?', code_part, re.IGNORECASE)
+        if m_lib:
+            in_exports = False
+            lib_name = m_lib.group(2)
+            parent_id = ctx.add_symbol(
+                f"{ctx.rel_slug}_lib_{_slugify(lib_name)}",
+                lib_name,
+                "library",
+                line=ln,
+                parent_id=file_id,
+                extra_meta={"def_directive": m_lib.group(1).upper()},
+            )
+            continue
+
+        if re.match(r"^EXPORTS\b", code_part, re.IGNORECASE):
+            in_exports = True
+            rest = code_part[len("EXPORTS"):].strip()
+            if not rest:
+                continue
+            code_part = rest
+
+        first_tok = code_part.split()[0].upper()
+        if first_tok in section_stop:
+            in_exports = False
+            continue
+
+        if in_exports:
+            m_exp = re.match(
+                r"^([A-Za-z_@?][A-Za-z0-9_@?$]*)(?:\s*=\s*([A-Za-z_][A-Za-z0-9_.]*))?(.*)$",
+                code_part,
+            )
+            if m_exp:
+                exp_name = m_exp.group(1)
+                internal_name = m_exp.group(2) or ""
+                tail = m_exp.group(3).strip()
+                ord_m = re.search(r"@(\d+)", tail)
+                ordinal = int(ord_m.group(1)) if ord_m else None
+                flags = [t for t in tail.split() if not t.startswith("@")]
+                doc = _extract_comment_near_line(lines, ln, line_prefixes=(";",))
+                enid = ctx.add_symbol(
+                    f"{ctx.rel_slug}_export_{_slugify(exp_name)}",
+                    exp_name,
+                    "export",
+                    line=ln,
+                    parent_id=parent_id,
+                    extra_meta={
+                        "ordinal": ordinal,
+                        "internal_name": internal_name,
+                        "flags": flags,
+                        "docstring": doc,
+                    },
+                )
+                if internal_name:
+                    ctx.add_edge(enid, _slugify(internal_name), "calls", line=ln)
+
+    return ctx.nodes, ctx.edges
+
+
+def _parse_rc(
+    text: str,
+    rel_path: str,
+    project_id: str,
+    encoding: str,
+) -> Tuple[List[GraphNode], List[GraphEdge]]:
+    """Parse Win32 Resource (.rc) DIALOG/DIALOGEX, MENU, STRINGTABLE, and control IDs."""
+    ctx = _LegacyParseContext(project_id, rel_path, "rc", encoding)
+    lines = text.splitlines()
+    file_id = ctx.ensure_file_node(docstring=_extract_comment_near_line(lines, 1))
+    no_comm, _ = _strip_comments_preserve_lines(text)
+    clean_lines = no_comm.splitlines()
+
+    for idx, line in enumerate(clean_lines):
+        m_inc = re.match(r'^\s*#\s*include\s+[<"]([^>"]+)[>"]', line)
+        if m_inc:
+            ctx.add_edge(file_id, _slugify(Path(m_inc.group(1)).stem), "imports", line=idx + 1)
+
+    dlg_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+(DIALOGEX|DIALOG)\b", re.IGNORECASE)
+    menu_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+(MENUEX|MENU)\b", re.IGNORECASE)
+    strtbl_re = re.compile(r"^\s*STRINGTABLE\b", re.IGNORECASE)
+    caption_re = re.compile(r'^\s*CAPTION\s+"([^"]*)"', re.IGNORECASE)
+    ctrl_quoted_re = re.compile(
+        r'^\s*(CONTROL|PUSHBUTTON|DEFPUSHBUTTON|CHECKBOX|RADIOBUTTON|GROUPBOX|LTEXT|RTEXT|CTEXT|AUTOCHECKBOX|AUTORADIOBUTTON)\s+"([^"]*)"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)',
+        re.IGNORECASE,
+    )
+    ctrl_unquoted_re = re.compile(
+        r"^\s*(EDITTEXT|COMBOBOX|LISTBOX|SCROLLBAR|ICON)\s+(?:\"[^\"]*\"\s*,\s*)?([A-Za-z_][A-Za-z0-9_]*)",
+        re.IGNORECASE,
+    )
+    menuitem_re = re.compile(r'^\s*MENUITEM\s+"([^"]*)"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)', re.IGNORECASE)
+    str_entry_re = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s+"([^"]*)"')
+
+    active_container_id: Optional[str] = None
+    active_container_kind: Optional[str] = None
+    block_depth = 0
+    seen_begin = False
+
+    for idx, raw in enumerate(clean_lines):
+        ln = idx + 1
+        s = raw.strip()
+        if not s:
+            continue
+
+        if active_container_kind is None:
+            m_dlg = dlg_re.match(s)
+            if m_dlg:
+                dlg_id_name = m_dlg.group(1)
+                active_container_kind = "dialog"
+                active_container_id = ctx.add_symbol(
+                    f"{ctx.rel_slug}_dlg_{_slugify(dlg_id_name)}",
+                    dlg_id_name,
+                    "dialog",
+                    line=ln,
+                    parent_id=file_id,
+                    extra_meta={"resource_type": m_dlg.group(2).upper()},
+                )
+                block_depth = 0
+                seen_begin = False
+                continue
+            m_menu = menu_re.match(s)
+            if m_menu:
+                menu_name = m_menu.group(1)
+                active_container_kind = "menu"
+                active_container_id = ctx.add_symbol(
+                    f"{ctx.rel_slug}_menu_{_slugify(menu_name)}",
+                    menu_name,
+                    "menu",
+                    line=ln,
+                    parent_id=file_id,
+                    extra_meta={"resource_type": m_menu.group(2).upper()},
+                )
+                block_depth = 0
+                seen_begin = False
+                continue
+            if strtbl_re.match(s):
+                active_container_kind = "stringtable"
+                active_container_id = file_id
+                block_depth = 0
+                seen_begin = False
+                continue
+            continue
+
+        # Inside DIALOG / MENU / STRINGTABLE
+        upper_tok = s.split()[0].upper()
+        if upper_tok in ("BEGIN", "{"):
+            block_depth += 1
+            seen_begin = True
+            continue
+        if upper_tok in ("END", "}"):
+            block_depth -= 1
+            if seen_begin and block_depth <= 0:
+                active_container_id = None
+                active_container_kind = None
+            continue
+
+        if active_container_kind == "dialog" and active_container_id:
+            m_cap = caption_re.match(s)
+            if m_cap:
+                node = ctx.nodes_by_id.get(active_container_id)
+                if node:
+                    node.metadata["caption"] = m_cap.group(1)
+                    node.metadata.setdefault("docstring", m_cap.group(1))
+                continue
+            m_cq = ctrl_quoted_re.match(s)
+            if m_cq:
+                ctype, ctext, cid = m_cq.group(1).upper(), m_cq.group(2), m_cq.group(3)
+                ctx.add_symbol(
+                    f"{ctx.rel_slug}_ctrl_{_slugify(cid)}",
+                    cid,
+                    "control",
+                    line=ln,
+                    parent_id=active_container_id,
+                    extra_meta={"control_type": ctype, "caption": ctext},
+                )
+                continue
+            m_cu = ctrl_unquoted_re.match(s)
+            if m_cu:
+                ctype, cid = m_cu.group(1).upper(), m_cu.group(2)
+                ctx.add_symbol(
+                    f"{ctx.rel_slug}_ctrl_{_slugify(cid)}",
+                    cid,
+                    "control",
+                    line=ln,
+                    parent_id=active_container_id,
+                    extra_meta={"control_type": ctype},
+                )
+        elif active_container_kind == "menu" and active_container_id:
+            m_mi = menuitem_re.match(s)
+            if m_mi:
+                mtext, mid = m_mi.group(1), m_mi.group(2)
+                ctx.add_symbol(
+                    f"{ctx.rel_slug}_ctrl_{_slugify(mid)}",
+                    mid,
+                    "control",
+                    line=ln,
+                    parent_id=active_container_id,
+                    extra_meta={"control_type": "MENUITEM", "caption": mtext},
+                )
+        elif active_container_kind == "stringtable":
+            m_se = str_entry_re.match(s)
+            if m_se:
+                sid, sval = m_se.group(1), m_se.group(2)
+                ctx.add_symbol(
+                    f"{ctx.rel_slug}_str_{_slugify(sid)}",
+                    sid,
+                    "string_resource",
+                    line=ln,
+                    parent_id=file_id,
+                    extra_meta={"value": sval, "docstring": sval},
+                )
+
+    return ctx.nodes, ctx.edges
+
+
+def _parse_vb6(
+    text: str,
+    rel_path: str,
+    project_id: str,
+    encoding: str,
+) -> Tuple[List[GraphNode], List[GraphEdge]]:
+    """Parse legacy VB6/VBA (.bas/.cls/.frm) modules, Declare APIs, subs/functions, and calls."""
+    ctx = _LegacyParseContext(project_id, rel_path, "vb6", encoding)
+    lines = text.splitlines()
+    file_id = ctx.ensure_file_node(docstring=_extract_comment_near_line(lines, 1, line_prefixes=("'", "REM ")))
+    ext = Path(rel_path).suffix.lower()
+
+    container_id = file_id
+    local_symbols: Dict[str, str] = {}
+    body_ranges: List[Tuple[str, int, int]] = []
+    current_proc: Optional[Tuple[str, int]] = None
+
+    attr_name_re = re.compile(r'^\s*Attribute\s+VB_Name\s*=\s*"([^"]+)"', re.IGNORECASE)
+    form_re = re.compile(r"^\s*Begin\s+VB\.(Form|MDIForm)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+    declare_re = re.compile(
+        r'^\s*(?:(Public|Private|Friend)\s+)?Declare\s+(?:PtrSafe\s+)?(Function|Sub)\s+'
+        r'([A-Za-z_][A-Za-z0-9_]*)\s+Lib\s+"([^"]+)"(?:\s+Alias\s+"([^"]+)")?',
+        re.IGNORECASE,
+    )
+    proc_re = re.compile(
+        r"^\s*(?:(Public|Private|Friend)\s+)?(?:Static\s+)?(Sub|Function|Property\s+(?:Get|Let|Set))\s+([A-Za-z_][A-Za-z0-9_]*)",
+        re.IGNORECASE,
+    )
+    end_proc_re = re.compile(r"^\s*End\s+(Sub|Function|Property)\b", re.IGNORECASE)
+    udt_re = re.compile(r"^\s*(?:(?:Public|Private)\s+)?Type\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+    enum_re = re.compile(r"^\s*(?:(?:Public|Private)\s+)?Enum\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+    for idx, raw_line in enumerate(lines):
+        ln = idx + 1
+        code_part = raw_line.split("'", 1)[0].strip()
+        if not code_part or code_part.upper().startswith("REM "):
+            continue
+
+        m_attr = attr_name_re.match(code_part)
+        if m_attr:
+            mod_name = m_attr.group(1)
+            vb_kind = "form" if ext == ".frm" else ("class" if ext == ".cls" else "module")
+            container_id = ctx.add_symbol(
+                f"{ctx.rel_slug}_mod_{_slugify(mod_name)}",
+                mod_name,
+                "class",
+                line=ln,
+                parent_id=file_id,
+                extra_meta={"vb_kind": vb_kind},
+            )
+            continue
+
+        m_frm = form_re.match(code_part)
+        if m_frm and container_id == file_id:
+            fname = m_frm.group(2)
+            container_id = ctx.add_symbol(
+                f"{ctx.rel_slug}_frm_{_slugify(fname)}",
+                fname,
+                "class",
+                line=ln,
+                parent_id=file_id,
+                extra_meta={"vb_kind": "form"},
+            )
+            continue
+
+        m_dec = declare_re.match(code_part)
+        if m_dec:
+            vis = (m_dec.group(1) or "Public").lower()
+            fn_name = m_dec.group(3)
+            dll_lib = m_dec.group(4)
+            alias = m_dec.group(5) or ""
+            doc = _extract_comment_near_line(lines, ln, line_prefixes=("'", "REM "))
+            nid = ctx.add_symbol(
+                f"{ctx.rel_slug}_decl_{_slugify(fn_name)}",
+                f"{fn_name}()",
+                "function",
+                line=ln,
+                parent_id=container_id,
+                extra_meta={
+                    "is_declare": True,
+                    "dll_lib": dll_lib,
+                    "alias": alias,
+                    "visibility": vis,
+                    "signature": code_part,
+                    "docstring": doc,
+                },
+            )
+            local_symbols[fn_name.lower()] = nid
+            ctx.add_edge(container_id, _slugify(Path(dll_lib).stem), "imports", line=ln)
+            continue
+
+        if current_proc and end_proc_re.match(code_part):
+            pid, sln = current_proc
+            body_ranges.append((pid, sln, ln))
+            current_proc = None
+            continue
+
+        m_proc = proc_re.match(code_part)
+        if m_proc:
+            vis = (m_proc.group(1) or "Public").lower()
+            pname = m_proc.group(3)
+            pkind = "method" if ext in (".cls", ".frm") else "function"
+            doc = _extract_comment_near_line(lines, ln, line_prefixes=("'", "REM "))
+            nid = ctx.add_symbol(
+                f"{ctx.rel_slug}_{_slugify(pname)}",
+                f"{pname}()",
+                pkind,
+                line=ln,
+                parent_id=container_id,
+                relation="method" if pkind == "method" else "contains",
+                extra_meta={"visibility": vis, "signature": code_part, "docstring": doc},
+            )
+            local_symbols[pname.lower()] = nid
+            current_proc = (nid, ln)
+            continue
+
+        m_udt = udt_re.match(code_part)
+        if m_udt:
+            ctx.add_symbol(f"{ctx.rel_slug}_udt_{_slugify(m_udt.group(1))}", m_udt.group(1), "struct", line=ln, parent_id=container_id)
+            continue
+
+        m_enum = enum_re.match(code_part)
+        if m_enum:
+            ctx.add_symbol(f"{ctx.rel_slug}_enum_{_slugify(m_enum.group(1))}", m_enum.group(1), "enum", line=ln, parent_id=container_id)
+            continue
+
+    call_re = re.compile(r"(?:\bCall\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    for caller_id, sln, eln in body_ranges:
+        for ln in range(sln + 1, eln):
+            code_part = lines[ln - 1].split("'", 1)[0]
+            for cm in call_re.finditer(code_part):
+                callee = cm.group(1)
+                if callee.lower() in local_symbols and local_symbols[callee.lower()] != caller_id:
+                    ctx.add_edge(caller_id, local_symbols[callee.lower()], "calls", line=ln)
+
+    return ctx.nodes, ctx.edges
+
+
+def _parse_delphi(
+    text: str,
+    rel_path: str,
+    project_id: str,
+    encoding: str,
+) -> Tuple[List[GraphNode], List[GraphEdge]]:
+    """Parse Delphi / Object Pascal (.pas/.dfm) units, sections, classes, and routines."""
+    ctx = _LegacyParseContext(project_id, rel_path, "pascal", encoding)
+    lines = text.splitlines()
+    file_id = ctx.ensure_file_node(docstring=_extract_comment_near_line(lines, 1, line_prefixes=("//",), block_open="{", block_close="}"))
+    ext = Path(rel_path).suffix.lower()
+
+    if ext == ".dfm":
+        if text.startswith("TPF0"):  # Binary DFM guard
+            return ctx.nodes, ctx.edges
+        stack: List[str] = [file_id]
+        for idx, raw in enumerate(lines):
+            ln = idx + 1
+            s = raw.strip()
+            m_obj = re.match(r"^(?:object|inherited)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)", s, re.IGNORECASE)
+            if m_obj:
+                oname, otype = m_obj.group(1), m_obj.group(2)
+                okind = "dialog" if len(stack) == 1 else "control"
+                nid = ctx.add_symbol(
+                    f"{ctx.rel_slug}_{_slugify(oname)}",
+                    oname,
+                    okind,
+                    line=ln,
+                    parent_id=stack[-1],
+                    extra_meta={"dfm_type": otype},
+                )
+                stack.append(nid)
+            elif s.lower() == "end" and len(stack) > 1:
+                stack.pop()
+        return ctx.nodes, ctx.edges
+
+    no_comm, no_str = _strip_comments_preserve_lines(
+        text,
+        line_prefixes=("//",),
+        block_pairs=(("(*", "*)"), ("{", "}")),
+        string_delims=("'",),
+        backslash_escapes=False,
+    )
+    line_starts = _compute_line_starts(no_str)
+    clean_lines = no_comm.splitlines()
+
+    unit_id = file_id
+    unit_name = Path(rel_path).stem
+    current_section = "interface"
+    current_section_id: Optional[str] = None
+    class_ids: Dict[str, str] = {}
+    routine_ids: Dict[str, str] = {}
+    body_spans: List[Tuple[str, int, int]] = []
+
+    unit_re = re.compile(r"^\s*(unit|program|library)\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", re.IGNORECASE)
+    type_cls_re = re.compile(
+        r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:packed\s+)?(class|interface|record)\s*(?:\(([^)]+)\))?",
+        re.IGNORECASE,
+    )
+    proc_re = re.compile(
+        r"^\s*(?:class\s+)?(procedure|function|constructor|destructor)\s+(?:([A-Za-z_][A-Za-z0-9_]*)\.)?([A-Za-z_][A-Za-z0-9_]*)",
+        re.IGNORECASE,
+    )
+
+    # uses ...; imports
+    for um in re.finditer(r"\buses\b(.*?);", no_comm, re.IGNORECASE | re.DOTALL):
+        ln = _line_of_offset(line_starts, um.start())
+        for tok in um.group(1).split(","):
+            uname = tok.strip().split()[0] if tok.strip() else ""
+            if uname and re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", uname):
+                ctx.add_edge(file_id, _slugify(uname), "imports", line=ln)
+
+    active_routine: Optional[Tuple[str, int]] = None
+    active_type_decl: Optional[Tuple[str, str]] = None  # (name, node_id)
+    begin_depth = 0
+    in_type_block = False
+
+    for idx, raw in enumerate(clean_lines):
+        ln = idx + 1
+        s = raw.strip()
+        if not s:
+            continue
+
+        m_u = unit_re.match(s)
+        if m_u:
+            unit_name = m_u.group(2)
+            pas_kind = m_u.group(1).lower()
+            if pas_kind in ("program", "library"):
+                current_section = "implementation"
+            unit_id = ctx.add_symbol(
+                f"{ctx.rel_slug}_unit_{_slugify(unit_name)}",
+                unit_name,
+                "unit",
+                line=ln,
+                parent_id=file_id,
+                extra_meta={"pas_kind": pas_kind},
+            )
+            continue
+
+        low = s.lower()
+        if low in ("interface", "implementation"):
+            current_section = low
+            in_type_block = False
+            active_type_decl = None
+            current_section_id = ctx.add_symbol(
+                f"{ctx.rel_slug}_sec_{low}",
+                f"{unit_name}.{low}",
+                "section",
+                line=ln,
+                parent_id=unit_id,
+            )
+            continue
+
+        if low == "type":
+            in_type_block = True
+            active_type_decl = None
+            continue
+        if low in ("var", "const", "resourcestring"):
+            in_type_block = False
+            active_type_decl = None
+            continue
+
+        if active_type_decl is not None and re.match(r"^end\s*;", low):
+            active_type_decl = None
+            continue
+
+        m_tc = type_cls_re.match(s)
+        if m_tc and (in_type_block or "=" in s):
+            cname = m_tc.group(1)
+            ckw = m_tc.group(2).lower()
+            bases = m_tc.group(3) or ""
+            ckind = "struct" if ckw == "record" else ("interface" if ckw == "interface" else "class")
+            doc = _extract_comment_near_line(lines, ln, line_prefixes=("//",), block_open="{", block_close="}")
+            cnid = ctx.add_symbol(
+                f"{ctx.rel_slug}_{ckind}_{_slugify(cname)}",
+                cname,
+                ckind,
+                line=ln,
+                parent_id=current_section_id or unit_id,
+                extra_meta={"section": current_section, "docstring": doc},
+            )
+            class_ids[cname.lower()] = cnid
+            # Forward class declarations `TFoo = class;` have `;` at EOL and no body
+            if not s.rstrip().endswith(";"):
+                active_type_decl = (cname, cnid)
+            for b in bases.split(","):
+                bname = b.strip()
+                if bname:
+                    ctx.add_edge(cnid, class_ids.get(bname.lower(), _slugify(bname)), "inherits", line=ln)
+            continue
+
+        m_pr = proc_re.match(s)
+        if m_pr and begin_depth == 0:
+            pkw = m_pr.group(1).lower()
+            cls_owner = m_pr.group(2) or (active_type_decl[0] if active_type_decl else None)
+            pname = m_pr.group(3)
+            doc = _extract_comment_near_line(lines, ln, line_prefixes=("//",), block_open="{", block_close="}")
+            if cls_owner:
+                owner_id = class_ids.get(cls_owner.lower()) or current_section_id or unit_id
+                qual = f"{cls_owner}.{pname}"
+                pkind = "method"
+            else:
+                owner_id = current_section_id or unit_id
+                qual = pname
+                pkind = "function"
+            pnid = ctx.add_symbol(
+                f"{ctx.rel_slug}_{_slugify(qual)}",
+                f"{qual}()",
+                pkind,
+                line=ln,
+                parent_id=owner_id,
+                relation="method" if pkind == "method" else "contains",
+                extra_meta={
+                    "pas_kind": pkw,
+                    "qualified_name": qual,
+                    "section": current_section,
+                    "docstring": doc,
+                },
+            )
+            routine_ids[qual.lower()] = pnid
+            routine_ids.setdefault(pname.lower(), pnid)
+            if current_section == "implementation" and active_type_decl is None:
+                active_routine = (pnid, ln)
+                begin_depth = 0
+            continue
+
+        if active_routine is not None:
+            for tok in re.findall(r"\b(?:begin|case|try|end)\b", low):
+                if tok in ("begin", "case", "try"):
+                    begin_depth += 1
+                elif tok == "end":
+                    begin_depth = max(0, begin_depth - 1)
+                    if begin_depth == 0:
+                        body_spans.append((active_routine[0], active_routine[1], ln))
+                        active_routine = None
+                        break
+
+    no_str_lines = no_str.splitlines()
+    call_re = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*(?:\(|;)")
+    for caller_id, sln, eln in body_spans:
+        for ln in range(sln + 1, min(eln, len(no_str_lines) + 1)):
+            line_clean = no_str_lines[ln - 1]
+            for cm in call_re.finditer(line_clean):
+                callee = cm.group(1).lower()
+                if callee in routine_ids and routine_ids[callee] != caller_id:
+                    ctx.add_edge(caller_id, routine_ids[callee], "calls", line=ln)
+
+    return ctx.nodes, ctx.edges
+
+
+def _parse_cobol(
+    text: str,
+    rel_path: str,
+    project_id: str,
+    encoding: str,
+) -> Tuple[List[GraphNode], List[GraphEdge]]:
+    """Parse COBOL (.cbl/.cob) PROGRAM-ID, DIVISION/SECTION, paragraphs, COPY, PERFORM, and CALL."""
+    ctx = _LegacyParseContext(project_id, rel_path, "cobol", encoding)
+    lines = text.splitlines()
+    file_id = ctx.ensure_file_node()
+
+    prog_id_re = re.compile(r"^\s*PROGRAM-ID\.\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
+    div_re = re.compile(r"^\s*(IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION\.", re.IGNORECASE)
+    sec_re = re.compile(r"^\s*([A-Za-z0-9-]+)\s+SECTION\.", re.IGNORECASE)
+    para_re = re.compile(r"^\s*([A-Za-z][A-Za-z0-9-]*)\.\s*$")
+    copy_re = re.compile(r"\bCOPY\s+([A-Za-z0-9_-]+)", re.IGNORECASE)
+    perform_re = re.compile(r"\bPERFORM\s+([A-Za-z][A-Za-z0-9-]*)", re.IGNORECASE)
+    call_re = re.compile(r"""\bCALL\s+['"]?([A-Za-z0-9_-]+)['"]?""", re.IGNORECASE)
+
+    program_node_id = file_id
+    current_section_id: Optional[str] = None
+    current_para_id: Optional[str] = None
+    para_ids: Dict[str, str] = {}
+    deferred_calls: List[Tuple[str, str, int, str]] = []
+    cobol_skip_perform = {"UNTIL", "VARYING", "TIMES", "WITH", "TEST", "INLINE"}
+
+    def _strip_cobol_line(raw: str) -> Optional[str]:
+        if len(raw) > 6 and raw[6] in ("*", "/"):
+            return None
+        code = raw.split("*>", 1)[0]
+        if len(raw) > 6 and raw[:6].isdigit():
+            code = code[6:]
+        return code.strip()
+
+    for idx, raw in enumerate(lines):
+        ln = idx + 1
+        cleaned = _strip_cobol_line(raw)
+        if not cleaned:
+            continue
+
+        m_pid = prog_id_re.match(cleaned)
+        if m_pid:
+            pname = m_pid.group(1).upper()
+            program_node_id = ctx.add_symbol(
+                f"{ctx.rel_slug}_prog_{_slugify(pname)}",
+                pname,
+                "program",
+                line=ln,
+                parent_id=file_id,
+            )
+            continue
+
+        if div_re.match(cleaned):
+            current_section_id = None
+            current_para_id = None
+            continue
+
+        m_sec = sec_re.match(cleaned)
+        if m_sec:
+            sname = m_sec.group(1).upper()
+            current_section_id = ctx.add_symbol(
+                f"{ctx.rel_slug}_sec_{_slugify(sname)}",
+                f"{sname} SECTION",
+                "section",
+                line=ln,
+                parent_id=program_node_id,
+            )
+            para_ids[sname] = current_section_id
+            current_para_id = None
+            continue
+
+        m_para = para_re.match(cleaned)
+        if m_para:
+            pname = m_para.group(1).upper()
+            if pname not in ("IDENTIFICATION", "ENVIRONMENT", "DATA", "PROCEDURE", "SECTION", "DIVISION"):
+                pnid = ctx.add_symbol(
+                    f"{ctx.rel_slug}_para_{_slugify(pname)}",
+                    pname,
+                    "function",
+                    line=ln,
+                    parent_id=current_section_id or program_node_id,
+                    extra_meta={"cobol_kind": "paragraph"},
+                )
+                para_ids[pname] = pnid
+                current_para_id = pnid
+                continue
+
+        caller = current_para_id or current_section_id or program_node_id
+        for cm in copy_re.finditer(cleaned):
+            ctx.add_edge(caller, _slugify(cm.group(1)), "imports", line=ln)
+        for pm in perform_re.finditer(cleaned):
+            tgt = pm.group(1).upper()
+            if tgt not in cobol_skip_perform:
+                deferred_calls.append((caller, tgt, ln, "perform"))
+        for clm in call_re.finditer(cleaned):
+            deferred_calls.append((caller, clm.group(1).upper(), ln, "call"))
+
+    for caller, tgt_name, ln, _ in deferred_calls:
+        target_id = para_ids.get(tgt_name, _slugify(tgt_name))
+        ctx.add_edge(caller, target_id, "calls", line=ln)
+
+    return ctx.nodes, ctx.edges
+
+
+def _parse_sql_script_reg(
+    text: str,
+    rel_path: str,
+    project_id: str,
+    encoding: str,
+) -> Tuple[List[GraphNode], List[GraphEdge]]:
+    """Parse SQL DDL/routines (.sql), Windows batch scripts (.bat/.cmd), and Registry (.reg)."""
+    ext = Path(rel_path).suffix.lower()
+    lang = "sql" if ext == ".sql" else ("reg" if ext == ".reg" else "batch")
+    ctx = _LegacyParseContext(project_id, rel_path, lang, encoding)
+    file_id = ctx.ensure_file_node()
+
+    if ext == ".sql":
+        no_comm, _ = _strip_comments_preserve_lines(text, line_prefixes=("--",), block_pairs=(("/*", "*/"),))
+        line_starts = _compute_line_starts(no_comm)
+        for m in re.finditer(
+            r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER)\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_0-9.\[\]`\"]+)",
+            no_comm,
+            re.IGNORECASE,
+        ):
+            obj_kw = m.group(1).lower()
+            obj_name = m.group(2).strip('[]`"')
+            ln = _line_of_offset(line_starts, m.start())
+            kind = "table" if obj_kw in ("table", "view") else "function"
+            ctx.add_symbol(f"{ctx.rel_slug}_{obj_kw}_{_slugify(obj_name)}", obj_name, kind, line=ln, parent_id=file_id)
+    elif ext == ".reg":
+        cur_key = file_id
+        for idx, raw in enumerate(text.splitlines(), start=1):
+            s = raw.strip()
+            if not s or s.startswith(";"):
+                continue
+            if s.startswith("[") and s.endswith("]"):
+                key_path = s[1:-1].strip()
+                cur_key = ctx.add_symbol(
+                    f"{ctx.rel_slug}_reg_{_slugify(key_path)}",
+                    key_path,
+                    "registry_key",
+                    line=idx,
+                    parent_id=file_id,
+                )
+            elif "=" in s:
+                vname = s.split("=", 1)[0].strip().strip('"')
+                if vname:
+                    ctx.add_symbol(
+                        f"{ctx.rel_slug}_regv_{_slugify(vname)}",
+                        vname,
+                        "variable",
+                        line=idx,
+                        parent_id=cur_key,
+                    )
+    else:  # .bat / .cmd
+        labels: Dict[str, str] = {}
+        for idx, raw in enumerate(text.splitlines(), start=1):
+            s = raw.strip()
+            if not s or s.lower().startswith(("rem ", "@rem ", "::")):
+                continue
+            m_lbl = re.match(r"^:([A-Za-z_][A-Za-z0-9_-]*)\b", s)
+            if m_lbl:
+                lbl = m_lbl.group(1)
+                nid = ctx.add_symbol(f"{ctx.rel_slug}_lbl_{_slugify(lbl)}", lbl, "function", line=idx, parent_id=file_id)
+                labels[lbl.lower()] = nid
+                continue
+            m_call = re.match(r"^(?:@?call)\s+:?([A-Za-z0-9_.-]+)", s, re.IGNORECASE)
+            if m_call:
+                tgt = m_call.group(1)
+                ctx.add_edge(file_id, labels.get(tgt.lower(), _slugify(tgt)), "calls", line=idx)
+
+    return ctx.nodes, ctx.edges
 
 
 class GraphifyExtractor:
@@ -274,7 +2706,7 @@ class GraphifyExtractor:
                 tmp.unlink(missing_ok=True)
 
     # -----------------------------------------------------------------------
-    # Code AST Extraction (graphify + Python AST Fallback)
+    # Code AST Extraction (graphify + Python AST + Legacy Parsers)
     # -----------------------------------------------------------------------
     def _extract_code_ast(
         self,
@@ -283,69 +2715,14 @@ class GraphifyExtractor:
         project_id: str,
         branch: str,
     ) -> GraphDelta:
-        """Extract code symbols using `graphify.extract.extract` with Python AST fallback."""
-        nodes: List[GraphNode] = []
-        edges: List[GraphEdge] = []
-
-        # 1. Try graphify tree-sitter extraction
-        extracted_ok = False
-        try:
-            import graphify.extract as g_extract  # type: ignore
-
-            with _TREE_SITTER_LOCK:
-                raw = g_extract.extract([file_path])
-            if raw and (raw.get("nodes") or raw.get("edges")):
-                for n in raw.get("nodes", []):
-                    nid = str(n.get("id") or "")
-                    if not nid:
-                        continue
-                    nodes.append(
-                        GraphNode(
-                            id=nid,
-                            project_id=project_id,
-                            label=str(n.get("label") or nid),
-                            file_type="code",
-                            source_file=rel_path,
-                            source_location=n.get("source_location"),
-                            metadata={
-                                k: v
-                                for k, v in n.items()
-                                if k not in ("id", "label", "file_type", "source_file", "source_location", "community")
-                            },
-                        )
-                    )
-                for e in raw.get("edges", []):
-                    src = str(e.get("source") or "")
-                    tgt = str(e.get("target") or "")
-                    if not src or not tgt:
-                        continue
-                    edges.append(
-                        GraphEdge(
-                            project_id=project_id,
-                            source=src,
-                            target=tgt,
-                            relation=str(e.get("relation") or "calls"),
-                            confidence=str(e.get("confidence") or "EXTRACTED"),
-                            confidence_score=float(e.get("confidence_score", 1.0)),
-                            source_file=rel_path,
-                            source_location=e.get("source_location"),
-                            weight=float(e.get("weight", 1.0)),
-                        )
-                    )
-                extracted_ok = True
-        except Exception as err:
-            logger.debug("graphify.extract failed on %s: %s. Falling back to internal AST.", rel_path, err)
-
-        # 2. Python AST Fallback if graphify produced nothing or errored on Python
-        if not extracted_ok and file_path.suffix.lower() in (".py", ".pyw"):
-            nodes, edges = self._python_ast_fallback(file_path, rel_path, project_id)
-
-        return GraphDelta(
+        """Extract code symbols via the unified ExtractorRegistry (UTF-8 staged Tree-sitter + legacy/C++ backends)."""
+        registry = getattr(self, "_extractor_registry", None) or get_default_registry()
+        return registry.extract_code(
+            file_path=file_path,
+            rel_path=rel_path,
             project_id=project_id,
             branch=branch,
-            nodes=nodes,
-            edges=edges,
-            hyperedges=[],
+            python_fallback_fn=self._python_ast_fallback,
         )
 
     def _python_ast_fallback(
@@ -360,7 +2737,7 @@ class GraphifyExtractor:
         file_slug = _slugify(Path(rel_path).stem)
 
         try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            content, _ = read_text_with_encoding(file_path)
             tree = ast.parse(content, filename=str(file_path))
         except Exception as e:
             logger.debug("ast.parse failed on %s: %s", rel_path, e)
@@ -943,7 +3320,7 @@ class GraphifyExtractor:
                     file_delta = self._extract_code_ast(fpath, rel_path, project_id, branch)
                 else:
                     try:
-                        text_content = fpath.read_text(encoding="utf-8", errors="replace")
+                        text_content, _ = read_text_with_encoding(fpath)
                     except Exception:
                         text_content = ""
                     file_delta = self.extract_document_graph(
@@ -974,21 +3351,101 @@ class GraphifyExtractor:
             else:
                 resolved_workers = min(eff_workers, len(uncached_tasks))
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=resolved_workers) as executor:
-                for idx, file_delta in executor.map(_extract_single_file, uncached_tasks):
+        registry = getattr(self, "_extractor_registry", None) or get_default_registry()
+        batch_ts_tasks: List[Tuple[int, Path, str, bool, str, str]] = []
+        remaining_tasks: List[Tuple[int, Path, str, bool, str, str]] = []
+        for task in uncached_tasks:
+            _, fpath, _, is_code, _, _ = task
+            if is_code and registry.is_graphify_ts_batch_eligible(fpath.suffix):
+                batch_ts_tasks.append(task)
+            else:
+                remaining_tasks.append(task)
+
+        # Batch graphify.extract execution for pass-2 cross-file INFERRED edge resolution
+        if batch_ts_tasks:
+            ws_root_resolved = ws_root.resolve()
+            pb_dir = ws_root / ".projectbrain"
+            pb_dir_existed = pb_dir.exists() or pb_dir.is_symlink()
+            staging_dir: Optional[Path] = None
+            used_pb_dir = False
+            try:
+                if not pb_dir.is_symlink() and pb_dir.resolve().is_relative_to(ws_root_resolved):
+                    pb_dir.mkdir(parents=True, exist_ok=True)
+                    if (
+                        not pb_dir.is_symlink()
+                        and pb_dir.is_dir()
+                        and pb_dir.resolve().is_relative_to(ws_root_resolved)
+                    ):
+                        candidate_stage = Path(tempfile.mkdtemp(prefix="_utf8_stage_", dir=str(pb_dir)))
+                        os.chmod(candidate_stage, 0o700)
+                        if candidate_stage.resolve().is_relative_to(ws_root_resolved):
+                            staging_dir = candidate_stage
+                            used_pb_dir = True
+                        else:
+                            shutil.rmtree(candidate_stage, ignore_errors=True)
+            except OSError:
+                staging_dir = None
+
+            if staging_dir is None:
+                try:
+                    staging_dir = Path(tempfile.mkdtemp(prefix="pb_batch_"))
+                    os.chmod(staging_dir, 0o700)
+                except OSError:
+                    staging_dir = None
+
+            try:
+                batch_items = [(idx, fpath, rel_path) for idx, fpath, rel_path, _, _, _ in batch_ts_tasks]
+                batch_deltas = registry.extract_graphify_ts_batch(
+                    batch_items,
+                    project_id=project_id,
+                    branch=branch,
+                    staging_dir=staging_dir,
+                    python_fallback_fn=self._python_ast_fallback,
+                )
+                for task in batch_ts_tasks:
+                    idx, _, _, _, cache_key, _ = task
+                    if idx in batch_deltas:
+                        file_delta = batch_deltas[idx]
+                        per_file_deltas[idx] = file_delta
+                        if use_cache:
+                            self.save_cached_delta(cache_key, file_delta)
+                    else:
+                        remaining_tasks.append(task)
+            finally:
+                if staging_dir is not None and staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                if used_pb_dir and not pb_dir_existed and pb_dir.exists() and not pb_dir.is_symlink():
+                    try:
+                        pb_dir.rmdir()
+                    except OSError:
+                        pass
+
+        if remaining_tasks:
+            if resolved_workers > 1 and len(remaining_tasks) >= 2:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=resolved_workers) as executor:
+                    for idx, file_delta in executor.map(_extract_single_file, remaining_tasks):
+                        per_file_deltas[idx] = file_delta
+            else:
+                for task in remaining_tasks:
+                    idx, file_delta = _extract_single_file(task)
                     per_file_deltas[idx] = file_delta
-        else:
-            for task in uncached_tasks:
-                idx, file_delta = _extract_single_file(task)
-                per_file_deltas[idx] = file_delta
 
         nodes: List[GraphNode] = []
         edges: List[GraphEdge] = []
         hyperedges: List[GraphHyperedge] = []
+        seen_node_ids: Set[str] = set()
+        seen_edge_keys: Set[Tuple[str, str, str]] = set()
         for file_delta in per_file_deltas:
             if file_delta is not None:
-                nodes.extend(file_delta.nodes)
-                edges.extend(file_delta.edges)
+                for n in file_delta.nodes:
+                    if n.id not in seen_node_ids:
+                        seen_node_ids.add(n.id)
+                        nodes.append(n)
+                for e in file_delta.edges:
+                    ek = (e.source, e.target, e.relation)
+                    if ek not in seen_edge_keys:
+                        seen_edge_keys.add(ek)
+                        edges.append(e)
                 hyperedges.extend(file_delta.hyperedges)
 
         # 3. Handle Tombstones for Deleted Files

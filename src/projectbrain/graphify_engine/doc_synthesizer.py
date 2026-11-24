@@ -30,6 +30,92 @@ import networkx as nx
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Legacy / Session 0 IPC / PLC-LASAL / Japanese Reverse-Engineering Constants
+# ---------------------------------------------------------------------------
+_SESSION0_IPC_CORE_RELATIONS: Tuple[str, ...] = (
+    "calls_pipe",
+    "shares_shm",
+    "controls_service",
+    "calls_com",
+    "sends_win32_msg",
+    "loads_dll",
+    "calls_socket",
+)
+_SESSION0_IPC_ALL_RELATIONS: Set[str] = set(_SESSION0_IPC_CORE_RELATIONS) | {"depends_on"}
+_PLC_RELATIONS: Set[str] = {"links_plc_channel", "shares_plc_tag"}
+_LEGACY_CODE_LANGUAGES: Set[str] = {
+    "c",
+    "cpp",
+    "idl",
+    "def",
+    "win32_rc",
+    "structured_text",
+    "lasal",
+    "vb6",
+    "delphi",
+    "cobol",
+}
+_JAPANESE_CHAR_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff\uff65-\uff9f]")
+_MERMAID_RESERVED_IDS: Set[str] = {
+    "end",
+    "subgraph",
+    "graph",
+    "flowchart",
+    "class",
+    "style",
+    "click",
+    "call",
+    "linkstyle",
+    "classdef",
+}
+
+
+def _md_cell(value: Any) -> str:
+    """Sanitize a value for single-line Markdown table cells."""
+    cleaned = " ".join(str(value or "").split())
+    return cleaned.replace("|", "\\|")
+
+
+def _mermaid_id(raw: str, prefix: str = "src") -> str:
+    """Create a deterministic, valid Mermaid node identifier."""
+    slug = re.sub(r"[^a-zA-Z0-9_]", "_", str(raw or "")).strip("_")
+    if not slug:
+        slug = f"{prefix}_node"
+    if slug[0].isdigit() or slug.lower() in _MERMAID_RESERVED_IDS:
+        slug = f"{prefix}_{slug}"
+    return slug
+
+
+def _mermaid_label(value: Any, max_len: int = 80) -> str:
+    """Sanitize text for quoted Mermaid node/edge labels."""
+    cleaned = " ".join(str(value or "").split()).replace('"', "'")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 3] + "..."
+    return cleaned
+
+
+def _has_japanese_text(value: Any) -> bool:
+    """Return True when ``value`` contains Hiragana, Katakana, or CJK Kanji."""
+    if not value:
+        return False
+    return bool(_JAPANESE_CHAR_RE.search(str(value)))
+
+
+def _format_source_loc(source_file: str, source_location: Optional[str]) -> str:
+    """Format file path and optional line indicator cleanly."""
+    sf = str(source_file or "").strip()
+    loc = str(source_location or "").strip()
+    if not loc:
+        return sf
+    if sf and sf in loc:
+        return loc
+    if loc.startswith("L") and loc[1:].isdigit():
+        return f"{sf}:{loc[1:]}" if sf else loc
+    if loc.isdigit():
+        return f"{sf}:{loc}" if sf else loc
+    return f"{sf}:{loc}" if sf else loc
+
+# ---------------------------------------------------------------------------
 # Concurrency-Safe Defensive DTO Import Pattern
 # ---------------------------------------------------------------------------
 try:
@@ -447,6 +533,8 @@ class ProjectDocSynthesizer:
                     "weight": getattr(e, "weight", 1.0),
                     "source_file": getattr(e, "source_file", None),
                     "source_location": getattr(e, "source_location", None),
+                    "metadata": getattr(e, "metadata", {}) or {},
+                    "contract_key": getattr(e, "contract_key", None),
                 })
             for h in getattr(graph_data, "hyperedges", []):
                 hyperedges.append({
@@ -495,6 +583,8 @@ class ProjectDocSynthesizer:
                         "weight": float(e.get("weight", 1.0)),
                         "source_file": e.get("source_file"),
                         "source_location": e.get("source_location"),
+                        "metadata": e.get("metadata", {}) or {},
+                        "contract_key": e.get("contract_key"),
                     })
                 elif hasattr(e, "source"):
                     edges.append({
@@ -507,6 +597,8 @@ class ProjectDocSynthesizer:
                         "weight": getattr(e, "weight", 1.0),
                         "source_file": getattr(e, "source_file", None),
                         "source_location": getattr(e, "source_location", None),
+                        "metadata": getattr(e, "metadata", {}) or {},
+                        "contract_key": getattr(e, "contract_key", None),
                     })
 
             raw_hyperedges = graph_data.get("hyperedges", [])
@@ -632,6 +724,567 @@ class ProjectDocSynthesizer:
         return f"cluster_{cid}"
 
     # -----------------------------------------------------------------------
+    # Legacy / Session 0 IPC / PLC-LASAL / Japanese Reverse-Engineering Helpers
+    # -----------------------------------------------------------------------
+    def _resolve_cross_source_relations(
+        self,
+        graph_data: Union[GraphDelta, Dict[str, Any]],
+        nodes: List[Dict[str, Any]],
+        edges: List[Dict[str, Any]],
+        cross_source_relations: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Collect active cross-source relations from args, graph_data, TenantManager, or legacy edges."""
+        raw_rels: Optional[List[Dict[str, Any]]] = None
+        if cross_source_relations is not None:
+            raw_rels = list(cross_source_relations)
+        elif isinstance(graph_data, dict) and graph_data.get("cross_source_relations") is not None:
+            raw_rels = list(graph_data.get("cross_source_relations") or [])
+        else:
+            project_id = (
+                getattr(graph_data, "project_id", None)
+                if hasattr(graph_data, "project_id")
+                else (graph_data.get("project_id") if isinstance(graph_data, dict) else None)
+            )
+            if project_id and str(project_id) != "default":
+                try:
+                    from projectbrain.core.tenant_manager import tenant_manager
+                    if getattr(tenant_manager, "_master_db", None) is not None:
+                        raw_rels = tenant_manager.list_cross_source_relations(str(project_id))
+                except Exception as exc:
+                    logger.debug("Cross-source relation lookup skipped for %s: %s", project_id, exc)
+
+        normalized: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, str, str]] = set()
+
+        for r in raw_rels or []:
+            if not isinstance(r, dict):
+                continue
+            status = str(r.get("status") or "active")
+            if status == "rejected":
+                continue
+            src = str(r.get("src_source_id") or r.get("source") or "").strip()
+            dst = str(r.get("dst_source_id") or r.get("target") or "").strip()
+            rel_type = str(r.get("relation_type") or r.get("relation") or "").strip()
+            c_key = str(r.get("contract_key") or "").strip()
+            if not src or not dst or not rel_type:
+                continue
+            dedup_key = (src, dst, rel_type, c_key)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            meta = r.get("contract_metadata")
+            if meta is None:
+                meta = r.get("metadata")
+            normalized.append({
+                "src_source_id": src,
+                "dst_source_id": dst,
+                "relation_type": rel_type,
+                "contract_key": c_key,
+                "contract_metadata": meta if isinstance(meta, dict) else {},
+                "src_file_path": r.get("src_file_path") or r.get("source_file") or "",
+                "status": status,
+                "confidence": str(r.get("confidence") or "high"),
+            })
+
+        # Also support legacy IPC / PLC relations passed directly as GraphEdge / dict edges
+        node_by_id = {n["id"]: n for n in nodes if n.get("id")}
+        legacy_edge_rels = _SESSION0_IPC_ALL_RELATIONS | _PLC_RELATIONS
+        for e in edges:
+            rel_type = str(e.get("relation") or "").strip()
+            if rel_type not in legacy_edge_rels:
+                continue
+            emeta = e.get("metadata") if isinstance(e.get("metadata"), dict) else {}
+            src_node = node_by_id.get(e.get("source", ""))
+            dst_node = node_by_id.get(e.get("target", ""))
+            src = str(
+                emeta.get("src_source_id")
+                or (src_node.get("metadata", {}).get("source_id") if src_node else "")
+                or (Path(src_node["source_file"]).parts[0] if src_node and len(Path(src_node.get("source_file", "")).parts) > 1 else "")
+                or e.get("source")
+                or ""
+            ).strip()
+            dst = str(
+                emeta.get("dst_source_id")
+                or (dst_node.get("metadata", {}).get("source_id") if dst_node else "")
+                or (Path(dst_node["source_file"]).parts[0] if dst_node and len(Path(dst_node.get("source_file", "")).parts) > 1 else "")
+                or e.get("target")
+                or ""
+            ).strip()
+            c_key = str(e.get("contract_key") or emeta.get("contract_key") or "").strip()
+            if not src or not dst:
+                continue
+            dedup_key = (src, dst, rel_type, c_key)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            normalized.append({
+                "src_source_id": src,
+                "dst_source_id": dst,
+                "relation_type": rel_type,
+                "contract_key": c_key,
+                "contract_metadata": emeta,
+                "src_file_path": e.get("source_file") or (src_node.get("source_file", "") if src_node else ""),
+                "status": str(emeta.get("status") or "active"),
+                "confidence": str(e.get("confidence") or "EXTRACTED"),
+            })
+
+        return normalized
+
+    def _collect_legacy_reverse_context(
+        self,
+        nodes: List[Dict[str, Any]],
+        relations: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Determine which reverse-engineering KB views apply and collect their inputs."""
+        legacy_node_kinds = {
+            "win32_api", "struct", "macro", "dialog", "interface", "coclass", "export", "server", "client"
+        }
+        has_legacy_nodes = False
+        has_japanese = False
+        plc_nodes: List[Dict[str, Any]] = []
+
+        for n in nodes:
+            meta = n.get("metadata") or {}
+            kind = str(meta.get("kind") or "").lower()
+            lang = str(meta.get("language") or "").lower()
+            var_scope = str(meta.get("var_scope") or "").upper()
+            io_addr = str(meta.get("io_address") or "").strip()
+
+            if lang in _LEGACY_CODE_LANGUAGES or kind in legacy_node_kinds:
+                has_legacy_nodes = True
+
+            if kind in ("server", "client") or (
+                kind == "variable" and (var_scope in ("VAR_GLOBAL", "VAR_EXTERNAL") or bool(io_addr))
+            ):
+                plc_nodes.append(n)
+
+            if not has_japanese:
+                for val in (
+                    n.get("label"),
+                    meta.get("docstring"),
+                    meta.get("caption"),
+                    meta.get("helpstring"),
+                    meta.get("value"),
+                ):
+                    if _has_japanese_text(val):
+                        has_japanese = True
+                        break
+
+        plc_relations = [r for r in relations if r["relation_type"] in _PLC_RELATIONS]
+        session0_raw = [r for r in relations if r["relation_type"] in _SESSION0_IPC_ALL_RELATIONS]
+        has_core_ipc = any(r["relation_type"] in _SESSION0_IPC_CORE_RELATIONS for r in session0_raw)
+        has_session0 = has_core_ipc or (
+            bool(session0_raw) and (has_legacy_nodes or bool(plc_relations) or bool(plc_nodes) or has_japanese)
+        )
+        session0_relations = session0_raw if has_session0 else []
+
+        has_plc = bool(plc_relations or plc_nodes)
+
+        glossary_entries: List[Dict[str, Any]] = []
+        if has_japanese:
+            for n in nodes:
+                meta = n.get("metadata") or {}
+                kind = str(meta.get("kind") or "").lower()
+                jp_candidates = (
+                    meta.get("docstring"),
+                    meta.get("caption"),
+                    meta.get("helpstring"),
+                    meta.get("value"),
+                    n.get("label"),
+                )
+                node_has_jp = any(_has_japanese_text(c) for c in jp_candidates)
+                is_glossary_kind = kind in ("struct", "macro", "dialog")
+                if node_has_jp or (is_glossary_kind and kind != "file"):
+                    glossary_entries.append(n)
+
+        has_japanese_glossary = bool(glossary_entries)
+        has_any = has_session0 or has_plc or has_japanese_glossary
+
+        return {
+            "session0_relations": session0_relations,
+            "plc_relations": plc_relations,
+            "plc_nodes": plc_nodes,
+            "glossary_entries": glossary_entries,
+            "has_session0": has_session0,
+            "has_plc": has_plc,
+            "has_japanese_glossary": has_japanese_glossary,
+            "has_any": has_any,
+        }
+
+    @staticmethod
+    def _format_contract_summary(rel: Dict[str, Any]) -> str:
+        """Build a concise, grounded endpoint/contract label for a cross-source relation."""
+        meta = rel.get("contract_metadata") or {}
+        c_key = str(rel.get("contract_key") or "").strip()
+        for k in (
+            "pipe_name",
+            "shm_name",
+            "service_name",
+            "com_target",
+            "message",
+            "export_or_dll",
+            "target_symbol",
+        ):
+            val = meta.get(k)
+            if val:
+                extra_uuid = meta.get("uuid")
+                if k == "com_target" and extra_uuid:
+                    return f"{val} ({extra_uuid})"
+                return str(val)
+        if meta.get("port"):
+            return f"port {meta['port']}"
+        if ":" in c_key:
+            return c_key.split(":", 1)[1]
+        return c_key or "-"
+
+    def _render_session0_architecture_map(
+        self,
+        session0_relations: List[Dict[str, Any]],
+        heading_level: str = "##",
+    ) -> str:
+        """Render Session 0 <-> Desktop Architecture Map (Mermaid flowchart LR + Markdown table)."""
+        sorted_rels = sorted(
+            session0_relations,
+            key=lambda r: (
+                r.get("src_source_id", ""),
+                r.get("relation_type", ""),
+                r.get("dst_source_id", ""),
+                r.get("contract_key", ""),
+            ),
+        )
+
+        sources: List[str] = []
+        seen_sources: Set[str] = set()
+        for r in sorted_rels:
+            for sid in (r["src_source_id"], r["dst_source_id"]):
+                if sid not in seen_sources:
+                    seen_sources.add(sid)
+                    sources.append(sid)
+
+        lines: List[str] = [
+            f"{heading_level} Session 0 <-> Desktop Architecture Map",
+            "",
+            "> Cross-source Windows Session 0 Service, Desktop Client/HMI, Native DLL, and COM/IPC boundaries.",
+            "",
+            "```mermaid",
+            "flowchart LR",
+        ]
+        for sid in sources:
+            mid = _mermaid_id(sid, prefix="src")
+            lines.append(f'    {mid}["{_mermaid_label(sid)}"]')
+
+        seen_mermaid_edges: Set[Tuple[str, str, str]] = set()
+        for r in sorted_rels:
+            src_mid = _mermaid_id(r["src_source_id"], prefix="src")
+            dst_mid = _mermaid_id(r["dst_source_id"], prefix="src")
+            contract = self._format_contract_summary(r)
+            rel_t = r["relation_type"]
+            edge_lbl = f"{rel_t}: {contract}" if contract and contract != "-" else rel_t
+            ek = (src_mid, dst_mid, edge_lbl)
+            if ek in seen_mermaid_edges:
+                continue
+            seen_mermaid_edges.add(ek)
+            lines.append(f'    {src_mid} -->|"{_mermaid_label(edge_lbl)}"| {dst_mid}')
+
+        lines.extend([
+            "```",
+            "",
+            "| Source | Relation | Target | Contract / Endpoint | Status | Source File |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ])
+
+        for r in sorted_rels:
+            src = f"`{_md_cell(r['src_source_id'])}`"
+            rel_t = f"`{_md_cell(r['relation_type'])}`"
+            dst = f"`{_md_cell(r['dst_source_id'])}`"
+            contract = f"`{_md_cell(self._format_contract_summary(r))}`"
+            status = _md_cell(r.get("status") or "active")
+            sfile = f"`{_md_cell(r.get('src_file_path') or '-')}`"
+            lines.append(f"| {src} | {rel_t} | {dst} | {contract} | {status} | {sfile} |")
+
+        return "\n".join(lines)
+
+    def _render_plc_lasal_map(
+        self,
+        plc_relations: List[Dict[str, Any]],
+        plc_nodes: List[Dict[str, Any]],
+        heading_level: str = "##",
+    ) -> str:
+        """Render PLC / LASAL Server-Client & Tag Map (Markdown table + Mermaid diagram)."""
+        sorted_rels = sorted(
+            plc_relations,
+            key=lambda r: (
+                r.get("src_source_id", ""),
+                r.get("relation_type", ""),
+                r.get("dst_source_id", ""),
+                r.get("contract_key", ""),
+            ),
+        )
+        sorted_nodes = sorted(
+            plc_nodes,
+            key=lambda n: (
+                n.get("source_file", ""),
+                str((n.get("metadata") or {}).get("kind") or ""),
+                n.get("label", ""),
+            ),
+        )
+
+        lines: List[str] = [
+            f"{heading_level} PLC / LASAL Server-Client & Tag Map",
+            "",
+            "> IEC 61131-3 Structured Text & Sigmatek LASAL `SERVER`/`CLIENT` channels and `VAR_GLOBAL` / I/O tags.",
+            "",
+            "```mermaid",
+            "flowchart LR",
+        ]
+
+        declared_ids: Set[str] = set()
+        for r in sorted_rels:
+            for sid in (r["src_source_id"], r["dst_source_id"]):
+                mid = _mermaid_id(sid, prefix="plc_src")
+                if mid not in declared_ids:
+                    declared_ids.add(mid)
+                    lines.append(f'    {mid}["{_mermaid_label(sid)}"]')
+
+        seen_edges: Set[Tuple[str, str, str]] = set()
+        for r in sorted_rels:
+            src_mid = _mermaid_id(r["src_source_id"], prefix="plc_src")
+            dst_mid = _mermaid_id(r["dst_source_id"], prefix="plc_src")
+            tag_or_ch = self._format_contract_summary(r)
+            edge_lbl = f"{r['relation_type']}: {tag_or_ch}" if tag_or_ch and tag_or_ch != "-" else r["relation_type"]
+            ek = (src_mid, dst_mid, edge_lbl)
+            if ek not in seen_edges:
+                seen_edges.add(ek)
+                lines.append(f'    {src_mid} -->|"{_mermaid_label(edge_lbl)}"| {dst_mid}')
+
+        if sorted_nodes:
+            by_file: Dict[str, List[Dict[str, Any]]] = {}
+            for n in sorted_nodes:
+                sf = n.get("source_file") or "PLC"
+                by_file.setdefault(sf, []).append(n)
+            for sf, fnodes in sorted(by_file.items()):
+                sg_id = _mermaid_id(f"sg_{sf}", prefix="plc_grp")
+                lines.append(f'    subgraph {sg_id} ["{_mermaid_label(Path(sf).name)}"]')
+                for n in fnodes:
+                    meta = n.get("metadata") or {}
+                    kind = str(meta.get("kind") or "").lower()
+                    role_tag = (
+                        "SERVER"
+                        if kind == "server"
+                        else ("CLIENT" if kind == "client" else str(meta.get("var_scope") or "IO"))
+                    )
+                    dtype = str(meta.get("data_type") or "")
+                    lbl = f"{role_tag}: {n.get('label', '')}" + (f" ({dtype})" if dtype else "")
+                    n_mid = _mermaid_id(n.get("id") or n.get("label", ""), prefix="plc_sym")
+                    lines.append(f'        {n_mid}["{_mermaid_label(lbl)}"]')
+                lines.append("    end")
+
+        lines.append("```")
+
+        if sorted_rels:
+            lines.extend([
+                "",
+                "| Consumer Source | Relation | PLC Source | Channel / Tag | PLC Kind | Status | Source File |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            ])
+            for r in sorted_rels:
+                meta = r.get("contract_metadata") or {}
+                plc_kind = meta.get("plc_kind") or (
+                    "var_global" if r["relation_type"] == "shares_plc_tag" else "lasal_channel"
+                )
+                lines.append(
+                    f"| `{_md_cell(r['src_source_id'])}` "
+                    f"| `{_md_cell(r['relation_type'])}` "
+                    f"| `{_md_cell(r['dst_source_id'])}` "
+                    f"| `{_md_cell(self._format_contract_summary(r))}` "
+                    f"| `{_md_cell(plc_kind)}` "
+                    f"| {_md_cell(r.get('status') or 'active')} "
+                    f"| `{_md_cell(r.get('src_file_path') or meta.get('dst_file_path') or '-')}` |"
+                )
+
+        if sorted_nodes:
+            lines.extend([
+                "",
+                "| Symbol | Channel / Scope | Data Type | I/O Address | Description | Source Location |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- |",
+            ])
+            for n in sorted_nodes:
+                meta = n.get("metadata") or {}
+                kind = str(meta.get("kind") or "").lower()
+                role = (
+                    "SERVER"
+                    if kind == "server"
+                    else ("CLIENT" if kind == "client" else str(meta.get("var_scope") or "VARIABLE"))
+                )
+                dtype = str(meta.get("data_type") or "-")
+                io_addr = str(meta.get("io_address") or "-")
+                desc = meta.get("docstring") or "-"
+                loc = _format_source_loc(n.get("source_file", ""), n.get("source_location"))
+                lines.append(
+                    f"| `{_md_cell(n.get('label', ''))}` "
+                    f"| `{_md_cell(role)}` "
+                    f"| `{_md_cell(dtype)}` "
+                    f"| `{_md_cell(io_addr)}` "
+                    f"| {_md_cell(desc)} "
+                    f"| `{_md_cell(loc or '-')}` |"
+                )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_glossary_details(node: Dict[str, Any]) -> str:
+        """Build concise structural/constant/resource details for a glossary row."""
+        meta = node.get("metadata") or {}
+        kind = str(meta.get("kind") or "").lower()
+        parts: List[str] = []
+
+        if kind == "struct":
+            pack = meta.get("pack")
+            if pack is not None:
+                parts.append(f"#pragma pack({pack})")
+            elif meta.get("packed"):
+                parts.append("#pragma pack(1)")
+            fields = meta.get("fields") or []
+            if isinstance(fields, list) and fields:
+                preview = ", ".join(
+                    f"{f.get('name', '?')}: {f.get('type', '?')}"
+                    for f in fields[:6]
+                    if isinstance(f, dict)
+                )
+                if len(fields) > 6:
+                    preview += ", ..."
+                parts.append(f"fields: {preview}")
+        elif kind == "macro":
+            val = meta.get("value")
+            if val is not None and str(val).strip():
+                parts.append(f"value: {val}")
+            params = meta.get("params")
+            if params:
+                parts.append(f"params: ({params})")
+        elif kind == "dialog":
+            rtype = meta.get("resource_type")
+            if rtype:
+                parts.append(str(rtype))
+        elif kind == "control":
+            ctype = meta.get("control_type")
+            if ctype:
+                parts.append(str(ctype))
+        elif kind == "enum":
+            members = meta.get("members") or []
+            if isinstance(members, list) and members:
+                preview = ", ".join(str(m) for m in members[:6])
+                if len(members) > 6:
+                    preview += ", ..."
+                parts.append(f"members: {preview}")
+        elif kind in ("server", "client", "variable"):
+            if meta.get("var_scope"):
+                parts.append(str(meta["var_scope"]))
+            if meta.get("data_type"):
+                parts.append(str(meta["data_type"]))
+            if meta.get("io_address"):
+                parts.append(f"AT {meta['io_address']}")
+        elif kind in ("interface", "coclass"):
+            if meta.get("uuid"):
+                parts.append(f"uuid: {meta['uuid']}")
+        elif meta.get("signature"):
+            parts.append(str(meta["signature"]))
+
+        return "; ".join(parts) if parts else "-"
+
+    def _render_japanese_term_glossary(
+        self,
+        glossary_entries: List[Dict[str, Any]],
+        heading_level: str = "##",
+    ) -> str:
+        """Render Japanese Term & Struct Glossary Markdown table."""
+        def _sort_key(n: Dict[str, Any]) -> Tuple[str, int, str]:
+            loc = str(n.get("source_location") or "")
+            line_num = 0
+            m = re.search(r"(\d+)$", loc)
+            if m:
+                line_num = int(m.group(1))
+            return (str(n.get("source_file") or ""), line_num, str(n.get("label") or ""))
+
+        sorted_entries = sorted(glossary_entries, key=_sort_key)
+
+        lines: List[str] = [
+            f"{heading_level} Japanese Term & Struct Glossary",
+            "",
+            "> Legacy C/C++ structs (`#pragma pack`, `typedef struct`), Structured Text `TYPE..STRUCT`, `#define` constants, Win32 `.rc` dialogs, and decoded Japanese domain comments (CP932 / Shift-JIS / UTF-16 / UTF-8).",
+            "",
+            "| Symbol | Kind | Japanese Term / Description | Details (Struct / Value / Pack) | Encoding | Source File |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+
+        for n in sorted_entries:
+            meta = n.get("metadata") or {}
+            kind = str(meta.get("kind") or n.get("file_type") or "symbol")
+            if kind == "class" and meta.get("st_kind"):
+                kind = str(meta["st_kind"])
+            jp_text = (
+                meta.get("docstring")
+                or meta.get("caption")
+                or meta.get("helpstring")
+                or meta.get("value")
+                or "-"
+            )
+            details = self._format_glossary_details(n)
+            enc = str(meta.get("encoding") or "-")
+            loc = _format_source_loc(n.get("source_file", ""), n.get("source_location"))
+            lines.append(
+                f"| `{_md_cell(n.get('label', ''))}` "
+                f"| `{_md_cell(kind)}` "
+                f"| {_md_cell(jp_text)} "
+                f"| {_md_cell(details)} "
+                f"| `{_md_cell(enc)}` "
+                f"| `{_md_cell(loc or '-')}` |"
+            )
+
+        return "\n".join(lines)
+
+    def _generate_legacy_reverse_engineering_page(
+        self,
+        legacy_ctx: Dict[str, Any],
+    ) -> WikiPage:
+        """Generate dedicated wiki/legacy_reverse_engineering.md consolidating active legacy views."""
+        sections: List[str] = [
+            "# Legacy Reverse Engineering & Session 0 IPC Map",
+            "",
+            "> **Deterministic Reverse Engineering Knowledge Base**  ",
+            "> Synthesized from Windows Session 0 IPC contracts, PLC/LASAL channel & tag mappings, and CP932/UTF-16/UTF-8 Japanese-annotated symbols.",
+        ]
+
+        if legacy_ctx["has_session0"]:
+            sections.extend(["", self._render_session0_architecture_map(legacy_ctx["session0_relations"])])
+
+        if legacy_ctx["has_plc"]:
+            sections.extend([
+                "",
+                self._render_plc_lasal_map(legacy_ctx["plc_relations"], legacy_ctx["plc_nodes"]),
+            ])
+
+        if legacy_ctx["has_japanese_glossary"]:
+            sections.extend(["", self._render_japanese_term_glossary(legacy_ctx["glossary_entries"])])
+
+        content = "\n".join(sections) + "\n"
+        return WikiPage(
+            slug="legacy_reverse_engineering",
+            title="Legacy Reverse Engineering & Session 0 IPC Map",
+            relative_path="wiki/legacy_reverse_engineering.md",
+            content=content,
+            category="reverse_engineering",
+            metadata={
+                "has_session0_map": legacy_ctx["has_session0"],
+                "has_plc_map": legacy_ctx["has_plc"],
+                "has_japanese_glossary": legacy_ctx["has_japanese_glossary"],
+                "session0_relations_count": len(legacy_ctx["session0_relations"]),
+                "plc_relations_count": len(legacy_ctx["plc_relations"]),
+                "plc_nodes_count": len(legacy_ctx["plc_nodes"]),
+                "glossary_entries_count": len(legacy_ctx["glossary_entries"]),
+            },
+        )
+
+    # -----------------------------------------------------------------------
     # Markdown Knowledge Wiki Generation (Locked Section 4.2)
     # -----------------------------------------------------------------------
     def synthesize_wiki(
@@ -640,6 +1293,7 @@ class ProjectDocSynthesizer:
         output_dir: Union[str, Path] = "docs/kb/wiki",
         top_god_nodes: int = 15,
         top_bridges: int = 15,
+        cross_source_relations: Optional[List[Dict[str, Any]]] = None,
     ) -> List[WikiPage]:
         """
         Generate complete Markdown knowledge wiki:
@@ -647,6 +1301,7 @@ class ProjectDocSynthesizer:
         - architecture_overview.md
         - api_and_mcp_reference.md
         - database_and_schemas.md
+        - legacy_reverse_engineering.md (only when legacy IPC, PLC/LASAL, or Japanese symbols exist)
         - communities/community_{id}_{slug}.md (per Leiden community)
         - ../GRAPH_REPORT.md (god nodes & structural analysis)
         """
@@ -657,6 +1312,10 @@ class ProjectDocSynthesizer:
         (out_dir / "communities").mkdir(parents=True, exist_ok=True)
 
         nodes, edges, hyperedges = self._normalize_graph_data(graph_data)
+        resolved_rels = self._resolve_cross_source_relations(
+            graph_data, nodes, edges, cross_source_relations=cross_source_relations
+        )
+        legacy_ctx = self._collect_legacy_reverse_context(nodes, resolved_rels)
         communities, god_nodes, surprising_bridges = self._compute_topology(
             nodes, edges, top_god_nodes=top_god_nodes, top_bridges=top_bridges
         )
@@ -664,13 +1323,13 @@ class ProjectDocSynthesizer:
         wiki_pages: List[WikiPage] = []
 
         # 1. index.md
-        p_index = self._generate_index_page(nodes, edges, communities, god_nodes)
+        p_index = self._generate_index_page(nodes, edges, communities, god_nodes, legacy_ctx=legacy_ctx)
         p_index_path = out_dir / "index.md"
         p_index_path.write_text(p_index.content, encoding="utf-8")
         wiki_pages.append(p_index)
 
         # 2. architecture_overview.md
-        p_arch = self._generate_architecture_overview(nodes, edges, communities)
+        p_arch = self._generate_architecture_overview(nodes, edges, communities, legacy_ctx=legacy_ctx)
         p_arch_path = out_dir / "architecture_overview.md"
         p_arch_path.write_text(p_arch.content, encoding="utf-8")
         wiki_pages.append(p_arch)
@@ -682,10 +1341,17 @@ class ProjectDocSynthesizer:
         wiki_pages.append(p_api)
 
         # 4. database_and_schemas.md
-        p_db = self._generate_database_and_schemas(nodes)
+        p_db = self._generate_database_and_schemas(nodes, legacy_ctx=legacy_ctx)
         p_db_path = out_dir / "database_and_schemas.md"
         p_db_path.write_text(p_db.content, encoding="utf-8")
         wiki_pages.append(p_db)
+
+        # 4b. legacy_reverse_engineering.md (only when legacy data is present)
+        if legacy_ctx["has_any"]:
+            p_legacy = self._generate_legacy_reverse_engineering_page(legacy_ctx)
+            p_legacy_path = out_dir / "legacy_reverse_engineering.md"
+            p_legacy_path.write_text(p_legacy.content, encoding="utf-8")
+            wiki_pages.append(p_legacy)
 
         # 5. communities/community_{id}_{slug}.md
         comm_pages = self._generate_community_pages(communities, edges)
@@ -709,6 +1375,7 @@ class ProjectDocSynthesizer:
         edges: List[Dict[str, Any]],
         communities: Dict[int, List[Dict[str, Any]]],
         god_nodes: List[Dict[str, Any]],
+        legacy_ctx: Optional[Dict[str, Any]] = None,
     ) -> WikiPage:
         """Master navigation map, summary metrics, and community directory."""
         ast_data = self.introspector.introspect()
@@ -740,12 +1407,18 @@ class ProjectDocSynthesizer:
             "- [API & FastMCP Reference](api_and_mcp_reference.md) — Complete catalog of REST endpoints and FastMCP tools with `file:line` locations.",
             "- [Database & Schemas](database_and_schemas.md) — PostgreSQL `pb_root` / `pb_br_*` multi-schema, SQLite overlays, HSG Cognitive Memory, and Pydantic models.",
             "- [Graph Structural Report](../GRAPH_REPORT.md) — God nodes centrality ranking, cross-community bridges, and confidence breakdown.",
+        ]
+        if legacy_ctx and legacy_ctx.get("has_any"):
+            content_lines.append(
+                "- [Legacy Reverse Engineering & Session 0 IPC Map](legacy_reverse_engineering.md) — Session 0 <-> Desktop IPC topology, PLC/LASAL channel & tag maps, and Japanese struct/constant glossary."
+            )
+        content_lines.extend([
             "",
             "## 3. Key God Nodes (Architectural Hubs)",
             "",
             "| Rank | Symbol | File Type | Source Location | Degree | Community |",
             "| :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
+        ])
 
         if god_nodes:
             for idx, g in enumerate(god_nodes[:10], start=1):
@@ -793,6 +1466,7 @@ class ProjectDocSynthesizer:
         nodes: List[Dict[str, Any]],
         edges: List[Dict[str, Any]],
         communities: Dict[int, List[Dict[str, Any]]],
+        legacy_ctx: Optional[Dict[str, Any]] = None,
     ) -> WikiPage:
         """System topology, Mermaid flowchart, module hierarchy, and data flow."""
         content_lines = [
@@ -868,6 +1542,15 @@ class ProjectDocSynthesizer:
             "| `src/projectbrain/ai/mcp.py` | calls | `src/projectbrain/graphify_engine/store.py` | EXTRACTED | MCP tools inspect codebase graph topology |",
             "| `src/projectbrain/graphify_engine/doc_synthesizer.py` | introspects | `src/projectbrain/server/routes/` | EXTRACTED | Synthesizer extracts verified endpoints directly from source |",
         ]
+
+        if legacy_ctx and legacy_ctx.get("has_session0"):
+            content_lines.extend(["", self._render_session0_architecture_map(legacy_ctx["session0_relations"])])
+
+        if legacy_ctx and legacy_ctx.get("has_plc"):
+            content_lines.extend([
+                "",
+                self._render_plc_lasal_map(legacy_ctx["plc_relations"], legacy_ctx["plc_nodes"]),
+            ])
 
         content = "\n".join(content_lines) + "\n"
         return WikiPage(
@@ -969,6 +1652,7 @@ class ProjectDocSynthesizer:
     def _generate_database_and_schemas(
         self,
         nodes: List[Dict[str, Any]],
+        legacy_ctx: Optional[Dict[str, Any]] = None,
     ) -> WikiPage:
         """PostgreSQL schemas (pb_root, pb_br_*), dynamic views, and HSG memory tables."""
         ast_data = self.introspector.introspect()
@@ -1037,6 +1721,9 @@ class ProjectDocSynthesizer:
             content_lines.append("| `GraphNode` | `src/projectbrain/graphify_engine/models.py:33` | 8 | `id, project_id, label, file_type` | AST Node DTO |")
             content_lines.append("| `GraphEdge` | `src/projectbrain/graphify_engine/models.py:45` | 9 | `project_id, source, target, relation` | Graph Edge DTO |")
             content_lines.append("| `GraphDelta` | `src/projectbrain/graphify_engine/models.py:68` | 7 | `project_id, branch, nodes, edges` | Branch Delta DTO |")
+
+        if legacy_ctx and legacy_ctx.get("has_japanese_glossary"):
+            content_lines.extend(["", self._render_japanese_term_glossary(legacy_ctx["glossary_entries"])])
 
         content = "\n".join(content_lines) + "\n"
         return WikiPage(
@@ -1981,6 +2668,7 @@ class ProjectDocSynthesizer:
         wiki_dir: Union[str, Path] = "docs/kb/wiki",
         exports_dir: Union[str, Path] = "docs/kb/exports",
         linker_index: Optional[Dict[str, Any]] = None,
+        cross_source_relations: Optional[List[Dict[str, Any]]] = None,
     ) -> SynthesisResult:
         """Orchestrate full wiki and office document generation suite."""
         w_dir = Path(wiki_dir)
@@ -1994,7 +2682,11 @@ class ProjectDocSynthesizer:
         w_dir.mkdir(parents=True, exist_ok=True)
         e_dir.mkdir(parents=True, exist_ok=True)
 
-        wiki_pages = self.synthesize_wiki(graph_data, output_dir=w_dir)
+        wiki_pages = self.synthesize_wiki(
+            graph_data,
+            output_dir=w_dir,
+            cross_source_relations=cross_source_relations,
+        )
 
         docx_path = e_dir / "ProjectBrain_Architecture_Spec.docx"
         xlsx_path = e_dir / "ProjectBrain_Traceability_Matrix.xlsx"

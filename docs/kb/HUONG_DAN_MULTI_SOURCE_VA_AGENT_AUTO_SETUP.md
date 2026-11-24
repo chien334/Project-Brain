@@ -28,6 +28,7 @@
    - [5.2. MCP Resource hướng dẫn tích hợp](#52-mcp-resource-hướng-dẫn-tích-hợp)
    - [5.3. Danh sách REST API Endpoints](#53-danh-sách-rest-api-endpoints)
    - [5.4. Theo dõi trực quan trên Web UI (`/app/workspace/sources`)](#54-theo-dõi-trực-quan-trên-web-ui-appworkspacesources)
+6. [Hỗ trợ Dự án Legacy C++, Windows Session 0 IPC, PLC ST/LASAL & Mã nguồn Nhật Bản](#6-hỗ-trợ-dự-án-legacy-c-windows-session-0-ipc-plc-stlasal--mã-nguồn-nhật-bản)
 
 ---
 
@@ -513,6 +514,24 @@ Mặc dù AI Agent có thể tự setup và vận hành 100% qua MCP, Tech Lead 
 - **Child Sub-Sources & Independent Lifecycle:** Xem danh sách source con, phiên bản (`current_version`), `sync_generation`, schema `pb_src_*`, hoặc đăng ký thêm source mới.
 - **Shared Project Documents (`__shared__`) & Bindings:** Quản lý tài liệu dùng chung và xem binding theo `binding_role` (`reference`, `architecture`, `api_contract`, `prd`, `adr`, `runbook`, `policy`).
 - **Cross-Source Relationships & Drift Monitor:** Theo dõi toàn bộ cạnh `calls_api`, `shares_schema`, `consumes_events`, `deploys`, `documented_by`, nút **Run Auto-Linker**, ghim/từ chối cạnh, và xử lý tức thì các cạnh cảnh báo **`drifted`** hoặc **`stale`**.
+
+---
+
+## 6. Hỗ trợ Dự án Legacy C++, Windows Session 0 IPC, PLC ST/LASAL & Mã nguồn Nhật Bản
+
+ProjectBrain hỗ trợ auto-bootstrap, trích xuất AST và theo dõi drift hợp đồng cho các hệ thống công nghiệp / Windows cũ và mã nguồn Nhật Bản mà không làm mất ngữ nghĩa comment hoặc ranh giới IPC nhị phân:
+
+1. **Giải mã chuẩn xác tiếng Nhật & file Windows cũ (`legacy_encoding.py`):**
+   - Tự động phát hiện và giải mã **UTF-8 (có/không BOM)**, **UTF-16 LE/BE** (kể cả `.rc` / `.reg` / `.def` không có BOM), **CP932 / Shift-JIS**, **EUC-JP**, và **ISO-2022-JP** trước khi đưa vào AST & HSG Memory — loại bỏ lỗi vỡ chữ (`\ufffd`) trên comment nghiệp vụ và bảng mã lỗi tiếng Nhật.
+2. **Auto-Discover cấu trúc Legacy & PLC (`projectbrain_discover_workspace_sources` / `projectbrain_bootstrap_project_hub`):**
+   - **Visual Studio (`.sln`, `.vcxproj`, `.vcproj`, `.csproj`, `.vbproj`):** Tách từng project con thành sub-source độc lập (`win_service`, `desktop_client`, `native_lib`, `backend`) và tự suy ra cạnh `depends_on` từ `.sln` `ProjectDependencies` và `<ProjectReference>`.
+   - **PLC IEC 61131-3 Structured Text & Sigmatek LASAL (`.lcp`, `.lxp`, `*.st`, `*.scl`, `*.pou`):** Tự nhận diện thành `plc_st` (`tech_stack=["iec61131-st", "lasal"]`), trích xuất `PROGRAM`, `FUNCTION_BLOCK`, `CLASS`, `METHOD`, `TYPE ... STRUCT`, `VAR_GLOBAL` và node `server` / `client`.
+   - **Legacy Stacks khác:** `CMakeLists.txt`, `Makefile`, Qt (`*.pro`), VB6 (`*.vbp`), Delphi (`*.dpr`, `*.dproj`), cùng parser cho `.idl`, `.def`, `.rc`, `.cbl`/`.cob`, `.bat`/`.cmd`, `.reg`.
+3. **Nối tự động ranh giới Windows Session 0 IPC & PLC (`CrossSourceLinker`):**
+   - Ngoài HTTP/Schema/Event, `CrossSourceLinker` tự động phát hiện và gắn `signature_hash` kiểm tra drift cho 9 loại quan hệ Legacy IPC & PLC:
+     - `calls_pipe` (`\\.\pipe\<Name>`), `shares_shm` (`Global\` / `Local\` Shared Memory + `struct`), `controls_service` (SCM `ServiceMain` ↔ `ControlService`), `calls_com` (`.idl` UUID/interface ↔ `CoCreateInstance`), `sends_win32_msg` (`WM_COPYDATA` / `RegisterWindowMessage` / `ON_MESSAGE`), `loads_dll` (`__declspec(dllexport)` / `.def` ↔ `LoadLibrary` / `GetProcAddress`), `calls_socket` (Winsock port), và `links_plc_channel` / `shares_plc_tag` (LASAL `SERVER`/`CLIENT`, `VAR_GLOBAL`, thanh ghi I/O).
+4. **Skill chuyên biệt cho AI Agent:**
+   - Khi làm việc trên dự án C++/Win32 Session 0, PLC ST/LASAL hoặc reverse engineering Nhật Bản, Agent cần nạp thêm skill [`.agents/skills/legacy-cpp-windows-reverse/SKILL.md`](../../.agents/skills/legacy-cpp-windows-reverse/SKILL.md) (và các quy tắc dự án trong `.agents/skills/legacy-cpp-windows-reverse/sub/*.md`) để giữ nguyên encoding file gốc khi sửa code và luôn chạy `projectbrain_cross_source_impact` trước khi sửa struct nhị phân hoặc hợp đồng IPC.
 
 ---
 
