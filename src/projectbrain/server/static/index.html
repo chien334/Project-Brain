@@ -437,6 +437,9 @@
                                 <button type="button" class="btn btn-secondary" data-tab-jump="v3TestingTab">
                                     <i class="fa-solid fa-vial-circle-check" aria-hidden="true"></i> v3.0 Layer 1 QA
                                 </button>
+                                <button type="button" id="btnOpenAiSettingsOverview" class="btn btn-secondary">
+                                    <i class="fa-solid fa-sliders" aria-hidden="true"></i> AI &amp; LLM Settings
+                                </button>
                             </div>
                         </div>
 
@@ -559,7 +562,7 @@
             <!-- Tab 2: Semantic Search -->
             <div class="tab-content" id="searchTab">
                 <h2>AI Semantic &amp; Fact Search</h2>
-                <p class="description-text">Query cognitive memory vectors with Gemini RAG synthesis or raw temporal context retrieval.</p>
+                <p class="description-text">Query cognitive memory vectors and codebase graph symbols with AI RAG synthesis (Gemini, OpenAI, Ollama, or Offline Local RAG) or raw context retrieval.</p>
                 <div class="search-box card">
                     <div class="search-input-group">
                         <i class="fa-solid fa-magnifying-glass search-icon" aria-hidden="true"></i>
@@ -567,14 +570,22 @@
                         <button type="button" id="btnSearch" class="btn btn-primary">Search</button>
                     </div>
                     <div class="search-modes">
-                        <label class="radio-label">
-                            <input type="radio" name="searchMode" value="rag" checked>
-                            <span><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Gemini RAG Search</span>
-                        </label>
-                        <label class="radio-label">
-                            <input type="radio" name="searchMode" value="raw">
-                            <span><i class="fa-solid fa-database" aria-hidden="true"></i> Raw Context Retrieval</span>
-                        </label>
+                        <div class="search-modes-radios">
+                            <label class="radio-label">
+                                <input type="radio" name="searchMode" value="rag" checked>
+                                <span><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> AI RAG Synthesis</span>
+                            </label>
+                            <label class="radio-label">
+                                <input type="radio" name="searchMode" value="raw">
+                                <span><i class="fa-solid fa-database" aria-hidden="true"></i> Raw Context Retrieval</span>
+                            </label>
+                        </div>
+                        <div class="search-provider-bar">
+                            <span id="searchActiveAiBadge" class="status-tag info">Engine: Auto (Local RAG)</span>
+                            <button type="button" id="btnOpenAiSettingsSearch" class="btn btn-secondary btn-sm">
+                                <i class="fa-solid fa-sliders" aria-hidden="true"></i> AI Settings
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -588,8 +599,18 @@
 
             <!-- Tab 3: PM Copilot -->
             <div class="tab-content" id="copilotTab">
-                <h2>Product Manager Documentation Copilot</h2>
-                <p class="description-text">Compile meeting notes, features, architectural preferences, and project memories into structured PM documentation.</p>
+                <div class="card-header-action">
+                    <div>
+                        <h2>Product Manager Documentation Copilot</h2>
+                        <p class="description-text">Compile meeting notes, features, architectural preferences, and project memories into structured PM documentation.</p>
+                    </div>
+                    <div class="copilot-provider-bar">
+                        <span id="copilotActiveAiBadge" class="status-tag info">Engine: Auto</span>
+                        <button type="button" id="btnOpenAiSettingsCopilot" class="btn btn-secondary btn-sm">
+                            <i class="fa-solid fa-sliders" aria-hidden="true"></i> AI Settings
+                        </button>
+                    </div>
+                </div>
 
                 <div class="copilot-form card">
                     <div class="form-group">
@@ -1670,6 +1691,186 @@
         </div>
         <form method="dialog" class="dialog-actions">
             <button type="submit" value="close" class="btn btn-primary" autofocus>Done</button>
+        </form>
+    </dialog>
+
+    <dialog id="aiSettingsDialog" aria-labelledby="aiSettingsDialogTitle" class="wb-dialog wb-dialog-lg">
+        <div class="dialog-header">
+            <h2 id="aiSettingsDialogTitle"><i class="fa-solid fa-sliders" aria-hidden="true"></i> AI &amp; LLM Provider Settings</h2>
+            <form method="dialog">
+                <button type="submit" value="cancel" class="btn-icon-only" aria-label="Close dialog">
+                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                </button>
+            </form>
+        </div>
+
+        <div id="aiSettingsStatusBanner" class="ai-status-banner" aria-live="polite">
+            <div class="ai-status-summary">
+                <span class="status-tag info">Resolved Engine: Detecting...</span>
+            </div>
+            <button type="button" id="btnRefreshAiProbe" class="btn btn-secondary btn-sm">
+                <i class="fa-solid fa-rotate" aria-hidden="true"></i> Probe Local AI
+            </button>
+        </div>
+
+        <form id="aiSettingsForm" class="stack-form ai-settings-form">
+            <div class="ai-settings-row">
+                <div class="form-group">
+                    <label for="aiProviderSelect">Active AI Chat / RAG Provider</label>
+                    <select id="aiProviderSelect" autofocus>
+                        <option value="auto">Auto (Cloud Key &rarr; Local Ollama/vLLM &rarr; Offline Local RAG)</option>
+                        <option value="local_rag">Built-in Offline Local RAG (No API Key Required)</option>
+                        <option value="gemini">Google Gemini / AI Studio / OpenRouter</option>
+                        <option value="openai">OpenAI / vLLM / LM Studio Compatible</option>
+                        <option value="ollama">Ollama Local Server</option>
+                        <option value="minimax">MiniMax API</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="aiEmbedSelect">Vector Embedding Provider</label>
+                    <select id="aiEmbedSelect">
+                        <option value="synthetic">Synthetic Hash (Offline &middot; Instant &middot; Zero Key)</option>
+                        <option value="gemini">Google Gemini Embeddings</option>
+                        <option value="openai">OpenAI Embeddings</option>
+                        <option value="ollama">Ollama Embeddings (nomic-embed-text)</option>
+                        <option value="minimax">MiniMax Embeddings</option>
+                    </select>
+                </div>
+            </div>
+
+            <label class="checkbox-row" for="aiFallbackLocalRag">
+                <input type="checkbox" id="aiFallbackLocalRag" checked>
+                <span>Auto-fallback to Offline Local RAG when Cloud/Ollama is unreachable or unconfigured</span>
+            </label>
+
+            <fieldset class="ai-provider-fieldset">
+                <legend><i class="fa-solid fa-sparkles" aria-hidden="true"></i> Google Gemini / OpenRouter</legend>
+                <div class="form-group">
+                    <label for="aiGeminiKey">GEMINI_API_KEY</label>
+                    <div class="password-field-wrap">
+                        <input type="password" id="aiGeminiKey" autocomplete="off" spellcheck="false" placeholder="Paste AIza... or sk-or-... (leave blank to keep saved key)">
+                        <button type="button" id="btnToggleAiGeminiKey" class="btn-password-toggle" aria-label="Show Gemini API key" aria-pressed="false">
+                            <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                        </button>
+                    </div>
+                    <div class="ai-key-meta-row">
+                        <span id="aiGeminiKeyHint" class="field-hint">Not configured</span>
+                        <label class="checkbox-row" for="aiClearGeminiKey">
+                            <input type="checkbox" id="aiClearGeminiKey">
+                            <span>Clear saved key</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="ai-settings-row">
+                    <div class="form-group">
+                        <label for="aiGeminiModel">Gemini Model</label>
+                        <input type="text" id="aiGeminiModel" list="geminiModelSuggestions" placeholder="gemini-2.5-flash">
+                        <datalist id="geminiModelSuggestions">
+                            <option value="gemini-2.5-flash"></option>
+                            <option value="gemini-2.5-pro"></option>
+                            <option value="gemini-2.0-flash"></option>
+                            <option value="gemini-3.1-pro-preview"></option>
+                        </datalist>
+                    </div>
+                    <div class="form-group">
+                        <label for="aiGeminiBaseUrl">Custom Base URL (Optional)</label>
+                        <input type="url" id="aiGeminiBaseUrl" spellcheck="false" placeholder="https://generativelanguage.googleapis.com/v1beta">
+                    </div>
+                </div>
+            </fieldset>
+
+            <fieldset class="ai-provider-fieldset">
+                <legend><i class="fa-solid fa-microchip" aria-hidden="true"></i> OpenAI / vLLM / LM Studio (OpenAI-Compatible)</legend>
+                <div class="form-group">
+                    <label for="aiOpenaiKey">OPENAI_API_KEY</label>
+                    <div class="password-field-wrap">
+                        <input type="password" id="aiOpenaiKey" autocomplete="off" spellcheck="false" placeholder="Paste sk-... or local token (leave blank to keep)">
+                        <button type="button" id="btnToggleAiOpenaiKey" class="btn-password-toggle" aria-label="Show OpenAI API key" aria-pressed="false">
+                            <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                        </button>
+                    </div>
+                    <div class="ai-key-meta-row">
+                        <span id="aiOpenaiKeyHint" class="field-hint">Not configured</span>
+                        <label class="checkbox-row" for="aiClearOpenaiKey">
+                            <input type="checkbox" id="aiClearOpenaiKey">
+                            <span>Clear saved key</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="ai-settings-row">
+                    <div class="form-group">
+                        <label for="aiOpenaiBaseUrl">Base URL</label>
+                        <input type="url" id="aiOpenaiBaseUrl" spellcheck="false" placeholder="https://api.openai.com/v1 or http://localhost:1234/v1">
+                    </div>
+                    <div class="form-group">
+                        <label for="aiOpenaiModel">Model</label>
+                        <input type="text" id="aiOpenaiModel" spellcheck="false" placeholder="gpt-4o-mini">
+                    </div>
+                </div>
+            </fieldset>
+
+            <fieldset class="ai-provider-fieldset">
+                <legend><i class="fa-solid fa-server" aria-hidden="true"></i> Ollama Local AI</legend>
+                <div class="form-group">
+                    <label for="aiOllamaUrl">Ollama Server URL</label>
+                    <input type="url" id="aiOllamaUrl" spellcheck="false" placeholder="http://localhost:11434">
+                </div>
+                <div class="ai-settings-row">
+                    <div class="form-group">
+                        <label for="aiOllamaModel">Chat Model</label>
+                        <input type="text" id="aiOllamaModel" list="ollamaModelSuggestions" spellcheck="false" placeholder="llama3.2">
+                        <datalist id="ollamaModelSuggestions"></datalist>
+                    </div>
+                    <div class="form-group">
+                        <label for="aiOllamaVisionModel">Vision OCR Model</label>
+                        <input type="text" id="aiOllamaVisionModel" spellcheck="false" placeholder="qwen2.5vl:7b">
+                    </div>
+                </div>
+            </fieldset>
+
+            <details class="ai-advanced-details">
+                <summary>Local AI / vLLM Endpoint Override (Optional)</summary>
+                <div class="ai-advanced-body">
+                    <div class="ai-settings-row">
+                        <div class="form-group">
+                            <label for="aiLocalAiBaseUrl">Local AI Base URL</label>
+                            <input type="url" id="aiLocalAiBaseUrl" spellcheck="false" placeholder="http://localhost:8000/v1">
+                        </div>
+                        <div class="form-group">
+                            <label for="aiLocalAiModel">Local AI Model</label>
+                            <input type="text" id="aiLocalAiModel" spellcheck="false" placeholder="Qwen/Qwen2.5-7B-Instruct">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="aiLocalAiKey">Local AI API Key (Optional)</label>
+                        <div class="password-field-wrap">
+                            <input type="password" id="aiLocalAiKey" autocomplete="off" spellcheck="false" placeholder="Leave blank to keep saved key">
+                            <button type="button" id="btnToggleAiLocalAiKey" class="btn-password-toggle" aria-label="Show Local AI key" aria-pressed="false">
+                                <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                            </button>
+                        </div>
+                        <div class="ai-key-meta-row">
+                            <span id="aiLocalAiKeyHint" class="field-hint">Not configured</span>
+                            <label class="checkbox-row" for="aiClearLocalAiKey">
+                                <input type="checkbox" id="aiClearLocalAiKey">
+                                <span>Clear saved key</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </details>
+
+            <div id="aiSettingsTestOutput" class="ai-test-banner" hidden aria-live="polite"></div>
+
+            <div class="dialog-actions">
+                <button type="button" id="btnCancelAiSettings" class="btn btn-secondary" command="close" commandfor="aiSettingsDialog">Cancel</button>
+                <button type="button" id="btnTestAiSettings" class="btn btn-secondary">
+                    <i class="fa-solid fa-plug-circle-check" aria-hidden="true"></i> Test Connection
+                </button>
+                <button type="submit" id="btnSaveAiSettings" class="btn btn-primary">
+                    <i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save Settings
+                </button>
+            </div>
         </form>
     </dialog>
 
