@@ -351,6 +351,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const searchQuery = document.getElementById('searchQuery');
     const btnSearch = document.getElementById('btnSearch');
     const searchResults = document.getElementById('searchResults');
+    const searchActiveAiBadge = document.getElementById('searchActiveAiBadge');
+    const btnOpenAiSettingsSearch = document.getElementById('btnOpenAiSettingsSearch');
 
     // PM Copilot
     const docType = document.getElementById('docType');
@@ -360,6 +362,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const generatedDocContent = document.getElementById('generatedDocContent');
     const docSourcesFeed = document.getElementById('docSourcesFeed');
     const btnCopyDoc = document.getElementById('btnCopyDoc');
+    const copilotActiveAiBadge = document.getElementById('copilotActiveAiBadge');
+    const btnOpenAiSettingsCopilot = document.getElementById('btnOpenAiSettingsCopilot');
+    const btnOpenAiSettingsOverview = document.getElementById('btnOpenAiSettingsOverview');
 
     // MCP Integration
     const mcpTransportRadios = document.getElementsByName('mcpTransport');
@@ -525,6 +530,38 @@ document.addEventListener('DOMContentLoaded', () => {
     const commandPaletteInput = document.getElementById('commandPaletteInput');
     const commandPaletteResults = document.getElementById('commandPaletteResults');
 
+    // AI & LLM Settings Dialog
+    const aiSettingsDialog = document.getElementById('aiSettingsDialog');
+    const aiSettingsStatusBanner = document.getElementById('aiSettingsStatusBanner');
+    const btnRefreshAiProbe = document.getElementById('btnRefreshAiProbe');
+    const aiSettingsForm = document.getElementById('aiSettingsForm');
+    const aiProviderSelect = document.getElementById('aiProviderSelect');
+    const aiEmbedSelect = document.getElementById('aiEmbedSelect');
+    const aiFallbackLocalRag = document.getElementById('aiFallbackLocalRag');
+    const aiGeminiKey = document.getElementById('aiGeminiKey');
+    const aiGeminiKeyHint = document.getElementById('aiGeminiKeyHint');
+    const aiClearGeminiKey = document.getElementById('aiClearGeminiKey');
+    const aiGeminiModel = document.getElementById('aiGeminiModel');
+    const aiGeminiBaseUrl = document.getElementById('aiGeminiBaseUrl');
+    const aiOpenaiKey = document.getElementById('aiOpenaiKey');
+    const aiOpenaiKeyHint = document.getElementById('aiOpenaiKeyHint');
+    const aiClearOpenaiKey = document.getElementById('aiClearOpenaiKey');
+    const aiOpenaiBaseUrl = document.getElementById('aiOpenaiBaseUrl');
+    const aiOpenaiModel = document.getElementById('aiOpenaiModel');
+    const aiOllamaUrl = document.getElementById('aiOllamaUrl');
+    const aiOllamaModel = document.getElementById('aiOllamaModel');
+    const aiOllamaVisionModel = document.getElementById('aiOllamaVisionModel');
+    const ollamaModelSuggestions = document.getElementById('ollamaModelSuggestions');
+    const aiLocalAiBaseUrl = document.getElementById('aiLocalAiBaseUrl');
+    const aiLocalAiModel = document.getElementById('aiLocalAiModel');
+    const aiLocalAiKey = document.getElementById('aiLocalAiKey');
+    const aiLocalAiKeyHint = document.getElementById('aiLocalAiKeyHint');
+    const aiClearLocalAiKey = document.getElementById('aiClearLocalAiKey');
+    const aiSettingsTestOutput = document.getElementById('aiSettingsTestOutput');
+    const btnCancelAiSettings = document.getElementById('btnCancelAiSettings');
+    const btnTestAiSettings = document.getElementById('btnTestAiSettings');
+    const btnSaveAiSettings = document.getElementById('btnSaveAiSettings');
+
     const toastRegion = document.getElementById('toastRegion');
     const srAnnouncer = document.getElementById('srAnnouncer');
 
@@ -544,6 +581,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let allPlugins = [];
     let activePluginCategory = 'all';
     let lastHardwareStatus = null;
+    let currentAiSettings = null;
     let cgNetwork = null;
     let cgNodesList = [];
     let cgEdgesList = [];
@@ -1123,6 +1161,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const actionCommands = [
             {
+                id: 'action:ai-settings',
+                title: 'AI & LLM Provider Settings (Gemini / OpenAI / Ollama / Offline RAG)',
+                subtitle: 'AI Engine',
+                keywords: 'ai llm settings gemini openai ollama minimax local rag provider api key model',
+                icon: 'fa-sliders',
+                run: () => openAiSettingsModal()
+            },
+            {
                 id: 'action:theme',
                 title: 'Toggle Color Theme (Light / Dark)',
                 subtitle: 'Appearance',
@@ -1355,6 +1401,9 @@ document.addEventListener('DOMContentLoaded', () => {
     wirePasswordToggle('btnToggleRegPassword', 'regPassword');
     wirePasswordToggle('btnToggleCurrentPassword', 'currentPasswordInput');
     wirePasswordToggle('btnToggleNewPassword', 'newPasswordInput');
+    wirePasswordToggle('btnToggleAiGeminiKey', 'aiGeminiKey');
+    wirePasswordToggle('btnToggleAiOpenaiKey', 'aiOpenaiKey');
+    wirePasswordToggle('btnToggleAiLocalAiKey', 'aiLocalAiKey');
 
     async function loadAuthConfig() {
         try {
@@ -1834,6 +1883,7 @@ document.addEventListener('DOMContentLoaded', () => {
         loadIngestedDocuments();
         loadPluginSummary();
         loadHardwareStatus();
+        loadAiSettings({ probeOllama: false });
         if (userRole === 'admin') {
             loadMcpStatus();
         }
@@ -1942,6 +1992,32 @@ document.addEventListener('DOMContentLoaded', () => {
         if (btnGenerateDoc) btnGenerateDoc.addEventListener('click', generateDoc);
         if (btnCopyDoc) btnCopyDoc.addEventListener('click', copyDocToClipboard);
         if (btnDeleteAll) btnDeleteAll.addEventListener('click', deleteAllMemories);
+
+        if (btnOpenAiSettingsSearch) btnOpenAiSettingsSearch.addEventListener('click', openAiSettingsModal);
+        if (btnOpenAiSettingsCopilot) btnOpenAiSettingsCopilot.addEventListener('click', openAiSettingsModal);
+        if (btnOpenAiSettingsOverview) btnOpenAiSettingsOverview.addEventListener('click', openAiSettingsModal);
+        if (btnRefreshAiProbe) btnRefreshAiProbe.addEventListener('click', () => loadAiSettings({ probeOllama: true }));
+        if (btnTestAiSettings) btnTestAiSettings.addEventListener('click', testAiSettingsConnection);
+        if (aiSettingsForm) aiSettingsForm.addEventListener('submit', saveAiSettings);
+        if (aiSettingsDialog) {
+            const closeBtns = aiSettingsDialog.querySelectorAll('[command="close"][commandfor="aiSettingsDialog"]');
+            closeBtns.forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (aiSettingsDialog.open) aiSettingsDialog.close('cancel');
+                });
+            });
+            if (btnCancelAiSettings) {
+                btnCancelAiSettings.addEventListener('click', () => {
+                    if (aiSettingsDialog.open) aiSettingsDialog.close('cancel');
+                });
+            }
+        }
+        document.addEventListener('click', (e) => {
+            const trigger = e.target.closest('[data-open-ai-settings="true"]');
+            if (trigger) {
+                openAiSettingsModal();
+            }
+        });
 
         if (searchQuery) {
             searchQuery.addEventListener('keydown', (e) => {
@@ -2719,6 +2795,277 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // =========================================================================
+    // 12B. AI & LLM Provider Settings Modal
+    // =========================================================================
+    function getShortProviderLabel(provider) {
+        const key = String(provider || '').toLowerCase();
+        if (key === 'local_rag') return 'Local RAG';
+        if (key === 'gemini') return 'Gemini';
+        if (key === 'openai') return 'OpenAI';
+        if (key === 'ollama') return 'Ollama';
+        if (key === 'minimax') return 'MiniMax';
+        if (key === 'local_ai') return 'Local AI';
+        return toDisplayText(provider, 'Auto');
+    }
+
+    function updateAiEngineBadges(settings) {
+        if (!settings) return;
+        const resolved = settings.resolved_provider || 'local_rag';
+        const shortResolved = getShortProviderLabel(resolved);
+        const mode = settings.provider || 'auto';
+        const fullLabel = toDisplayText(settings.resolved_label, shortResolved);
+        const searchText = mode === 'auto' ? `Engine: Auto (${shortResolved})` : `Engine: ${shortResolved}`;
+        const copilotText = mode === 'auto' ? `Engine: Auto (${shortResolved})` : `Engine: ${shortResolved}`;
+        const tagClass = resolved === 'local_rag' ? 'status-tag info' : 'status-tag success';
+
+        if (searchActiveAiBadge) {
+            searchActiveAiBadge.textContent = searchText;
+            searchActiveAiBadge.className = tagClass;
+            searchActiveAiBadge.title = fullLabel;
+        }
+        if (copilotActiveAiBadge) {
+            copilotActiveAiBadge.textContent = copilotText;
+            copilotActiveAiBadge.className = tagClass;
+            copilotActiveAiBadge.title = fullLabel;
+        }
+    }
+
+    function renderAiSettingsStatusBanner(data) {
+        if (!aiSettingsStatusBanner || !data) return;
+        const summaryEl = aiSettingsStatusBanner.querySelector('.ai-status-summary');
+        if (!summaryEl) return;
+
+        const resolvedProvider = data.resolved_provider || 'local_rag';
+        const resolvedLabel = toDisplayText(data.resolved_label, getShortProviderLabel(resolvedProvider));
+        const engineTagClass = resolvedProvider === 'local_rag' ? 'info' : 'success';
+
+        const geminiText = data.has_gemini_key
+            ? `Gemini: ${toDisplayText(data.gemini_key_masked, 'Configured')}`
+            : 'Gemini: No key';
+        const openaiText = data.has_openai_key
+            ? `OpenAI: ${toDisplayText(data.openai_key_masked, 'Configured')}`
+            : 'OpenAI: No key';
+
+        const ollamaModels = Array.isArray(data.ollama_models)
+            ? data.ollama_models.map(m => toDisplayText(m)).filter(Boolean)
+            : [];
+        const ollamaText = data.ollama_reachable
+            ? `Ollama: Ready (${ollamaModels.length > 0 ? ollamaModels.slice(0, 3).join(', ') + (ollamaModels.length > 3 ? ` +${ollamaModels.length - 3}` : '') : '0 models'})`
+            : 'Ollama: Offline';
+
+        summaryEl.innerHTML = `
+            <span class="status-tag ${engineTagClass}">Resolved: ${escapeHTML(resolvedLabel)}</span>
+            <span class="status-tag ${data.has_gemini_key ? 'success' : 'warning'}">${escapeHTML(geminiText)}</span>
+            <span class="status-tag ${data.has_openai_key ? 'success' : 'warning'}">${escapeHTML(openaiText)}</span>
+            <span class="status-tag ${data.ollama_reachable ? 'success' : 'info'}">${escapeHTML(ollamaText)}</span>
+        `;
+    }
+
+    function populateAiSettingsForm(data) {
+        if (!data) return;
+        if (aiProviderSelect) aiProviderSelect.value = data.provider || 'auto';
+        if (aiEmbedSelect) aiEmbedSelect.value = data.emb_kind || 'synthetic';
+        if (aiFallbackLocalRag) aiFallbackLocalRag.checked = data.fallback_to_local_rag !== false;
+
+        if (aiGeminiKey) aiGeminiKey.value = '';
+        if (aiClearGeminiKey) aiClearGeminiKey.checked = false;
+        if (aiGeminiKeyHint) {
+            aiGeminiKeyHint.textContent = data.has_gemini_key
+                ? `Saved: ${toDisplayText(data.gemini_key_masked, 'Configured')}`
+                : 'Not configured';
+        }
+        if (aiGeminiModel) aiGeminiModel.value = toDisplayText(data.gemini_model, 'gemini-2.5-flash');
+        if (aiGeminiBaseUrl) aiGeminiBaseUrl.value = toDisplayText(data.gemini_base_url, '');
+
+        if (aiOpenaiKey) aiOpenaiKey.value = '';
+        if (aiClearOpenaiKey) aiClearOpenaiKey.checked = false;
+        if (aiOpenaiKeyHint) {
+            aiOpenaiKeyHint.textContent = data.has_openai_key
+                ? `Saved: ${toDisplayText(data.openai_key_masked, 'Configured')}`
+                : 'Not configured';
+        }
+        if (aiOpenaiBaseUrl) aiOpenaiBaseUrl.value = toDisplayText(data.openai_base_url, 'https://api.openai.com/v1');
+        if (aiOpenaiModel) aiOpenaiModel.value = toDisplayText(data.openai_model, 'gpt-4o-mini');
+
+        if (aiOllamaUrl) aiOllamaUrl.value = toDisplayText(data.ollama_url, 'http://localhost:11434');
+        if (aiOllamaModel) aiOllamaModel.value = toDisplayText(data.ollama_model, 'llama3.2');
+        if (aiOllamaVisionModel) aiOllamaVisionModel.value = toDisplayText(data.ollama_vision_model, 'qwen2.5vl:7b');
+        if (ollamaModelSuggestions) {
+            const models = Array.isArray(data.ollama_models)
+                ? data.ollama_models.map(m => toDisplayText(m)).filter(Boolean)
+                : [];
+            ollamaModelSuggestions.innerHTML = models
+                .map(m => `<option value="${escapeHTML(m)}"></option>`)
+                .join('');
+        }
+
+        if (aiLocalAiBaseUrl) aiLocalAiBaseUrl.value = toDisplayText(data.local_ai_base_url, '');
+        if (aiLocalAiModel) aiLocalAiModel.value = toDisplayText(data.local_ai_model, '');
+        if (aiLocalAiKey) aiLocalAiKey.value = '';
+        if (aiClearLocalAiKey) aiClearLocalAiKey.checked = false;
+        if (aiLocalAiKeyHint) {
+            aiLocalAiKeyHint.textContent = data.has_local_ai_key ? 'Saved (hidden)' : 'Not configured';
+        }
+    }
+
+    function collectAiSettingsPayload() {
+        return {
+            provider: aiProviderSelect ? aiProviderSelect.value : 'auto',
+            fallback_to_local_rag: aiFallbackLocalRag ? Boolean(aiFallbackLocalRag.checked) : true,
+            emb_kind: aiEmbedSelect ? aiEmbedSelect.value : 'synthetic',
+            gemini_key: aiGeminiKey ? aiGeminiKey.value.trim() : '',
+            clear_gemini_key: aiClearGeminiKey ? Boolean(aiClearGeminiKey.checked) : false,
+            gemini_model: (aiGeminiModel?.value || '').trim() || 'gemini-2.5-flash',
+            gemini_base_url: (aiGeminiBaseUrl?.value || '').trim(),
+            openai_key: aiOpenaiKey ? aiOpenaiKey.value.trim() : '',
+            clear_openai_key: aiClearOpenaiKey ? Boolean(aiClearOpenaiKey.checked) : false,
+            openai_base_url: (aiOpenaiBaseUrl?.value || '').trim() || 'https://api.openai.com/v1',
+            openai_model: (aiOpenaiModel?.value || '').trim() || 'gpt-4o-mini',
+            ollama_url: (aiOllamaUrl?.value || '').trim() || 'http://localhost:11434',
+            ollama_model: (aiOllamaModel?.value || '').trim() || 'llama3.2',
+            ollama_vision_model: (aiOllamaVisionModel?.value || '').trim() || 'qwen2.5vl:7b',
+            local_ai_base_url: (aiLocalAiBaseUrl?.value || '').trim(),
+            local_ai_model: (aiLocalAiModel?.value || '').trim(),
+            local_ai_api_key: aiLocalAiKey ? aiLocalAiKey.value.trim() : '',
+            clear_local_ai_key: aiClearLocalAiKey ? Boolean(aiClearLocalAiKey.checked) : false
+        };
+    }
+
+    async function loadAiSettings({ probeOllama = false } = {}) {
+        try {
+            const res = await fetch(`/pm/ai-settings?probe_ollama=${probeOllama ? 'true' : 'false'}`);
+            if (!res.ok) return null;
+            const data = await res.json();
+            currentAiSettings = data;
+            updateAiEngineBadges(data);
+            renderAiSettingsStatusBanner(data);
+            populateAiSettingsForm(data);
+            return data;
+        } catch (err) {
+            console.warn('AI settings fetch failed:', err);
+            return null;
+        }
+    }
+
+    async function openAiSettingsModal() {
+        if (!aiSettingsDialog) return;
+        if (aiSettingsTestOutput) {
+            aiSettingsTestOutput.hidden = true;
+            aiSettingsTestOutput.className = 'ai-test-banner';
+            aiSettingsTestOutput.innerHTML = '';
+        }
+        if (!aiSettingsDialog.open) {
+            aiSettingsDialog.returnValue = '';
+            aiSettingsDialog.showModal();
+        }
+        if (aiProviderSelect) {
+            requestAnimationFrame(() => aiProviderSelect.focus());
+        }
+        await loadAiSettings({ probeOllama: true });
+    }
+
+    async function testAiSettingsConnection() {
+        if (!aiSettingsTestOutput) return;
+        const origHtml = btnTestAiSettings ? btnTestAiSettings.innerHTML : '';
+        if (btnTestAiSettings) {
+            btnTestAiSettings.disabled = true;
+            btnTestAiSettings.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Testing...';
+        }
+        aiSettingsTestOutput.hidden = false;
+        aiSettingsTestOutput.className = 'ai-test-banner';
+        aiSettingsTestOutput.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Probing AI provider connection...';
+
+        try {
+            const res = await fetch('/pm/ai-settings/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectAiSettingsPayload())
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) {
+                const errText = toDisplayText(data?.error || data?.detail, `Test failed (HTTP ${res.status})`);
+                aiSettingsTestOutput.className = 'ai-test-banner is-error';
+                aiSettingsTestOutput.innerHTML = `
+                    <div class="ai-test-meta">
+                        <i class="fa-solid fa-circle-xmark" aria-hidden="true"></i>
+                        <span>Connection Test Failed</span>
+                        ${data?.provider_used ? `<span class="status-tag danger">${escapeHTML(toDisplayText(data.provider_used))}</span>` : ''}
+                    </div>
+                    <div class="ai-test-reply">${escapeHTML(errText)}</div>
+                `;
+                return;
+            }
+
+            const providerUsed = toDisplayText(data.provider_used, 'local_rag');
+            const modelUsed = toDisplayText(data.model_used, '');
+            const latency = data.latency_ms !== undefined && data.latency_ms !== null ? `${round(data.latency_ms, 1)} ms` : '';
+            const replyPreview = toDisplayText(data.reply, 'OK');
+            aiSettingsTestOutput.className = 'ai-test-banner is-success';
+            aiSettingsTestOutput.innerHTML = `
+                <div class="ai-test-meta">
+                    <i class="fa-solid fa-circle-check" aria-hidden="true"></i>
+                    <span>Connection Verified</span>
+                    <span class="status-tag success">${escapeHTML(providerUsed)}</span>
+                    ${modelUsed ? `<span class="status-tag info">${escapeHTML(modelUsed)}</span>` : ''}
+                    ${latency ? `<span class="status-tag info mono-num">${escapeHTML(latency)}</span>` : ''}
+                </div>
+                <div class="ai-test-reply">${escapeHTML(replyPreview)}</div>
+            `;
+        } catch (err) {
+            aiSettingsTestOutput.className = 'ai-test-banner is-error';
+            aiSettingsTestOutput.innerHTML = `
+                <div class="ai-test-meta">
+                    <i class="fa-solid fa-circle-xmark" aria-hidden="true"></i>
+                    <span>Connection Test Failed</span>
+                </div>
+                <div class="ai-test-reply">${escapeHTML(toDisplayText(err?.message, 'Network error'))}</div>
+            `;
+        } finally {
+            if (btnTestAiSettings) {
+                btnTestAiSettings.disabled = false;
+                btnTestAiSettings.innerHTML = origHtml || '<i class="fa-solid fa-plug-circle-check" aria-hidden="true"></i> Test Connection';
+            }
+        }
+    }
+
+    async function saveAiSettings(e) {
+        e.preventDefault();
+        const origHtml = btnSaveAiSettings ? btnSaveAiSettings.innerHTML : '';
+        if (btnSaveAiSettings) {
+            btnSaveAiSettings.disabled = true;
+            btnSaveAiSettings.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Saving...';
+        }
+
+        try {
+            const res = await fetch('/pm/ai-settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectAiSettingsPayload())
+            });
+            if (!res.ok) {
+                throw new Error(await extractErrorMessage(res, 'Failed to save AI & LLM settings.'));
+            }
+            const updated = await res.json();
+            currentAiSettings = updated;
+            updateAiEngineBadges(updated);
+            renderAiSettingsStatusBanner(updated);
+            populateAiSettingsForm(updated);
+            if (aiSettingsDialog?.open) {
+                aiSettingsDialog.close('saved');
+            }
+            const label = toDisplayText(updated.resolved_label || updated.provider, 'updated');
+            showToast(`AI & LLM settings saved (${label}).`, 'success');
+        } catch (err) {
+            showToast('Failed to save AI settings: ' + err.message, 'error');
+        } finally {
+            if (btnSaveAiSettings) {
+                btnSaveAiSettings.disabled = false;
+                btnSaveAiSettings.innerHTML = origHtml || '<i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save Settings';
+            }
+        }
+    }
+
+    // =========================================================================
     // 13. Semantic Search & PM Copilot
     // =========================================================================
     async function performSearch() {
@@ -2741,21 +3088,70 @@ document.addEventListener('DOMContentLoaded', () => {
                     })
                 });
                 if (!res.ok) {
-                    const detail = await extractErrorMessage(res, 'Failed to query Gemini PM search.');
+                    const detail = await extractErrorMessage(res, 'Failed to query AI semantic search.');
                     throw new Error(detail);
                 }
                 const data = await res.json();
 
                 searchResults.innerHTML = '';
+                const providerLabel = toDisplayText(data.provider_label, 'AI RAG Synthesis');
+                const modelUsed = toDisplayText(data.model_used, '');
+                const fallbackReason = toDisplayText(data.fallback_reason, '').trim();
+
                 const ragCard = document.createElement('div');
                 ragCard.className = 'card rag-response-card';
                 ragCard.innerHTML = `
                     <div class="rag-header">
-                        <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Gemini AI Answer
+                        <div class="rag-header-title">
+                            <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>
+                            <span>AI Answer</span>
+                            <span class="status-tag info">${escapeHTML(providerLabel)}</span>
+                            ${modelUsed ? `<span class="status-tag info">${escapeHTML(modelUsed)}</span>` : ''}
+                        </div>
+                        <button type="button" class="btn btn-secondary btn-sm" data-open-ai-settings="true">
+                            <i class="fa-solid fa-sliders" aria-hidden="true"></i> Configure AI
+                        </button>
                     </div>
+                    ${fallbackReason ? `
+                        <div class="ai-fallback-banner" role="status">
+                            <i class="fa-solid fa-circle-info" aria-hidden="true"></i>
+                            <span>Fell back cleanly to Local RAG: ${escapeHTML(fallbackReason)}</span>
+                        </div>
+                    ` : ''}
                     <div class="rag-body">${formatMarkdownLike(data.results || '')}</div>
                 `;
                 searchResults.appendChild(ragCard);
+
+                const graphMatches = Array.isArray(data.graph_matches) ? data.graph_matches : [];
+                if (graphMatches.length > 0) {
+                    const graphHeader = document.createElement('h3');
+                    graphHeader.className = 'subsection-heading';
+                    graphHeader.innerHTML = '<i class="fa-solid fa-circle-nodes" aria-hidden="true"></i> Matching Code &amp; Graph Symbols';
+                    searchResults.appendChild(graphHeader);
+
+                    const graphGrid = document.createElement('div');
+                    graphGrid.className = 'graph-matches-grid';
+                    graphMatches.forEach(sym => {
+                        const card = document.createElement('div');
+                        card.className = 'card graph-match-card';
+                        const symLabel = toDisplayText(sym?.label || sym?.qualified_name || sym?.name, 'Symbol');
+                        const symKind = toDisplayText(sym?.sym_kind || sym?.file_type || sym?.kind, 'symbol');
+                        const sourceFile = toDisplayText(sym?.source_file, '');
+                        const sourceLoc = toDisplayText(sym?.source_location, '');
+                        card.innerHTML = `
+                            <div class="graph-match-header">
+                                <span class="graph-match-label">${escapeHTML(symLabel)}</span>
+                                <span class="status-tag info">${escapeHTML(symKind)}</span>
+                            </div>
+                            <div class="graph-match-meta code-font">
+                                ${sourceFile ? `<span><i class="fa-regular fa-file-code" aria-hidden="true"></i> ${escapeHTML(sourceFile)}</span>` : ''}
+                                ${sourceLoc ? `<span><i class="fa-solid fa-location-dot" aria-hidden="true"></i> ${escapeHTML(sourceLoc)}</span>` : ''}
+                            </div>
+                        `;
+                        graphGrid.appendChild(card);
+                    });
+                    searchResults.appendChild(graphGrid);
+                }
 
                 const sourceHeader = document.createElement('h3');
                 sourceHeader.className = 'subsection-heading';
@@ -2787,11 +3183,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 renderMemoriesList(rows, searchResults);
             }
         } catch (err) {
-            const isGeminiHint = err.message.toLowerCase().includes('gemini') || err.message.toLowerCase().includes('api_key');
+            const msgLower = String(err.message || '').toLowerCase();
+            const isAiHint = msgLower.includes('gemini') || msgLower.includes('openai') || msgLower.includes('ollama') || msgLower.includes('api_key');
             searchResults.innerHTML = `
                 <div class="card danger-zone">
                     <h3><i class="fa-solid fa-circle-exclamation" aria-hidden="true"></i> Search Unavailable</h3>
-                    <p class="info-text">${escapeHTML(err.message)}${isGeminiHint ? ' Switch to "Raw Context Retrieval" mode or configure GEMINI_API_KEY.' : ''}</p>
+                    <p class="info-text">${escapeHTML(err.message)}${isAiHint ? ' Switch to "Raw Context Retrieval" or configure your AI provider below.' : ''}</p>
+                    <div class="action-buttons">
+                        <button type="button" class="btn btn-secondary btn-sm" data-open-ai-settings="true">
+                            <i class="fa-solid fa-sliders" aria-hidden="true"></i> Open AI &amp; LLM Settings
+                        </button>
+                    </div>
                 </div>`;
         }
     }
@@ -2863,6 +3265,31 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await res.json();
 
             if (copilotResults) copilotResults.style.display = 'grid';
+            const docViewer = generatedDocContent?.closest('.doc-viewer');
+            if (docViewer) {
+                const existingFallback = docViewer.querySelector('.ai-fallback-banner');
+                if (existingFallback) existingFallback.remove();
+                const existingProviderBadge = docViewer.querySelector('.doc-provider-tag');
+                if (existingProviderBadge) existingProviderBadge.remove();
+
+                const providerLabel = toDisplayText(data.provider_label, '');
+                const docHeader = docViewer.querySelector('.doc-header');
+                if (docHeader && providerLabel) {
+                    const badge = document.createElement('span');
+                    badge.className = 'status-tag info doc-provider-tag';
+                    badge.textContent = providerLabel;
+                    docHeader.insertBefore(badge, btnCopyDoc || null);
+                }
+
+                const fallbackReason = toDisplayText(data.fallback_reason, '').trim();
+                if (fallbackReason && generatedDocContent) {
+                    const banner = document.createElement('div');
+                    banner.className = 'ai-fallback-banner';
+                    banner.setAttribute('role', 'status');
+                    banner.innerHTML = `<i class="fa-solid fa-circle-info" aria-hidden="true"></i><span>Fell back cleanly to Local RAG: ${escapeHTML(fallbackReason)}</span>`;
+                    docViewer.insertBefore(banner, generatedDocContent);
+                }
+            }
             if (generatedDocContent) generatedDocContent.innerHTML = formatMarkdownLike(data.document || '');
 
             if (docSourcesFeed) {

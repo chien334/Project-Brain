@@ -281,6 +281,10 @@ def create_app() -> FastAPI:
             method in ("POST", "PUT", "PATCH", "DELETE")
             and (normalized_path == "/plugins" or path.startswith("/plugins/"))
         )
+        is_admin_ai_settings_route = (
+            normalized_path in ("/pm/ai-settings", "/pm/ai-settings/test")
+            and method in ("PUT", "POST", "PATCH", "DELETE")
+        )
         is_admin_route = (
             (
                 (normalized_path == "/auth" or path.startswith("/auth/"))
@@ -289,6 +293,7 @@ def create_app() -> FastAPI:
             or normalized_path == "/memory/mcp"
             or path.startswith("/memory/mcp/")
             or is_admin_plugin_route
+            or is_admin_ai_settings_route
         )
         is_protected_route = (
             is_self_service_auth_route
@@ -627,6 +632,12 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup():
         auth.init_auth_system()
+        try:
+            from ..ai.runtime_settings import sync_ai_settings_from_db
+
+            sync_ai_settings_from_db()
+        except Exception as exc:
+            logger.debug(f"Failed to sync persisted AI settings on startup: {exc}")
         logger.info(f"ProjectBrain Server running (database: {_redact_database_url(getattr(env, 'database_url', None))})")
 
     return app

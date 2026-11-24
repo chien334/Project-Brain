@@ -1,11 +1,26 @@
-from fastapi import APIRouter, HTTPException
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Body, HTTPException, Query, Request
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+
+from ...ai.gemini import GeminiAdapter  # Kept for backward compatibility
+from ...ai.runtime_settings import (
+    get_public_ai_settings_async,
+    lookup_project_graph_matches,
+    run_pm_doc_generation,
+    run_rag_chat,
+    sanitize_secret,
+    test_ai_provider,
+    update_ai_settings,
+)
 from ...main import Memory
-from ...ai.gemini import GeminiAdapter
+from . import auth
 
 router = APIRouter(tags=["pm"])
 mem = Memory()
+logger = logging.getLogger("server")
+
 
 class PMSearchRequest(BaseModel):
     query: str
@@ -13,93 +28,171 @@ class PMSearchRequest(BaseModel):
     limit: Optional[int] = 10
     author: Optional[str] = None
 
+
 class PMDocRequest(BaseModel):
     prompt: str
-    doc_type: str = "status_report" # status_report, prd, user_story, roadmap
+    doc_type: str = "status_report"  # status_report, prd, user_story, roadmap
     user_id: Optional[str] = None
     author: Optional[str] = None
+
+
+class AISettingsUpdateRequest(BaseModel):
+    provider: Optional[str] = None
+    fallback_to_local_rag: Optional[bool] = None
+    emb_kind: Optional[str] = None
+    gemini_key: Optional[str] = None
+    clear_gemini_key: Optional[bool] = None
+    gemini_model: Optional[str] = None
+    gemini_base_url: Optional[str] = None
+    openai_key: Optional[str] = None
+    clear_openai_key: Optional[bool] = None
+    openai_base_url: Optional[str] = None
+    openai_model: Optional[str] = None
+    ollama_url: Optional[str] = None
+    ollama_model: Optional[str] = None
+    ollama_vision_model: Optional[str] = None
+    minimax_key: Optional[str] = None
+    clear_minimax_key: Optional[bool] = None
+    minimax_base_url: Optional[str] = None
+    minimax_model: Optional[str] = None
+    local_ai_base_url: Optional[str] = None
+    local_ai_model: Optional[str] = None
+    local_ai_api_key: Optional[str] = None
+    clear_local_ai_key: Optional[bool] = None
+
+
+class AISettingsTestRequest(AISettingsUpdateRequest):
+    pass
+
+
+def _dump_request_dict(model_obj: Optional[BaseModel]) -> Dict[str, Any]:
+    if model_obj is None:
+        return {}
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump(exclude_unset=True)
+    return model_obj.dict(exclude_unset=True)
+
+
+def _enforce_admin_if_authenticated(request: Optional[Request]) -> Optional[Dict[str, Any]]:
+    account = auth.get_authenticated_account(request)
+    if account and account.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Permission denied: Admin role required.")
+    if auth._is_rest_auth_required() and not account:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required: Valid admin token required.",
+        )
+    return account
+
+
+@router.get("/ai-settings")
+async def get_ai_settings_endpoint(
+    probe_ollama: bool = Query(default=True),
+):
+    return await get_public_ai_settings_async(probe_ollama=probe_ollama)
+
+
+@router.put("/ai-settings")
+async def put_ai_settings_endpoint(
+    req: AISettingsUpdateRequest,
+    request: Request = None,
+    probe_ollama: bool = Query(default=False),
+):
+    account = _enforce_admin_if_authenticated(request)
+    payload = _dump_request_dict(req)
+    try:
+        _, audit_summary = update_ai_settings(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    audit_fn = getattr(auth, "_record_audit", None) or getattr(auth, "_log_audit", None)
+    if callable(audit_fn):
+        audit_fn(
+            "ai_settings_updated",
+            "success",
+            actor_username=(account or {}).get("username"),
+            request=request,
+            details=audit_summary,
+        )
+
+    public_settings = await get_public_ai_settings_async(probe_ollama=probe_ollama)
+    return {"status": "success", "settings": public_settings, **public_settings}
+
+
+@router.post("/ai-settings/test")
+async def test_ai_settings_endpoint(
+    req: Optional[AISettingsTestRequest] = Body(default=None),
+    request: Request = None,
+):
+    _enforce_admin_if_authenticated(request)
+    overrides = _dump_request_dict(req)
+    return await test_ai_provider(overrides=overrides or None)
+
 
 @router.post("/search")
 async def pm_search(req: PMSearchRequest):
     try:
-        import logging
-        logger = logging.getLogger("server")
-        logger.info(f"User '{req.author or 'anonymous'}' triggered PM RAG search: '{req.query}' on project '{req.user_id or 'all'}'")
+        logger.info(
+            f"User '{req.author or 'anonymous'}' triggered PM RAG search: "
+            f"'{req.query}' on project '{req.user_id or 'all'}'"
+        )
 
-        # 1. Search ProjectBrain
-        mems = await mem.search(req.query, user_id=req.user_id, limit=req.limit)
-        
-        if not mems:
+        # 1. Search cognitive memories + Graphify code/doc symbols
+        mems = await mem.search(req.query, user_id=req.user_id, limit=req.limit or 10)
+        graph_nodes = lookup_project_graph_matches(req.query, req.user_id)
+
+        if not mems and not graph_nodes:
             return {
-                "results": "No relevant memories found to answer the question.",
-                "source_memories": []
+                "results": "No relevant memories or graph symbols found to answer the question.",
+                "source_memories": [],
+                "graph_matches": [],
+                "provider_used": "none",
+                "model_used": "none",
+                "provider_label": "No Matches",
+                "fallback_reason": None,
             }
-            
-        # 2. Build RAG prompt for Gemini
-        context = "\n".join([f"- [{m.get('primary_sector')} | Tag: {m.get('tags')}] {m.get('content')}" for m in mems])
-        
-        prompt = f"""You are a smart AI assistant supporting a PM (Project Manager). 
-Please answer the PM's question based on the project memories (context) found below.
-If the information in the context is insufficient, answer based on what is available and clearly state the gaps.
 
-Question: {req.query}
-
-Project memories found:
-{context}
-"""
-        # Call Gemini
-        adapter = GeminiAdapter()
-        answer = await adapter.chat([
-            {"role": "user", "content": prompt}
-        ])
-        
+        # 2. Synthesize via active AI provider or zero-key Local RAG
+        rag_res = await run_rag_chat(req.query, mems, graph_nodes)
         return {
-            "results": answer,
-            "source_memories": mems
+            "results": rag_res["answer"],
+            "source_memories": mems,
+            "graph_matches": graph_nodes,
+            "provider_used": rag_res["provider_used"],
+            "model_used": rag_res["model_used"],
+            "provider_label": rag_res["provider_label"],
+            "fallback_reason": rag_res["fallback_reason"],
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
- 
+        raise HTTPException(status_code=500, detail=sanitize_secret(e))
+
+
 @router.post("/generate-doc")
 async def pm_generate_doc(req: PMDocRequest):
     try:
-        import logging
-        logger = logging.getLogger("server")
-        logger.info(f"User '{req.author or 'anonymous'}' triggered PM document generation (Type: {req.doc_type}) for prompt: '{req.prompt}' on project '{req.user_id or 'all'}'")
- 
-        # 1. Search memories related to the prompt
+        logger.info(
+            f"User '{req.author or 'anonymous'}' triggered PM document generation "
+            f"(Type: {req.doc_type}) for prompt: '{req.prompt}' on project '{req.user_id or 'all'}'"
+        )
+
+        # 1. Search memories & graph symbols related to the prompt
         mems = await mem.search(req.prompt, user_id=req.user_id, limit=20)
-        
-        # 2. Build RAG prompt for document generation
-        context = "\n".join([f"- [{m.get('primary_sector')}] {m.get('content')}" for m in mems])
-        
-        doc_instructions = {
-            "status_report": "Project Status Report including completed tasks, in-progress work, and identified risks.",
-            "prd": "Product Requirement Document (PRD) including overview, objectives, user stories, functional and technical requirements.",
-            "user_story": "Detailed list of User Stories accompanied by acceptance criteria (Acceptance Criteria).",
-            "roadmap": "Product Roadmap broken down by milestones and major features."
-        }
-        
-        instruction = doc_instructions.get(req.doc_type, doc_instructions["status_report"])
-        
-        prompt = f"""You are an outstanding Product Manager expert. 
-Your task is to draft a document: {instruction}
-Please base your writing on the actual facts collected from the project memories below, and write the document professionally with a clear Markdown structure.
+        graph_nodes = lookup_project_graph_matches(req.prompt, req.user_id, limit=10)
 
-PM Request: {req.prompt}
-
-Actual project memories collected:
-{context}
-"""
-        # Call Gemini
-        adapter = GeminiAdapter()
-        document = await adapter.chat([
-            {"role": "user", "content": prompt}
-        ])
-        
+        # 2. Generate document via active AI provider or zero-key Local RAG
+        doc_res = await run_pm_doc_generation(req.prompt, req.doc_type, mems, graph_nodes)
         return {
-            "document": document,
-            "source_memories": mems
+            "document": doc_res["document"],
+            "source_memories": mems,
+            "graph_matches": graph_nodes,
+            "provider_used": doc_res["provider_used"],
+            "model_used": doc_res["model_used"],
+            "provider_label": doc_res["provider_label"],
+            "fallback_reason": doc_res["fallback_reason"],
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_secret(e))
