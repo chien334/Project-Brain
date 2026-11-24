@@ -876,7 +876,13 @@ def _tokenize_query_terms(query: str) -> List[str]:
     return terms
 
 
-def _normalize_graph_node(node: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_graph_node(
+    node: Dict[str, Any],
+    default_source_id: Optional[str] = None,
+    default_branch: Optional[str] = None,
+    default_scope: Optional[str] = None,
+    via_relation: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     meta = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
     label = str(node.get("label") or node.get("name") or node.get("id") or "symbol")
     kind = str(
@@ -893,6 +899,22 @@ def _normalize_graph_node(node: Dict[str, Any]) -> Dict[str, Any]:
         s_line = node.get("start_line") or meta.get("start_line")
         e_line = node.get("end_line") or meta.get("end_line")
         source_location = f"L{s_line}-L{e_line}" if e_line and e_line != s_line else f"L{s_line}"
+
+    eff_src = (
+        str(default_source_id).strip()
+        if default_source_id
+        else (
+            str(node.get("source_id") or meta.get("source_id") or "__default__").strip()
+            or "__default__"
+        )
+    )
+    eff_scope = default_scope or (
+        "project_shared"
+        if eff_src == "__shared__"
+        else str(node.get("scope") or meta.get("scope") or "source").strip() or "source"
+    )
+    eff_branch = default_branch or str(node.get("branch") or meta.get("branch") or "main").strip() or "main"
+
     return {
         "id": str(node.get("id") or label),
         "label": label,
@@ -901,30 +923,191 @@ def _normalize_graph_node(node: Dict[str, Any]) -> Dict[str, Any]:
         "source_location": str(source_location) if source_location else None,
         "signature": node.get("signature") or meta.get("signature"),
         "docstring": node.get("docstring") or meta.get("docstring") or meta.get("summary"),
+        "source_id": eff_src,
+        "branch": eff_branch,
+        "scope": eff_scope,
+        "via_relation": dict(via_relation) if via_relation is not None else None,
     }
+
+
+def _call_visjs_safe(
+    store: Any,
+    proj: str,
+    branch_name: str,
+    query: Optional[str] = None,
+    limit: int = 500,
+    source_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    import inspect
+
+    fn = store.to_legacy_visjs
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    kwargs: Dict[str, Any] = {"branch_name": branch_name, "limit": limit}
+    if query is not None:
+        kwargs["query"] = query
+    if source_id is not None and (
+        "source_id" in params
+        or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    ):
+        kwargs["source_id"] = source_id
+    return fn(proj, **kwargs)
+
+
+def _node_matches_shared_filter(node: Dict[str, Any]) -> bool:
+    meta = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    nsrc = str(node.get("source_id") or meta.get("source_id") or "").strip()
+    nscope = str(node.get("scope") or meta.get("scope") or "").strip()
+    return nsrc == "__shared__" or nscope == "project_shared"
+
+
+def _node_matches_target_source(
+    node: Dict[str, Any], target_src: Optional[str], multi_db_active: bool
+) -> bool:
+    if target_src is None:
+        return True
+    if target_src == "__shared__":
+        return _node_matches_shared_filter(node)
+    if multi_db_active and target_src != "__default__":
+        return True
+    meta = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    nsrc = str(node.get("source_id") or meta.get("source_id") or "__default__").strip() or "__default__"
+    nscope = str(node.get("scope") or meta.get("scope") or "source").strip() or "source"
+    if nscope == "project_shared" or nsrc == "__shared__":
+        return False
+    return nsrc == target_src
+
+
+def _lookup_shared_doc_unit_matches(
+    proj: str,
+    shared_br: str,
+    q_clean: str,
+    terms: List[str],
+    limit: int,
+    target_source_id: Optional[str],
+    binding_map: Dict[str, Dict[str, Dict[str, Any]]],
+    existing_doc_keys: set,
+) -> List[Tuple[float, Dict[str, Any]]]:
+    """Collect matching sections from `pb_root` `document_versions` / `document_units`."""
+    from ..core.tenant_manager import tenant_context, tenant_manager
+    from ..memory.hsg import _is_shared_doc_allowed_for_source
+
+    if not tenant_manager.has_branch(proj, shared_br, source_id="__shared__"):
+        return []
+
+    matches: List[Tuple[float, Dict[str, Any]]] = []
+    q_low = q_clean.lower()
+    try:
+        with tenant_context(proj, shared_br, source_id="__shared__"):
+            ver_rows = db.fetchall(
+                "SELECT doc_key, version, filename, branch FROM document_versions "
+                "WHERE project_id=? AND status='active' "
+                "AND (scope='project_shared' OR source_id='__shared__') "
+                "ORDER BY created_at DESC",
+                (proj,),
+            )
+            for dv in ver_rows:
+                dkey = str(dv.get("doc_key") or "").strip()
+                dver = str(dv.get("version") or "").strip()
+                fname = str(dv.get("filename") or f"{dkey}.md")
+                dbr = str(dv.get("branch") or shared_br)
+                if not dkey or dkey in existing_doc_keys:
+                    continue
+                if not _is_shared_doc_allowed_for_source(
+                    dkey, dver, target_source_id, binding_map
+                ):
+                    continue
+                units = db.fetchall(
+                    "SELECT unit_index, unit_title, markdown_text FROM document_units "
+                    "WHERE project_id=? AND branch=? AND doc_key=? AND version=? "
+                    "ORDER BY unit_index ASC",
+                    (proj, dbr, dkey, dver),
+                )
+                for u in units:
+                    utitle = str(u.get("unit_title") or fname)
+                    umarkdown = str(u.get("markdown_text") or "")
+                    haystack = f"{fname} {dkey} {utitle} {umarkdown}".lower()
+                    score = 0.0
+                    if q_low in haystack:
+                        score = 45.0
+                    else:
+                        for t in terms:
+                            if t in utitle.lower() or t in dkey.lower():
+                                score += 5.0
+                            elif t in haystack:
+                                score += 2.0
+                    if score > 0:
+                        matches.append(
+                            (
+                                score * 0.92,
+                                {
+                                    "id": f"shared_doc::{dkey}::u{u.get('unit_index', 0)}",
+                                    "label": utitle or fname,
+                                    "kind": "shared_doc",
+                                    "source_file": fname,
+                                    "source_location": f"{dver}#unit-{u.get('unit_index', 0)}",
+                                    "signature": None,
+                                    "docstring": _snippet(umarkdown, 220),
+                                    "source_id": "__shared__",
+                                    "branch": dbr,
+                                    "scope": "project_shared",
+                                    "via_relation": None,
+                                },
+                            )
+                        )
+                        if len(matches) >= limit:
+                            break
+    except Exception:
+        return []
+    return matches
 
 
 def lookup_project_graph_matches(
     query: str,
     user_id: Optional[str],
     limit: int = 8,
+    source_id: Optional[str] = None,
+    include_shared_docs: bool = True,
+    relation_depth: int = 1,
+    relation_types: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Query Graphify store for matching code/doc symbols safely without provisioning phantom DBs."""
+    from ..core.tenant_manager import is_multi_db_enabled, parse_tenant_spec, tenant_manager
+    from ..memory.hsg import (
+        _contract_key_overlaps_query,
+        _ctx_source_arg,
+        _is_shared_doc_allowed_for_source,
+        _load_shared_binding_map,
+        _resolve_project_root_branch,
+        collect_cross_source_relations_bfs,
+    )
+
     q_clean = (query or "").strip()
     if not q_clean or limit <= 0:
         return []
+
+    clean_arg_src = (
+        str(source_id).strip()
+        if source_id is not None and str(source_id).strip()
+        else None
+    )
 
     raw_uid = (user_id or "").strip()
     if not raw_uid or raw_uid in ("%", "*", "all"):
         target_project: Optional[str] = None
         branch = "main"
+        eff_src: Optional[str] = clean_arg_src
     else:
-        parts = raw_uid.split(":", 1)
-        target_project = parts[0].strip() or None
-        if target_project in ("%", "*", "all"):
-            target_project = None
-        raw_branch = parts[1].strip() if len(parts) > 1 else "main"
-        branch = "main" if raw_branch in ("", "%", "*") else raw_branch
+        parsed_proj, parsed_src, parsed_br = parse_tenant_spec(
+            raw_uid, default_branch="main"
+        )
+        target_project = None if parsed_proj in ("%", "*", "all") else parsed_proj
+        branch = "main" if parsed_br in ("", "%", "*") else parsed_br
+        eff_src = clean_arg_src or (
+            str(parsed_src).strip() if parsed_src else None
+        )
 
     store = None
     try:
@@ -946,7 +1129,11 @@ def lookup_project_graph_matches(
                 raw_list = raw_res
             else:
                 raw_list = []
-            return [_normalize_graph_node(n) for n in raw_list[:limit] if isinstance(n, dict)]
+            return [
+                _normalize_graph_node(n, default_source_id=eff_src, default_branch=branch)
+                for n in raw_list[:limit]
+                if isinstance(n, dict)
+            ]
 
         known_projects: List[str] = []
         if hasattr(store, "list_projects"):
@@ -955,15 +1142,14 @@ def lookup_project_graph_matches(
             except Exception:
                 known_projects = []
 
+        multi_db_active = is_multi_db_enabled()
         if target_project:
             if known_projects:
                 if target_project not in known_projects:
                     return []
                 candidate_projects = [target_project]
             else:
-                from ..core.tenant_manager import is_multi_db_enabled
-
-                if is_multi_db_enabled():
+                if multi_db_active:
                     return []
                 candidate_projects = [target_project]
         else:
@@ -977,42 +1163,98 @@ def lookup_project_graph_matches(
         collected: List[Tuple[float, Dict[str, Any]]] = []
         seen_ids = set()
 
-        for proj in candidate_projects:
+        def _collect_from_visjs_target(
+            proj: str,
+            target_src: Optional[str],
+            target_br: str,
+            scope_label: Optional[str],
+            via_rel: Optional[Dict[str, Any]],
+            weight_mult: float,
+            contract_node_ids: Optional[set] = None,
+            contract_tokens: Optional[set] = None,
+            contract_boost: float = 0.0,
+            shared_only: bool = False,
+            shared_bindings: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+            binding_target_src: Optional[str] = None,
+            out_shared_doc_keys: Optional[set] = None,
+        ) -> None:
             if not hasattr(store, "to_legacy_visjs"):
-                continue
+                return
+            if multi_db_active and target_src is not None:
+                ctx_src = _ctx_source_arg(target_src)
+                if not tenant_manager.has_branch(proj, target_br, source_id=ctx_src):
+                    return
 
-            # 1. Exact substring query via GraphStore's native Vis.js search
-            direct_vis = store.to_legacy_visjs(
-                proj, branch_name=branch, query=q_clean, limit=limit
+            def _accept_node(n: Dict[str, Any]) -> bool:
+                if shared_only:
+                    if not _node_matches_shared_filter(n):
+                        return False
+                    if shared_bindings is not None:
+                        nmeta = n.get("metadata") if isinstance(n.get("metadata"), dict) else {}
+                        dkey = nmeta.get("doc_key")
+                        dver = nmeta.get("doc_version")
+                        if not _is_shared_doc_allowed_for_source(
+                            dkey, dver, binding_target_src, shared_bindings
+                        ):
+                            return False
+                        if out_shared_doc_keys is not None and dkey:
+                            out_shared_doc_keys.add(str(dkey))
+                    return True
+                return _node_matches_target_source(n, target_src, multi_db_active)
+
+            direct_vis = _call_visjs_safe(
+                store, proj, target_br, query=q_clean, limit=limit, source_id=target_src
             )
+            local_count = 0
             for idx, n in enumerate(direct_vis.get("nodes") or []):
-                if not isinstance(n, dict):
+                if not isinstance(n, dict) or not _accept_node(n):
                     continue
                 nid = str(n.get("id") or "")
                 haystack = " ".join(
                     str(n.get(k) or "")
                     for k in ("id", "label", "qualified_name", "source_file", "docstring", "signature")
                 ).lower()
-                # Prefer true substring hits over 1-hop context neighbors
+                is_contract_node = bool(contract_node_ids and nid in contract_node_ids)
                 if q_low in haystack:
                     score = 100.0 - idx
                 elif terms and any(t in haystack for t in terms):
                     score = 50.0 - idx
+                elif is_contract_node or (
+                    contract_tokens and any(ct in haystack for ct in contract_tokens)
+                ):
+                    score = 40.0 - idx
                 else:
                     continue
-                dedup_key = f"{proj}:{nid}"
+
+                adj_score = score * weight_mult + (
+                    contract_boost if (is_contract_node or (contract_tokens and any(ct in haystack for ct in contract_tokens))) else 0.0
+                )
+                dedup_key = f"{proj}:{target_src or '__default__'}:{nid}"
                 if dedup_key not in seen_ids:
                     seen_ids.add(dedup_key)
-                    collected.append((score, _normalize_graph_node(n)))
+                    local_count += 1
+                    collected.append(
+                        (
+                            adj_score,
+                            _normalize_graph_node(
+                                n,
+                                default_source_id=target_src,
+                                default_branch=target_br,
+                                default_scope=scope_label,
+                                via_relation=via_rel,
+                            ),
+                        )
+                    )
 
-            # 2. Multi-token keyword fallback for natural-language questions
-            if len(collected) < limit and terms:
-                broad_vis = store.to_legacy_visjs(proj, branch_name=branch, limit=500)
+            if local_count < limit and (terms or contract_node_ids or contract_tokens):
+                broad_vis = _call_visjs_safe(
+                    store, proj, target_br, limit=500, source_id=target_src
+                )
                 for n in broad_vis.get("nodes") or []:
-                    if not isinstance(n, dict):
+                    if not isinstance(n, dict) or not _accept_node(n):
                         continue
                     nid = str(n.get("id") or "")
-                    dedup_key = f"{proj}:{nid}"
+                    dedup_key = f"{proj}:{target_src or '__default__'}:{nid}"
                     if dedup_key in seen_ids:
                         continue
                     label_low = str(n.get("label") or "").lower()
@@ -1030,9 +1272,138 @@ def lookup_project_graph_matches(
                             token_score += 3.0
                         elif t in doc_low:
                             token_score += 1.5
+
+                    is_contract_hit = bool(contract_node_ids and nid in contract_node_ids)
+                    if is_contract_hit:
+                        token_score += 6.0
+                    elif contract_tokens:
+                        hay_low = f"{label_low} {id_low} {file_low} {doc_low}"
+                        if any(ct in hay_low for ct in contract_tokens):
+                            token_score += 4.0
+                            is_contract_hit = True
+
                     if token_score > 0:
                         seen_ids.add(dedup_key)
-                        collected.append((token_score, _normalize_graph_node(n)))
+                        adj_score = token_score * weight_mult + (
+                            contract_boost if is_contract_hit else 0.0
+                        )
+                        collected.append(
+                            (
+                                adj_score,
+                                _normalize_graph_node(
+                                    n,
+                                    default_source_id=target_src,
+                                    default_branch=target_br,
+                                    default_scope=scope_label,
+                                    via_relation=via_rel,
+                                ),
+                            )
+                        )
+
+        for proj in candidate_projects:
+            # 1. Target sub-source (or legacy project root)
+            primary_scope = "project_shared" if eff_src == "__shared__" else "source"
+            _collect_from_visjs_target(
+                proj=proj,
+                target_src=eff_src,
+                target_br=branch,
+                scope_label=primary_scope,
+                via_rel=None,
+                weight_mult=1.0,
+            )
+
+            # 2. Shared Docs in pb_root when source_id / proj@src is queried
+            if include_shared_docs and eff_src not in (None, "__shared__"):
+                shared_br = _resolve_project_root_branch(proj)
+                shared_bindings = _load_shared_binding_map(proj)
+                found_shared_keys: set = set()
+                _collect_from_visjs_target(
+                    proj=proj,
+                    target_src="__shared__",
+                    target_br=shared_br,
+                    scope_label="project_shared",
+                    via_rel=None,
+                    weight_mult=0.92,
+                    shared_only=True,
+                    shared_bindings=shared_bindings,
+                    binding_target_src=eff_src,
+                    out_shared_doc_keys=found_shared_keys,
+                )
+                doc_unit_matches = _lookup_shared_doc_unit_matches(
+                    proj=proj,
+                    shared_br=shared_br,
+                    q_clean=q_clean,
+                    terms=terms,
+                    limit=limit,
+                    target_source_id=eff_src,
+                    binding_map=shared_bindings,
+                    existing_doc_keys=found_shared_keys,
+                )
+                for u_score, u_node in doc_unit_matches:
+                    dkey = f"{proj}:__shared__:{u_node['id']}"
+                    if dkey not in seen_ids:
+                        seen_ids.add(dkey)
+                        collected.append((u_score, u_node))
+
+            # 3. Connected sibling sub-source contract symbols (if relation_depth > 0)
+            if (
+                relation_depth > 0
+                and eff_src not in (None, "__default__", "__shared__")
+            ):
+                bfs_res = collect_cross_source_relations_bfs(
+                    project_id=proj,
+                    source_id=eff_src,
+                    branch=branch,
+                    relation_depth=relation_depth,
+                    relation_types=relation_types,
+                    expand_relations=True,
+                    include_shared_docs=include_shared_docs,
+                )
+                for (nbr_src, nbr_br), edge_cands in bfs_res["sibling_edges"].items():
+                    best_rank: Optional[Tuple[int, int, float]] = None
+                    best_choice: Optional[Tuple[int, str, Dict[str, Any], bool, float]] = None
+                    c_node_ids: set = set()
+                    c_tokens: set = set()
+                    for hop, from_src, rel_d in edge_cands:
+                        ck = str(rel_d.get("contract_key") or "")
+                        ov = _contract_key_overlaps_query(ck, q_clean)
+                        c_val = rel_d.get("confidence_score")
+                        c_sc = max(0.0, min(1.0, float(c_val if c_val is not None else 1.0)))
+                        if rel_d.get("src_source_id") == nbr_src and rel_d.get("src_node_id"):
+                            c_node_ids.add(str(rel_d["src_node_id"]))
+                        if rel_d.get("dst_source_id") == nbr_src and rel_d.get("dst_node_id"):
+                            c_node_ids.add(str(rel_d["dst_node_id"]))
+                        for tok in re.findall(r"[A-Za-z0-9_.-]{3,}", ck):
+                            low_t = tok.lower()
+                            if low_t not in _QUERY_STOPWORDS:
+                                c_tokens.add(low_t)
+                        rk = (1 if ov else 0, -hop, c_sc)
+                        if best_rank is None or rk > best_rank:
+                            best_rank = rk
+                            best_choice = (hop, from_src, rel_d, ov, c_sc)
+
+                    if best_choice is None:
+                        continue
+                    b_hop, b_from, b_rel, b_ov, b_conf = best_choice
+                    via_rel = {
+                        "relation_type": b_rel.get("relation_type"),
+                        "contract_key": b_rel.get("contract_key") or "",
+                        "from_source": b_from,
+                        "to_source": nbr_src,
+                        "hop": b_hop,
+                        "status": b_rel.get("status") or "active",
+                    }
+                    _collect_from_visjs_target(
+                        proj=proj,
+                        target_src=nbr_src,
+                        target_br=nbr_br,
+                        scope_label="related_source",
+                        via_rel=via_rel,
+                        weight_mult=(0.72 ** b_hop) * b_conf,
+                        contract_node_ids=c_node_ids,
+                        contract_tokens=c_tokens if b_ov else None,
+                        contract_boost=10.0 if b_ov else 0.0,
+                    )
 
         collected.sort(key=lambda item: item[0], reverse=True)
         return [item[1] for item in collected[:limit]]
@@ -1066,14 +1437,61 @@ def _snippet(text: Any, max_len: int = 320) -> str:
     return cleaned[: max_len - 1].rstrip() + "…"
 
 
+def _format_provenance_badge(item: Dict[str, Any]) -> str:
+    """Build a concise provenance label for multi-source memories and graph symbols."""
+    src = str(item.get("source_id") or "").strip()
+    scope = str(item.get("scope") or "").strip()
+    branch = str(item.get("branch") or "").strip()
+    via = item.get("via_relation")
+    if scope == "project_shared" or src == "__shared__":
+        return "shared:__shared__"
+    if isinstance(via, dict) and via:
+        rel_t = via.get("relation_type") or "related"
+        ck = via.get("contract_key") or ""
+        ck_s = f" {ck}" if ck else ""
+        hop = via.get("hop")
+        hop_s = f" hop {hop}" if hop else ""
+        return f"source:{src} | via {rel_t}{ck_s}{hop_s}"
+    if src and src != "__default__":
+        br_s = f":{branch}" if branch and branch != "main" else ""
+        return f"source:{src}{br_s}"
+    return ""
+
+
+def _collect_provenance_relations_from_items(
+    memories: Sequence[Dict[str, Any]],
+    graph_nodes: Sequence[Dict[str, Any]],
+    explicit_relations: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    if explicit_relations:
+        return list(explicit_relations)
+    derived: List[Dict[str, Any]] = []
+    seen = set()
+    for item in list(memories) + list(graph_nodes):
+        via = item.get("via_relation")
+        if isinstance(via, dict) and via:
+            key = (
+                via.get("from_source"),
+                via.get("to_source"),
+                via.get("relation_type"),
+                via.get("contract_key"),
+            )
+            if key not in seen:
+                seen.add(key)
+                derived.append(via)
+    return derived
+
+
 def synthesize_local_rag_answer(
     query: str,
     memories: Sequence[Dict[str, Any]],
     graph_nodes: Optional[Sequence[Dict[str, Any]]] = None,
+    cross_source_relations: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     """Synthesize a clean, structured Markdown answer offline from HSG memories & Graphify symbols."""
     mems = list(memories or [])
     nodes = list(graph_nodes or [])
+    rels = _collect_provenance_relations_from_items(mems, nodes, cross_source_relations)
 
     lines: List[str] = ["### Executive Summary"]
     mem_count = len(mems)
@@ -1099,10 +1517,14 @@ def synthesize_local_rag_answer(
         highlights: List[str] = []
         for m in mems[:2]:
             sec = str(m.get("primary_sector") or "semantic").upper()
-            highlights.append(f"- **[{sec}]** {_snippet(m.get('content'), 180)}")
+            prov = _format_provenance_badge(m)
+            prov_badge = f" (`{prov}`)" if prov else ""
+            highlights.append(f"- **[{sec}]**{prov_badge} {_snippet(m.get('content'), 180)}")
         for n in nodes[:2]:
             loc = f" (`{n['source_file']}`)" if n.get("source_file") else ""
-            highlights.append(f"- **Symbol `{n.get('label')}`** ({n.get('kind', 'symbol')}){loc}")
+            prov = _format_provenance_badge(n)
+            prov_badge = f" [`{prov}`]" if prov else ""
+            highlights.append(f"- **Symbol `{n.get('label')}`** ({n.get('kind', 'symbol')}){loc}{prov_badge}")
         if highlights:
             lines.append("")
             lines.extend(highlights[:3])
@@ -1116,8 +1538,10 @@ def synthesize_local_rag_answer(
             score_str = f" · score `{float(score):.2f}`" if isinstance(score, (int, float)) else ""
             tags_str = _format_tags(m.get("tags"))
             tags_badge = f" · tags: `{tags_str}`" if tags_str else ""
+            prov = _format_provenance_badge(m)
+            prov_badge = f" · `{prov}`" if prov else ""
             lines.append(
-                f"- **`[{sector}]`**{score_str}{tags_badge}: {_snippet(m.get('content'), 340)}"
+                f"- **`[{sector}]`**{score_str}{prov_badge}{tags_badge}: {_snippet(m.get('content'), 340)}"
             )
     else:
         lines.append(
@@ -1137,9 +1561,23 @@ def synthesize_local_rag_answer(
                 loc_suffix = f" — `{src_file}` ({src_loc})"
             elif src_file:
                 loc_suffix = f" — `{src_file}`"
+            prov = _format_provenance_badge(n)
+            prov_badge = f" · `{prov}`" if prov else ""
             doc_snip = _snippet(n.get("docstring") or n.get("signature") or "", 160)
             extra = f": {doc_snip}" if doc_snip else ""
-            lines.append(f"- **`{label}`** (`{kind}`){loc_suffix}{extra}")
+            lines.append(f"- **`{label}`** (`{kind}`){loc_suffix}{prov_badge}{extra}")
+
+    if rels:
+        lines.append("")
+        lines.append("### Cross-Source Contract Context")
+        for r in rels[:8]:
+            f_src = r.get("from_source") or r.get("src_source_id") or "?"
+            t_src = r.get("to_source") or r.get("dst_source_id") or "?"
+            r_type = r.get("relation_type") or "relates_to"
+            ck = r.get("contract_key") or ""
+            st = r.get("status") or "active"
+            ck_str = f" `{ck}`" if ck else ""
+            lines.append(f"- `{f_src}` --[{r_type}{ck_str}]--> `{t_src}` (status: `{st}`)")
 
     lines.append("")
     lines.append(
@@ -1154,10 +1592,12 @@ def synthesize_local_pm_doc(
     doc_type: str,
     memories: Sequence[Dict[str, Any]],
     graph_nodes: Optional[Sequence[Dict[str, Any]]] = None,
+    cross_source_relations: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     """Draft a structured PM document (`status_report`, `prd`, `user_story`, `roadmap`) offline."""
     mems = list(memories or [])
     nodes = list(graph_nodes or [])
+    rels = _collect_provenance_relations_from_items(mems, nodes, cross_source_relations)
     dtype = (doc_type or "status_report").strip().lower()
 
     completed_items: List[str] = []
@@ -1170,23 +1610,28 @@ def synthesize_local_pm_doc(
         if not text:
             continue
         sec = str(m.get("primary_sector") or "semantic").lower()
+        prov = _format_provenance_badge(m)
+        prefix = f"[{sec} | {prov}]" if prov else f"[{sec}]"
         low = text.lower()
         if any(k in low for k in ("risk", "bug", "error", "fail", "issue", "blocker", "warn", "vulnerability")):
-            risk_items.append(f"[{sec}] {text}")
+            risk_items.append(f"{prefix} {text}")
         elif any(k in low for k in ("done", "completed", "shipped", "implemented", "merged", "fixed", "released")):
-            completed_items.append(f"[{sec}] {text}")
+            completed_items.append(f"{prefix} {text}")
         elif any(k in low for k in ("wip", "in progress", "todo", "next", "plan", "pending", "working on")):
-            active_items.append(f"[{sec}] {text}")
+            active_items.append(f"{prefix} {text}")
         else:
-            general_items.append(f"[{sec}] {text}")
+            general_items.append(f"{prefix} {text}")
 
     all_facts = completed_items + active_items + general_items + risk_items
 
-    symbol_bullets = [
-        f"- **`{n.get('label')}`** (`{n.get('kind', 'symbol')}`)"
-        + (f" in `{n['source_file']}`" if n.get("source_file") else "")
-        for n in nodes[:10]
-    ]
+    symbol_bullets: List[str] = []
+    for n in nodes[:10]:
+        prov = _format_provenance_badge(n)
+        prov_part = f" · `{prov}`" if prov else ""
+        loc_part = f" in `{n['source_file']}`" if n.get("source_file") else ""
+        symbol_bullets.append(
+            f"- **`{n.get('label')}`** (`{n.get('kind', 'symbol')}`){loc_part}{prov_part}"
+        )
 
     lines: List[str] = []
 
@@ -1314,6 +1759,17 @@ def synthesize_local_pm_doc(
         if symbol_bullets:
             lines.extend(["", "## Referenced Code & Knowledge Graph Symbols", *symbol_bullets])
 
+    if rels:
+        lines.extend(["", "## Cross-Source Dependencies & Contracts"])
+        for r in rels[:10]:
+            f_src = r.get("from_source") or r.get("src_source_id") or "?"
+            t_src = r.get("to_source") or r.get("dst_source_id") or "?"
+            r_type = r.get("relation_type") or "relates_to"
+            ck = r.get("contract_key") or ""
+            st = r.get("status") or "active"
+            ck_str = f" `{ck}`" if ck else ""
+            lines.append(f"- `{f_src}` --[{r_type}{ck_str}]--> `{t_src}` (status: `{st}`)")
+
     lines.append("")
     lines.append(
         "> 💡 *Generated offline by ProjectBrain Local RAG Engine (zero API key required). "
@@ -1409,16 +1865,35 @@ def _build_rag_prompt(
     query: str,
     memories: Sequence[Dict[str, Any]],
     graph_nodes: Sequence[Dict[str, Any]],
+    cross_source_relations: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
-    mem_lines = [
-        f"- [{m.get('primary_sector')} | Tag: {m.get('tags')}] {m.get('content')}"
-        for m in memories
-    ]
-    graph_lines = [
-        f"- [Symbol: {n.get('label')} ({n.get('kind')}) | File: {n.get('source_file') or 'n/a'}"
-        + (f" {n.get('source_location')}" if n.get("source_location") else "")
-        + f"] {n.get('docstring') or n.get('signature') or ''}".rstrip()
-        for n in graph_nodes
+    mem_lines: List[str] = []
+    for m in memories:
+        prov = _format_provenance_badge(m)
+        prov_part = f" | {prov}" if prov else ""
+        mem_lines.append(
+            f"- [{m.get('primary_sector')} | Tag: {m.get('tags')}{prov_part}] {m.get('content')}"
+        )
+
+    graph_lines: List[str] = []
+    for n in graph_nodes:
+        prov = _format_provenance_badge(n)
+        prov_part = f" | {prov}" if prov else ""
+        loc_part = f" {n.get('source_location')}" if n.get("source_location") else ""
+        graph_lines.append(
+            (
+                f"- [Symbol: {n.get('label')} ({n.get('kind')}) | File: {n.get('source_file') or 'n/a'}"
+                f"{loc_part}{prov_part}] {n.get('docstring') or n.get('signature') or ''}"
+            ).rstrip()
+        )
+
+    rels = _collect_provenance_relations_from_items(
+        memories, graph_nodes, cross_source_relations
+    )
+    rel_lines = [
+        f"- {r.get('from_source') or r.get('src_source_id')} --[{r.get('relation_type')} {r.get('contract_key') or ''}]--> "
+        f"{r.get('to_source') or r.get('dst_source_id')} (status={r.get('status') or 'active'})"
+        for r in rels
     ]
 
     sections: List[str] = []
@@ -1426,6 +1901,8 @@ def _build_rag_prompt(
         sections.append("Project cognitive memories:\n" + "\n".join(mem_lines))
     if graph_lines:
         sections.append("Matching code & knowledge graph symbols:\n" + "\n".join(graph_lines))
+    if rel_lines:
+        sections.append("Cross-source contract relations:\n" + "\n".join(rel_lines))
     context_block = "\n\n".join(sections) if sections else "(No matching context)"
 
     return f"""You are a smart AI assistant supporting a PM and engineering team.
@@ -1443,6 +1920,7 @@ def _build_pm_doc_prompt(
     doc_type: str,
     memories: Sequence[Dict[str, Any]],
     graph_nodes: Sequence[Dict[str, Any]],
+    cross_source_relations: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     doc_instructions = {
         "status_report": "Project Status Report including completed tasks, in-progress work, and identified risks.",
@@ -1452,14 +1930,32 @@ def _build_pm_doc_prompt(
     }
     instruction = doc_instructions.get(doc_type, doc_instructions["status_report"])
 
-    mem_context = "\n".join(
-        f"- [{m.get('primary_sector')}] {m.get('content')}" for m in memories
-    ) or "(No cognitive memories matched)"
-    graph_context = "\n".join(
-        f"- {n.get('label')} ({n.get('kind')}) in {n.get('source_file') or 'n/a'}"
-        for n in graph_nodes
-    )
+    mem_lines: List[str] = []
+    for m in memories:
+        prov = _format_provenance_badge(m)
+        prov_part = f" | {prov}" if prov else ""
+        mem_lines.append(f"- [{m.get('primary_sector')}{prov_part}] {m.get('content')}")
+    mem_context = "\n".join(mem_lines) or "(No cognitive memories matched)"
+
+    graph_lines: List[str] = []
+    for n in graph_nodes:
+        prov = _format_provenance_badge(n)
+        prov_part = f" [{prov}]" if prov else ""
+        graph_lines.append(
+            f"- {n.get('label')} ({n.get('kind')}) in {n.get('source_file') or 'n/a'}{prov_part}"
+        )
+    graph_context = "\n".join(graph_lines)
     extra_graph = f"\n\nMatching code & architecture symbols:\n{graph_context}" if graph_context else ""
+
+    rels = _collect_provenance_relations_from_items(
+        memories, graph_nodes, cross_source_relations
+    )
+    rel_context = "\n".join(
+        f"- {r.get('from_source') or r.get('src_source_id')} --[{r.get('relation_type')} {r.get('contract_key') or ''}]--> "
+        f"{r.get('to_source') or r.get('dst_source_id')} (status={r.get('status') or 'active'})"
+        for r in rels
+    )
+    extra_rels = f"\n\nCross-source dependencies & contracts:\n{rel_context}" if rel_context else ""
 
     return f"""You are an outstanding Product Manager expert.
 Your task is to draft a document: {instruction}
@@ -1468,7 +1964,7 @@ Please base your writing on the actual facts collected from the project memories
 PM Request: {prompt}
 
 Actual project memories collected:
-{mem_context}{extra_graph}
+{mem_context}{extra_graph}{extra_rels}
 """
 
 
@@ -1476,29 +1972,35 @@ async def run_rag_chat(
     query: str,
     memories: Sequence[Dict[str, Any]],
     graph_nodes: Optional[Sequence[Dict[str, Any]]] = None,
+    source_id: Optional[str] = None,
+    include_shared_docs: bool = True,
+    relation_depth: int = 1,
+    relation_types: Optional[List[str]] = None,
+    cross_source_relations: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Execute multi-provider RAG answer generation with automatic zero-key Local RAG fallback."""
     eff = get_effective_ai_settings()
     mems = list(memories or [])
     nodes = list(graph_nodes or [])
+    rels = list(cross_source_relations or [])
     provider = eff["provider"]
 
     if provider == "local_rag":
         return {
-            "answer": synthesize_local_rag_answer(query, mems, nodes),
+            "answer": synthesize_local_rag_answer(query, mems, nodes, rels),
             "provider_used": "local_rag",
             "model_used": LOCAL_RAG_MODEL_ID,
             "provider_label": LOCAL_RAG_LABEL,
             "fallback_reason": None,
         }
 
-    messages = [{"role": "user", "content": _build_rag_prompt(query, mems, nodes)}]
+    messages = [{"role": "user", "content": _build_rag_prompt(query, mems, nodes, rels)}]
 
     if provider == "auto":
         candidate = await _select_auto_llm_candidate(eff)
         if candidate is None:
             return {
-                "answer": synthesize_local_rag_answer(query, mems, nodes),
+                "answer": synthesize_local_rag_answer(query, mems, nodes, rels),
                 "provider_used": "local_rag",
                 "model_used": LOCAL_RAG_MODEL_ID,
                 "provider_label": LOCAL_RAG_LABEL,
@@ -1529,7 +2031,7 @@ async def run_rag_chat(
                     f"[AI-RAG] Auto provider '{cand_provider}' failed ({clean_err}); falling back to Local RAG."
                 )
                 return {
-                    "answer": synthesize_local_rag_answer(query, mems, nodes),
+                    "answer": synthesize_local_rag_answer(query, mems, nodes, rels),
                     "provider_used": "local_rag",
                     "model_used": LOCAL_RAG_MODEL_ID,
                     "provider_label": LOCAL_RAG_LABEL,
@@ -1562,7 +2064,7 @@ async def run_rag_chat(
                 f"[AI-RAG] Provider '{provider}' failed ({clean_err}); falling back to Local RAG."
             )
             return {
-                "answer": synthesize_local_rag_answer(query, mems, nodes),
+                "answer": synthesize_local_rag_answer(query, mems, nodes, rels),
                 "provider_used": "local_rag",
                 "model_used": LOCAL_RAG_MODEL_ID,
                 "provider_label": LOCAL_RAG_LABEL,
@@ -1576,29 +2078,35 @@ async def run_pm_doc_generation(
     doc_type: str,
     memories: Sequence[Dict[str, Any]],
     graph_nodes: Optional[Sequence[Dict[str, Any]]] = None,
+    source_id: Optional[str] = None,
+    include_shared_docs: bool = True,
+    relation_depth: int = 1,
+    relation_types: Optional[List[str]] = None,
+    cross_source_relations: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Execute multi-provider PM Copilot document generation with automatic Local RAG fallback."""
     eff = get_effective_ai_settings()
     mems = list(memories or [])
     nodes = list(graph_nodes or [])
+    rels = list(cross_source_relations or [])
     provider = eff["provider"]
 
     if provider == "local_rag":
         return {
-            "document": synthesize_local_pm_doc(prompt, doc_type, mems, nodes),
+            "document": synthesize_local_pm_doc(prompt, doc_type, mems, nodes, rels),
             "provider_used": "local_rag",
             "model_used": LOCAL_RAG_MODEL_ID,
             "provider_label": LOCAL_RAG_LABEL,
             "fallback_reason": None,
         }
 
-    messages = [{"role": "user", "content": _build_pm_doc_prompt(prompt, doc_type, mems, nodes)}]
+    messages = [{"role": "user", "content": _build_pm_doc_prompt(prompt, doc_type, mems, nodes, rels)}]
 
     if provider == "auto":
         candidate = await _select_auto_llm_candidate(eff)
         if candidate is None:
             return {
-                "document": synthesize_local_pm_doc(prompt, doc_type, mems, nodes),
+                "document": synthesize_local_pm_doc(prompt, doc_type, mems, nodes, rels),
                 "provider_used": "local_rag",
                 "model_used": LOCAL_RAG_MODEL_ID,
                 "provider_label": LOCAL_RAG_LABEL,
@@ -1629,7 +2137,7 @@ async def run_pm_doc_generation(
                     f"[AI-DOC] Auto provider '{cand_provider}' failed ({clean_err}); falling back to Local RAG."
                 )
                 return {
-                    "document": synthesize_local_pm_doc(prompt, doc_type, mems, nodes),
+                    "document": synthesize_local_pm_doc(prompt, doc_type, mems, nodes, rels),
                     "provider_used": "local_rag",
                     "model_used": LOCAL_RAG_MODEL_ID,
                     "provider_label": LOCAL_RAG_LABEL,
@@ -1662,7 +2170,7 @@ async def run_pm_doc_generation(
                 f"[AI-DOC] Provider '{provider}' failed ({clean_err}); falling back to Local RAG."
             )
             return {
-                "document": synthesize_local_pm_doc(prompt, doc_type, mems, nodes),
+                "document": synthesize_local_pm_doc(prompt, doc_type, mems, nodes, rels),
                 "provider_used": "local_rag",
                 "model_used": LOCAL_RAG_MODEL_ID,
                 "provider_label": LOCAL_RAG_LABEL,

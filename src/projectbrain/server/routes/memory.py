@@ -4,7 +4,10 @@ from fastapi import APIRouter, HTTPException, Body
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 from ...main import Memory
-from ...memory.hsg import invalidate_query_cache
+from ...memory.hsg import (
+    invalidate_query_cache,
+    resolve_cross_source_relations_summary,
+)
 
 mem = Memory()
 
@@ -25,6 +28,7 @@ class AddMemoryRequest(BaseModel):
     tags: Optional[List[str]] = []
     metadata: Optional[Dict[str, Any]] = {}
     author: Optional[str] = None
+    source_id: Optional[str] = None
 
 
 class SearchMemoryRequest(BaseModel):
@@ -33,6 +37,10 @@ class SearchMemoryRequest(BaseModel):
     limit: Optional[int] = 10
     filters: Optional[Dict[str, Any]] = {}
     author: Optional[str] = None
+    source_id: Optional[str] = None
+    include_shared_docs: bool = True
+    relation_depth: int = 1
+    relation_types: Optional[List[str]] = None
 
 
 class DeleteAllRequest(BaseModel):
@@ -43,11 +51,13 @@ class DeleteAllRequest(BaseModel):
 async def add_memory(req: AddMemoryRequest):
     _check_read_only()
     try:
-        meta = req.metadata or {}
+        meta = dict(req.metadata or {})
         if req.tags:
             meta["tags"] = req.tags
         if req.author:
             meta["author"] = req.author
+        if req.source_id is not None and str(req.source_id).strip():
+            meta["source_id"] = str(req.source_id).strip()
 
         result = await mem.add(req.content, user_id=req.user_id, meta=meta, tags=req.tags)
         invalidate_query_cache()
@@ -65,9 +75,40 @@ async def search_memory(req: SearchMemoryRequest):
         logger = logging.getLogger("server")
         logger.info(f"User '{req.author or 'anonymous'}' searched: '{req.query}' on project '{req.user_id or 'all'}'")
 
-        filters = req.filters or {}
-        results = await mem.search(req.query, user_id=req.user_id, limit=req.limit, **filters)
-        return {"results": results}
+        filters = dict(req.filters or {})
+        eff_source_id = (
+            req.source_id
+            if req.source_id is not None
+            else filters.pop("source_id", None)
+        )
+        eff_include_shared = bool(
+            filters.pop("include_shared_docs", req.include_shared_docs)
+        )
+        eff_rel_depth = int(filters.pop("relation_depth", req.relation_depth))
+        eff_rel_types = filters.pop("relation_types", req.relation_types)
+
+        results = await mem.search(
+            req.query,
+            user_id=req.user_id,
+            limit=req.limit,
+            source_id=eff_source_id,
+            include_shared_docs=eff_include_shared,
+            relation_depth=eff_rel_depth,
+            relation_types=eff_rel_types,
+            **filters,
+        )
+        cross_source_relations = resolve_cross_source_relations_summary(
+            req.user_id,
+            source_id=eff_source_id,
+            relation_depth=eff_rel_depth,
+            relation_types=eff_rel_types,
+            include_shared_docs=eff_include_shared,
+            include_sources=filters.get("include_sources"),
+        )
+        return {
+            "results": results,
+            "cross_source_relations": cross_source_relations,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

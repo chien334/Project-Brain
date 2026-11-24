@@ -1,6 +1,7 @@
 import sys
 import os
 import asyncio
+import inspect
 import json
 import sqlite3
 import traceback
@@ -8,6 +9,7 @@ import datetime
 import logging
 from typing import Optional, List, Dict, Any, Union, Tuple
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 logger = logging.getLogger("mcp")
 
@@ -83,6 +85,185 @@ def resolve_mcp_user_id(user_id: str = None) -> str:
     return uid or "default"
 def check_read_only() -> bool:
     return os.getenv("PB_READ_ONLY", "false").lower() in ("true", "1", "yes") or os.getenv("OM_READ_ONLY", "false").lower() in ("true", "1", "yes")
+
+
+def _filter_supported_kwargs(fn: Any, candidate_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Return subset of `candidate_kwargs` accepted by `fn` (safe across gradual Wave 3A rollout)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(candidate_kwargs)
+    return {k: v for k, v in candidate_kwargs.items() if k in params}
+
+
+def _resolve_project_source_branch(
+    project_id: Optional[str],
+    source_id: Optional[str] = None,
+    branch: str = "main",
+    scope: Optional[str] = None,
+) -> Tuple[str, Optional[str], str]:
+    """Resolve `(base_project_id, effective_source_id, target_branch)` from MCP inputs."""
+    from ..core.tenant_manager import parse_tenant_spec
+
+    raw_src = str(source_id).strip() if isinstance(source_id, str) and source_id.strip() else None
+    resolved = resolve_mcp_user_id(project_id)
+    eff_default_branch = (branch or "main").strip() or "main"
+    proj, parsed_src, parsed_br = parse_tenant_spec(
+        resolved,
+        default_branch=eff_default_branch,
+        default_source=raw_src,
+    )
+    if raw_src is not None and "@" not in str(resolved or ""):
+        eff_src: Optional[str] = raw_src
+    else:
+        eff_src = parsed_src
+
+    if eff_src == "__default__":
+        eff_src = None
+
+    clean_scope = str(scope or "").strip()
+    if clean_scope == "project_shared" and eff_src is None:
+        eff_src = "__shared__"
+
+    if ":" in str(resolved or "") and (branch is None or branch == "main"):
+        eff_branch = parsed_br or "main"
+    else:
+        eff_branch = eff_default_branch
+    return proj, eff_src, eff_branch
+
+
+def _format_graph_target(
+    project_id: str,
+    source_id: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> str:
+    """Format `project_id` or `project_id@source_id` for GraphStore / KB routing."""
+    clean_src = str(source_id).strip() if isinstance(source_id, str) and source_id.strip() else None
+    if clean_src and clean_src != "__default__":
+        return f"{project_id}@{clean_src}"
+    if str(scope or "").strip() == "project_shared":
+        return f"{project_id}@__shared__"
+    return project_id
+
+
+def _format_mem_user_id(
+    project_id: str,
+    branch: str = "main",
+    source_id: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> str:
+    """Format `user_id` (`proj[@src][:branch]`) for HSG memory routing."""
+    base = _format_graph_target(project_id, source_id=source_id, scope=scope)
+    clean_br = (branch or "").strip()
+    if clean_br and (clean_br != "main" or "@" in base):
+        return f"{base}:{clean_br}"
+    return base
+
+
+def _extract_cross_source_provenance(item: Dict[str, Any]) -> Tuple[Optional[str], str, Optional[Any]]:
+    """Extract `(source_id, scope, via_relation)` provenance from a search result item."""
+    from ..core.tenant_manager import parse_tenant_spec
+
+    meta = item.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    raw_src = item.get("source_id") or meta.get("source_id")
+    if not raw_src and item.get("user_id"):
+        _, parsed_src, _ = parse_tenant_spec(str(item["user_id"]))
+        raw_src = parsed_src
+    eff_src = str(raw_src).strip() if raw_src else None
+    if eff_src == "__default__":
+        eff_src = None
+
+    raw_scope = item.get("scope") or meta.get("scope")
+    if raw_scope:
+        eff_scope = str(raw_scope).strip()
+    elif eff_src == "__shared__":
+        eff_scope = "project_shared"
+    else:
+        eff_scope = "source"
+
+    via_rel = item.get("via_relation") if item.get("via_relation") is not None else meta.get("via_relation")
+    return eff_src, eff_scope, via_rel
+
+
+def _record_source_upgrade_and_auto_link(
+    *,
+    project_id: str,
+    source_id: Optional[str],
+    branch: str,
+    source_version: Optional[str],
+    upgrade_mode: str = "delta",
+    auto_link_sources: bool = True,
+    workspace_path: Optional[str] = None,
+    nodes_delta: int = 0,
+    edges_delta: int = 0,
+    docs_updated: int = 0,
+) -> Dict[str, Any]:
+    """Record optional sub-source upgrade telemetry and run cross-source auto-linking."""
+    from ..core.tenant_manager import parse_tenant_from_user_id, tenant_manager
+
+    base_proj = parse_tenant_from_user_id(project_id)[0]
+    eff_src = str(source_id).strip() if isinstance(source_id, str) and source_id.strip() else None
+    out: Dict[str, Any] = {}
+
+    if eff_src and eff_src not in ("__default__", "__shared__"):
+        try:
+            existing = tenant_manager.get_project_source(base_proj, eff_src)
+            if existing is None:
+                tenant_manager.register_project_source(
+                    base_proj,
+                    eff_src,
+                    workspace_subpath=workspace_path,
+                    current_version=source_version or "1.0.0",
+                )
+            if source_version or (upgrade_mode and upgrade_mode != "delta"):
+                upg = tenant_manager.record_source_upgrade(
+                    project_id=base_proj,
+                    source_id=eff_src,
+                    branch_name=branch or "main",
+                    to_version=source_version or (existing.get("current_version") if existing else "1.0.0"),
+                    upgrade_mode=upgrade_mode or "delta",
+                    nodes_delta=nodes_delta,
+                    edges_delta=edges_delta,
+                    docs_updated=docs_updated,
+                    actor=os.getenv("USER", "mcp"),
+                )
+                out["upgrade"] = upg
+        except Exception as exc:
+            logger.debug(f"Source upgrade tracking skipped for {base_proj}@{eff_src}: {exc}")
+
+    if auto_link_sources:
+        try:
+            reg_sources = tenant_manager.list_project_sources(base_proj)
+            if eff_src or reg_sources:
+                from ..graphify_engine.cross_source_linker import CrossSourceLinker
+
+                ws_map = None
+                if eff_src and workspace_path and os.path.exists(workspace_path):
+                    ws_map = {eff_src: workspace_path}
+                linker = CrossSourceLinker()
+                link_res = linker.auto_link_project(
+                    project_id=base_proj,
+                    source_id=eff_src if eff_src and eff_src != "__shared__" else None,
+                    branch=branch or "main",
+                    workspace_map=ws_map,
+                )
+                out["cross_source_linking"] = link_res
+        except Exception as exc:
+            logger.debug(f"Auto-link skipped for {base_proj}: {exc}")
+
+    return out
+
+
 @mcp_server.tool(name="projectbrain_query", description="Query ProjectBrain for contextual memories (HSG) and/or temporal facts")
 async def projectbrain_query(
     query: str,
@@ -92,7 +273,11 @@ async def projectbrain_query(
     k: int = 10,
     user_id: str = None,
     sector: str = None,
-    author: str = None
+    author: str = None,
+    source_id: Optional[str] = None,
+    include_shared_docs: bool = True,
+    relation_depth: int = 1,
+    relation_types: Optional[List[str]] = None,
 ) -> str:
     """
     Query ProjectBrain for contextual memories (HSG) and/or temporal facts.
@@ -106,6 +291,10 @@ async def projectbrain_query(
         user_id: Isolate results to specific user.
         sector: Restrict to sector (lexical, semantic, etc).
         author: Optional name of the user performing the search.
+        source_id: Optional sub-source ID for scoped/cross-source retrieval.
+        include_shared_docs: Include project-shared documents (default True).
+        relation_depth: Cross-source relation expansion depth (0 disables expansion, default 1).
+        relation_types: Optional list of cross-source relation types to traverse.
     """
     try:
         import getpass
@@ -130,18 +319,70 @@ async def projectbrain_query(
         
         # contextual (hsg) query
         if qtype in ["contextual", "unified"]:
-            filters = {}
-            if sector: filters["sector"] = sector
-            
-            contextual = await mem.search(query, user_id=uid, limit=limit, **filters)
-            results["contextual"] = [{
-                "source": "hsg",
-                "id": m.get("id"),
-                "score": round(m.get("score", 0), 4),
-                "primary_sector": m.get("primary_sector"),
-                "salience": round(m.get("salience", 0), 4),
-                "content": m.get("content")
-            } for m in contextual]
+            filters: Dict[str, Any] = {}
+            if sector:
+                filters["sector"] = sector
+            has_cross_source_args = (
+                source_id is not None
+                or "@" in str(uid or "")
+                or include_shared_docs is not True
+                or relation_depth != 1
+                or relation_types is not None
+            )
+            if has_cross_source_args:
+                if source_id is not None:
+                    filters["source_id"] = source_id
+                filters["include_shared_docs"] = include_shared_docs
+                filters["relation_depth"] = relation_depth
+                if relation_types is not None:
+                    filters["relation_types"] = relation_types
+
+            if is_pb_remote_mode():
+                import httpx
+                server_url = get_pb_server_url()
+                api_key = get_pb_api_key()
+                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                payload: Dict[str, Any] = {
+                    "query": query,
+                    "user_id": uid,
+                    "limit": limit,
+                    "filters": filters,
+                    "include_shared_docs": include_shared_docs,
+                    "relation_depth": relation_depth,
+                }
+                if source_id is not None:
+                    payload["source_id"] = source_id
+                if relation_types is not None:
+                    payload["relation_types"] = relation_types
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        f"{server_url}/memory/search",
+                        json=payload,
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    contextual = resp.json().get("results") or []
+            else:
+                contextual = await mem.search(query, user_id=uid, limit=limit, **filters)
+
+            contextual_out = []
+            for m in contextual:
+                m_src, m_scope, m_via_rel = _extract_cross_source_provenance(m)
+                entry: Dict[str, Any] = {
+                    "source": "hsg",
+                    "id": m.get("id"),
+                    "score": round(m.get("score", 0), 4),
+                    "primary_sector": m.get("primary_sector"),
+                    "salience": round(m.get("salience", 0), 4),
+                    "source_id": m_src,
+                    "scope": m_scope,
+                    "via_relation": m_via_rel,
+                    "content": m.get("content"),
+                }
+                if m.get("via_contract") is not None:
+                    entry["via_contract"] = m.get("via_contract")
+                contextual_out.append(entry)
+            results["contextual"] = contextual_out
         
         # temporal fact query
         if qtype in ["factual", "unified"]:
@@ -552,7 +793,11 @@ async def projectbrain_sync_codegraph(
     branch: str = None, 
     sync_memories: bool = True,
     author: str = None,
-    base_branch: Optional[str] = None
+    base_branch: Optional[str] = None,
+    source_id: Optional[str] = None,
+    source_version: Optional[str] = None,
+    upgrade_mode: str = "delta",
+    auto_link_sources: bool = True,
 ) -> str:
     """
     Synchronize the local codegraph database (.codegraph/codegraph.db in current working directory or specified project path)
@@ -565,19 +810,35 @@ async def projectbrain_sync_codegraph(
         sync_memories: If True (default), scans and ingests all text source files as memories.
         author: Optional name of the user performing the sync.
         base_branch: Optional parent/base branch for delta-only memory sync and overlay inheritance.
+        source_id: Optional sub-source ID within a multi-source project.
+        source_version: Optional semantic version or build tag for source upgrade history.
+        upgrade_mode: Upgrade mode ('delta' or 'full_replace').
+        auto_link_sources: If True (default), automatically reconciles cross-source links after sync.
     """
     import shutil
     import subprocess
     
     if check_read_only():
         return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
-        
+
+    from ..core.tenant_manager import parse_tenant_spec
+    parsed_proj, parsed_src, parsed_br = parse_tenant_spec(
+        project_id, default_branch=branch or "main", default_source=source_id
+    )
+    eff_source = (
+        str(source_id).strip()
+        if isinstance(source_id, str) and source_id.strip()
+        else (parsed_src if parsed_src != "__default__" else None)
+    )
+    if eff_source == "__default__":
+        eff_source = None
+
     projects_root = os.getenv("PB_PROJECTS_ROOT_DIR") or os.getenv("OM_PROJECTS_ROOT_DIR")
     
     if projects_root:
         projects_root_resolved = Path(projects_root).resolve()
         projects_root = str(projects_root_resolved)
-        project_dir_name = project_id.split(":")[0]
+        project_dir_name = parsed_proj
         if project_path:
             if os.path.isabs(project_path):
                 resolved_project_path = os.path.abspath(project_path)
@@ -627,7 +888,7 @@ async def projectbrain_sync_codegraph(
         
     resolved_project_path = os.path.abspath(target_dir)
 
-    is_server_project = project_id.split(":")[0] in ["openmemory", "projectbrain", "test-project"]
+    is_server_project = parsed_proj in ["openmemory", "projectbrain", "test-project"]
     is_server_dir = False
     if not is_server_project:
         is_server_dir = os.path.exists(os.path.join(resolved_project_path, "src", "projectbrain", "main.py"))
@@ -756,6 +1017,8 @@ async def projectbrain_sync_codegraph(
         
         # Auto-detect git branch if branch is not explicitly provided
         resolved_branch = branch
+        if not resolved_branch and ":" in str(project_id or ""):
+            resolved_branch = parsed_br
         if not resolved_branch:
             try:
                 git_bin = shutil.which("git")
@@ -765,18 +1028,16 @@ async def projectbrain_sync_codegraph(
                         resolved_branch = res_git.stdout.strip()
             except Exception:
                 pass
-                
+
+        graph_proj = _format_graph_target(parsed_proj, eff_source)
         if resolved_branch:
-            if ":" in project_id:
-                base_id, _ = project_id.split(":", 1)
-                sync_project_id = f"{base_id}:{resolved_branch}"
-            else:
-                sync_project_id = f"{project_id}:{resolved_branch}"
+            sync_project_id = f"{graph_proj}:{resolved_branch}"
         else:
-            sync_project_id = project_id
- 
+            sync_project_id = graph_proj
+
         from ..server.routes.codegraph import sync_codegraph_data, SyncRequest
-        
+        import getpass
+
         resolved_author = author or os.getenv("PB_USER_NAME") or os.getenv("OM_USER_NAME") or os.getenv("USER") or getpass.getuser() or "anonymous-mcp"
         
         req = SyncRequest(
@@ -791,10 +1052,17 @@ async def projectbrain_sync_codegraph(
         if mem.mode == "remote":
             import httpx
             headers = {"Authorization": f"Bearer {mem.api_key}"} if mem.api_key else {}
+            req_payload = req.dict()
+            if eff_source:
+                req_payload["source_id"] = eff_source
+            if source_version is not None:
+                req_payload["source_version"] = source_version
+            req_payload["upgrade_mode"] = upgrade_mode
+            req_payload["auto_link_sources"] = auto_link_sources
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
                     f"{mem.url}/codegraph/sync",
-                    json=req.dict(),
+                    json=req_payload,
                     headers=headers,
                     timeout=120.0
                 )
@@ -819,7 +1087,24 @@ async def projectbrain_sync_codegraph(
                 from ..memory.hsg import invalidate_query_cache
                 register_memory_branch(proj, br, base_branch)
                 invalidate_query_cache()
-            
+
+        if eff_source:
+            res["source_id"] = eff_source
+        if mem.mode != "remote":
+            extra = _record_source_upgrade_and_auto_link(
+                project_id=parsed_proj,
+                source_id=eff_source,
+                branch=resolved_branch or "main",
+                source_version=source_version,
+                upgrade_mode=upgrade_mode,
+                auto_link_sources=auto_link_sources,
+                workspace_path=resolved_project_path,
+                nodes_delta=len(nodes),
+                edges_delta=len(edges),
+                docs_updated=(mem_res or {}).get("total_ingested", 0) if isinstance(mem_res, dict) else 0,
+            )
+            res.update(extra)
+
         return json.dumps(res, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
@@ -994,7 +1279,10 @@ async def projectbrain_query_codegraph(
     query: str = None,
     kinds: str = None,
     node_id: str = None,
-    follow_connections: bool = False
+    follow_connections: bool = False,
+    source_id: Optional[str] = None,
+    include_shared_docs: bool = True,
+    relation_depth: int = 1,
 ) -> str:
     """
     Query ProjectBrain's codebase structure graph (codegraph) to find classes, functions, files, variables, clients, servers, and trace their connections (edges) in the project.
@@ -1005,9 +1293,28 @@ async def projectbrain_query_codegraph(
         kinds: Comma-separated list of node kinds to filter by (e.g., 'class,function,method,file,variable,server,client').
         node_id: Specific node ID to fetch details for.
         follow_connections: If True, returns incoming and outgoing edges and connected nodes for the matching nodes or the specified node_id.
+        source_id: Optional sub-source ID; routes lookup to `project_id@source_id`.
+        include_shared_docs: Include shared document bindings for this project/source (default True).
+        relation_depth: Cross-source relation expansion depth (default 1).
     """
     try:
-        uid = resolve_mcp_user_id(project_id)
+        from ..core.tenant_manager import parse_tenant_spec, tenant_manager
+
+        raw_uid = resolve_mcp_user_id(project_id)
+        base_proj, parsed_src, parsed_br = parse_tenant_spec(
+            raw_uid, default_branch="main", default_source=source_id
+        )
+        eff_source = (
+            str(source_id).strip()
+            if isinstance(source_id, str) and source_id.strip()
+            else (parsed_src if parsed_src != "__default__" else None)
+        )
+        if eff_source == "__default__":
+            eff_source = None
+
+        graph_target = _format_graph_target(base_proj, eff_source)
+        uid = f"{graph_target}:{parsed_br}" if ":" in str(raw_uid or "") else graph_target
+
         db.connect()
         cursor = db.conn.cursor()
         
@@ -1072,30 +1379,23 @@ async def projectbrain_query_codegraph(
                 else:
                     nodes.append(dict(r))
 
+        edges = []
+        used_graphify_fallback = False
         if not nodes:
             try:
-                from ..graphify_engine.store import get_graph_store
                 store = _get_mcp_graph_store()
                 try:
-                    proj_name = uid.split(":")[0] if ":" in uid else uid
-                    branch_name = uid.split(":")[1] if ":" in uid else "main"
-                    vis = store.to_legacy_visjs(project_id=proj_name, branch_name=branch_name, query=query, kinds=kinds)
+                    vis = store.to_legacy_visjs(project_id=graph_target, branch_name=parsed_br, query=query, kinds=kinds)
                 finally:
                     store.close()
                 if vis.get("nodes"):
-                    cursor.close()
-                    return json.dumps({
-                        "project_id": uid,
-                        "nodes_count": len(vis["nodes"]),
-                        "edges_count": len(vis["edges"]),
-                        "nodes": vis["nodes"],
-                        "edges": vis["edges"]
-                    }, indent=2)
+                    nodes = vis["nodes"]
+                    edges = vis.get("edges", [])
+                    used_graphify_fallback = True
             except Exception:
                 pass
                     
-        edges = []
-        if follow_connections and nodes:
+        if follow_connections and nodes and not used_graphify_fallback:
             node_ids = [n["id"] for n in nodes]
             if len(node_ids) > 0:
                 # Query edges
@@ -1126,14 +1426,42 @@ async def projectbrain_query_codegraph(
                         edges.append(d)
                         
         cursor.close()
+
+        cross_source_relations: List[Dict[str, Any]] = []
+        if follow_connections or (relation_depth and relation_depth > 0):
+            try:
+                rels = tenant_manager.list_cross_source_relations(
+                    base_proj,
+                    source_id=eff_source,
+                    branch=parsed_br,
+                )
+                cross_source_relations = [r for r in rels if r.get("status") != "rejected"]
+            except Exception:
+                cross_source_relations = []
+
+        shared_doc_bindings: List[Dict[str, Any]] = []
+        if include_shared_docs:
+            try:
+                shared_doc_bindings = tenant_manager.list_shared_doc_bindings(
+                    base_proj,
+                    target_source_id=eff_source,
+                    include_wildcard=True,
+                )
+            except Exception:
+                shared_doc_bindings = []
         
-        output = {
+        output: Dict[str, Any] = {
             "project_id": uid,
+            "source_id": eff_source,
             "nodes_count": len(nodes),
             "edges_count": len(edges),
             "nodes": nodes,
-            "edges": edges
+            "edges": edges,
         }
+        if cross_source_relations or follow_connections or (relation_depth and relation_depth > 0):
+            output["cross_source_relations"] = cross_source_relations
+        if include_shared_docs and shared_doc_bindings:
+            output["shared_doc_bindings"] = shared_doc_bindings
         return json.dumps(output, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
@@ -1253,6 +1581,10 @@ async def projectbrain_sync_graphify(
     device: Optional[str] = None,
     workers: Optional[int] = None,
     semantic_engine: Optional[str] = None,
+    source_id: Optional[str] = None,
+    source_version: Optional[str] = None,
+    upgrade_mode: str = "delta",
+    auto_link_sources: bool = True,
 ) -> str:
     """
     Extract AST code graph and document entities via Graphify and synchronize to ProjectBrain.
@@ -1262,17 +1594,11 @@ async def projectbrain_sync_graphify(
             return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
 
         from ..graphify_engine.extractor import GraphifyExtractor
-        from ..graphify_engine.models import GraphDelta
-        from ..graphify_engine.store import get_graph_store
 
-        resolved_proj = resolve_mcp_user_id(project_id)
-        if ":" in resolved_proj:
-            p_parts = resolved_proj.split(":", 1)
-            target_proj = p_parts[0]
-            target_branch = branch if branch != "main" else (p_parts[1] or "main")
-        else:
-            target_proj = resolved_proj
-            target_branch = branch or "main"
+        target_proj, target_source, target_branch = _resolve_project_source_branch(
+            project_id, source_id=source_id, branch=branch
+        )
+        graph_target = _format_graph_target(target_proj, target_source)
 
         eff_device = device or "auto"
         eff_semantic_engine = semantic_engine or "auto"
@@ -1314,7 +1640,7 @@ async def projectbrain_sync_graphify(
         is_partial = bool(scoped_paths or git_dirty_only or (base_branch and base_branch != target_branch))
 
         if local_only:
-            return json.dumps({
+            local_out: Dict[str, Any] = {
                 "status": "cached_local",
                 "project_id": target_proj,
                 "branch": target_branch,
@@ -1324,7 +1650,12 @@ async def projectbrain_sync_graphify(
                 "edges_count": len(delta.edges),
                 "hyperedges_count": len(delta.hyperedges),
                 "partial": is_partial,
-            }, indent=2)
+            }
+            if target_source is not None:
+                local_out["source_id"] = target_source
+                local_out["source_version"] = source_version
+                local_out["upgrade_mode"] = upgrade_mode
+            return json.dumps(local_out, indent=2)
 
         synced_files_list = [sf["file_path"] if isinstance(sf, dict) else str(sf) for sf in delta.synced_files]
 
@@ -1333,8 +1664,8 @@ async def projectbrain_sync_graphify(
             server_url = get_pb_server_url()
             api_key = get_pb_api_key()
             headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-            payload = {
-                "project_id": target_proj,
+            payload: Dict[str, Any] = {
+                "project_id": graph_target,
                 "branch": target_branch,
                 "base_branch": base_branch,
                 "nodes": [n.to_dict() if hasattr(n, "to_dict") else n.model_dump() for n in delta.nodes],
@@ -1348,7 +1679,13 @@ async def projectbrain_sync_graphify(
                 "partial": is_partial,
                 "author": os.getenv("USER", "system"),
                 "cluster": False,
+                "upgrade_mode": upgrade_mode,
+                "auto_link_sources": auto_link_sources,
             }
+            if target_source is not None:
+                payload["source_id"] = target_source
+            if source_version is not None:
+                payload["source_version"] = source_version
             if device is not None:
                 payload["device"] = device
             if workers is not None:
@@ -1362,8 +1699,12 @@ async def projectbrain_sync_graphify(
         else:
             store = _get_mcp_graph_store()
             try:
+                extra_sync = _filter_supported_kwargs(
+                    store.sync_branch_delta,
+                    {"source_id": target_source, "upgrade_mode": upgrade_mode},
+                )
                 res = store.sync_branch_delta(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     branch_name=target_branch,
                     delta=delta,
                     partial=is_partial,
@@ -1371,18 +1712,34 @@ async def projectbrain_sync_graphify(
                     deleted_files=delta.deleted_files,
                     author=os.getenv("USER", "system"),
                     base_branch=base_branch,
+                    **extra_sync,
                 )
                 if base_branch and base_branch != target_branch:
                     try:
                         from ..core.db import register_memory_branch
                         from ..memory.hsg import invalidate_query_cache
-                        register_memory_branch(target_proj, target_branch, base_branch)
+                        register_memory_branch(graph_target, target_branch, base_branch)
                         invalidate_query_cache()
                     except Exception as me:
-                        logger.debug(f"Memory branch registration skipped for {target_proj}:{target_branch}: {me}")
-                return json.dumps(res, indent=2)
+                        logger.debug(f"Memory branch registration skipped for {graph_target}:{target_branch}: {me}")
             finally:
                 store.close()
+            if isinstance(res, dict):
+                if target_source is not None:
+                    res["source_id"] = target_source
+                extra = _record_source_upgrade_and_auto_link(
+                    project_id=target_proj,
+                    source_id=target_source,
+                    branch=target_branch,
+                    source_version=source_version,
+                    upgrade_mode=upgrade_mode,
+                    auto_link_sources=auto_link_sources,
+                    workspace_path=workspace_path,
+                    nodes_delta=len(delta.nodes),
+                    edges_delta=len(delta.edges),
+                )
+                res.update(extra)
+            return json.dumps(res, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_sync_graphify: {str(e)}"
@@ -1399,81 +1756,100 @@ async def projectbrain_query_graphify(
     target_symbol: Optional[str] = None,
     mode: str = "bfs",
     max_hops: int = 3,
-    budget: int = 2500
+    budget: int = 2500,
+    source_id: Optional[str] = None,
+    include_shared_docs: bool = True,
+    relation_depth: int = 1,
 ) -> str:
     """
     Query ProjectBrain Graphify hybrid graph with various graph analytics and traversal actions.
     """
     try:
-        resolved_proj = resolve_mcp_user_id(project_id)
-        if ":" in resolved_proj:
-            p_parts = resolved_proj.split(":", 1)
-            target_proj = p_parts[0]
-            target_branch = branch if branch != "main" else (p_parts[1] or "main")
-        else:
-            target_proj = resolved_proj
-            target_branch = branch or "main"
+        target_proj, target_source, target_branch = _resolve_project_source_branch(
+            project_id, source_id=source_id, branch=branch
+        )
+        graph_target = _format_graph_target(target_proj, target_source)
 
         resolver = get_hybrid_resolver()
         try:
             act = (action or "query").lower().strip()
 
             if act == "query":
+                extra_q = _filter_supported_kwargs(
+                    resolver.query,
+                    {
+                        "source_id": target_source,
+                        "include_shared_docs": include_shared_docs,
+                        "relation_depth": relation_depth,
+                    },
+                )
+                q_proj = target_proj if "source_id" in extra_q else graph_target
                 res = resolver.query(
-                    project_id=target_proj,
+                    project_id=q_proj,
                     query_text=query,
                     branch=target_branch,
                     mode=mode,
                     budget=budget,
+                    **extra_q,
                 )
             elif act == "trace":
                 res = resolver.trace_path(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     source_id=query,
                     target_id=target_symbol or "",
                     branch=target_branch,
                 )
             elif act == "impact":
                 res = resolver.get_impact_radius(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     node_id=query,
                     max_hops=max_hops,
                     branch=target_branch,
                 )
             elif act == "callers":
                 res = resolver.get_callers(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     node_id=query,
                     branch=target_branch,
                 )
             elif act == "callees":
                 res = resolver.get_callees(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     node_id=query,
                     branch=target_branch,
                 )
             elif act == "node":
                 res = resolver.get_node_details(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     node_id=query,
                     branch=target_branch,
                 )
             elif act == "god_nodes":
                 top_n = max_hops if max_hops > 0 else 10
                 res = resolver.get_god_nodes(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     branch=target_branch,
-                    top_n=top_n,
+                    top_k=top_n,
                 )
             elif act == "community":
                 comm_id = int(query) if query.isdigit() else 0
                 res = resolver.get_community(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     community_id=comm_id,
                     branch=target_branch,
                 )
             else:
                 return f"Error: Unknown action '{action}'. Supported actions: query, trace, impact, callers, callees, node, god_nodes, community."
+
+            if isinstance(res, dict) and relation_depth and relation_depth > 0 and "cross_source_relations" not in res:
+                try:
+                    from ..core.tenant_manager import tenant_manager
+                    rels = tenant_manager.list_cross_source_relations(
+                        target_proj, source_id=target_source, branch=target_branch
+                    )
+                    res["cross_source_relations"] = [r for r in rels if r.get("status") != "rejected"]
+                except Exception:
+                    pass
 
             return json.dumps(res, indent=2)
         finally:
@@ -1550,60 +1926,143 @@ async def projectbrain_hybrid_query(
     local_path: Optional[str] = None,
     include_memories: bool = True,
     mode: str = "bfs",
-    budget: int = 2500
+    budget: int = 2500,
+    source_id: Optional[str] = None,
+    include_shared_docs: bool = True,
+    relation_depth: int = 1,
+    relation_types: Optional[List[str]] = None,
 ) -> str:
     """
     Execute 3-tier Hybrid Knowledge Base query combining Graphify structural graph traversal and HSG cognitive memories.
     """
     try:
-        resolved_proj = resolve_mcp_user_id(project_id)
-        if ":" in resolved_proj:
-            p_parts = resolved_proj.split(":", 1)
-            target_proj = p_parts[0]
-            target_branch = branch if branch != "main" else (p_parts[1] or "main")
-        else:
-            target_proj = resolved_proj
-            target_branch = branch or "main"
+        target_proj, target_source, target_branch = _resolve_project_source_branch(
+            project_id, source_id=source_id, branch=branch
+        )
 
+        if is_pb_remote_mode():
+            import httpx
+            server_url = get_pb_server_url()
+            api_key = get_pb_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            payload: Dict[str, Any] = {
+                "project_id": target_proj,
+                "query": query,
+                "branch": target_branch,
+                "local_path": local_path,
+                "include_memories": include_memories,
+                "mode": mode,
+                "budget": budget,
+                "include_shared_docs": include_shared_docs,
+                "relation_depth": relation_depth,
+            }
+            if target_source is not None:
+                payload["source_id"] = target_source
+            if relation_types is not None:
+                payload["relation_types"] = relation_types
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{server_url}/graphify/hybrid-query",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+
+        graph_target = _format_graph_target(target_proj, target_source)
         resolver = get_hybrid_resolver()
         try:
+            extra_q = _filter_supported_kwargs(
+                resolver.query,
+                {
+                    "source_id": target_source,
+                    "include_shared_docs": include_shared_docs,
+                    "relation_depth": relation_depth,
+                    "relation_types": relation_types,
+                },
+            )
+            q_proj = target_proj if "source_id" in extra_q else graph_target
             graph_res = resolver.query(
-                project_id=target_proj,
+                project_id=q_proj,
                 query_text=query,
                 branch=target_branch,
                 local_path=local_path,
                 mode=mode,
                 budget=budget,
+                **extra_q,
             )
         finally:
             if getattr(resolver, "store", None) is not None:
                 resolver.store.close()
 
-        memories = []
+        memories: List[Dict[str, Any]] = []
         if include_memories:
-            mem_user_id = f"{target_proj}:{target_branch}" if target_branch and target_branch != "main" and ":" not in target_proj else target_proj
+            mem_user_id = _format_mem_user_id(target_proj, target_branch, source_id=target_source)
             try:
-                memories = await mem.search(query=query, user_id=mem_user_id, limit=5)
+                mem_filters: Dict[str, Any] = {}
+                if (
+                    target_source is not None
+                    or include_shared_docs is not True
+                    or relation_depth != 1
+                    or relation_types is not None
+                ):
+                    if target_source is not None:
+                        mem_filters["source_id"] = target_source
+                    mem_filters["include_shared_docs"] = include_shared_docs
+                    mem_filters["relation_depth"] = relation_depth
+                    if relation_types is not None:
+                        mem_filters["relation_types"] = relation_types
+                memories = await mem.search(query=query, user_id=mem_user_id, limit=5, **mem_filters)
             except Exception as me:
                 logger.debug(f"Memory search error in hybrid query: {me}")
+
+        cross_source_relations: List[Dict[str, Any]] = list(graph_res.get("cross_source_relations") or [])
+        if not cross_source_relations and relation_depth and relation_depth > 0:
+            try:
+                from ..core.tenant_manager import tenant_manager
+                rels = tenant_manager.list_cross_source_relations(
+                    target_proj,
+                    source_id=target_source,
+                    branch=target_branch,
+                )
+                if relation_types:
+                    allowed_rt = {rt.strip() for rt in relation_types if rt and rt.strip()}
+                    rels = [r for r in rels if r.get("relation_type") in allowed_rt]
+                cross_source_relations = [r for r in rels if r.get("status") != "rejected"]
+            except Exception as rel_exc:
+                logger.debug(f"Cross-source relations lookup skipped in hybrid query: {rel_exc}")
 
         matched_nodes = graph_res.get("nodes", [])
         linked_doc_chunks = [
             n for n in matched_nodes
             if n.get("file_type") == "document" or "chunk_id" in (n.get("metadata") or {})
         ]
-        output = {
+        shared_doc_chunks = list(graph_res.get("shared_doc_chunks") or [])
+        if not shared_doc_chunks:
+            shared_doc_chunks = [
+                n for n in linked_doc_chunks
+                if n.get("source_id") == "__shared__"
+                or n.get("scope") == "project_shared"
+                or (n.get("metadata") or {}).get("scope") == "project_shared"
+            ]
+        output: Dict[str, Any] = {
             "query": query,
             "project_id": target_proj,
             "branch": target_branch,
+            "source_id": target_source,
+            "include_shared_docs": include_shared_docs,
+            "relation_depth": relation_depth,
+            "relation_types": relation_types,
             "graph_summary": graph_res.get("context_markdown", ""),
             "matched_nodes": matched_nodes,
             "linked_doc_chunks": linked_doc_chunks,
+            "shared_doc_chunks": shared_doc_chunks,
+            "cross_source_relations": cross_source_relations,
             "traversal_stats": graph_res.get("tier_breakdown", {}),
             "cognitive_memories_count": len(memories),
             "cognitive_memories": memories,
         }
-        return json.dumps(output, indent=2)
+        return json.dumps(output, default=str, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_hybrid_query: {str(e)}"
@@ -1627,6 +2086,9 @@ async def projectbrain_upload_document(
     ocr_device: Optional[str] = None,
     local_ai_model: Optional[str] = None,
     local_ai_url: Optional[str] = None,
+    source_id: Optional[str] = None,
+    scope: str = "source",
+    doc_role: str = "general",
 ) -> str:
     """
     Process and ingest multimodal document into Graphify and ProjectBrain memory.
@@ -1639,14 +2101,13 @@ async def projectbrain_upload_document(
         from ..graphify_engine.doc_versioning import ingest_document_versioned
         from ..graphify_engine.models import GraphDelta
 
-        resolved_proj = resolve_mcp_user_id(project_id)
-        if ":" in resolved_proj:
-            p_parts = resolved_proj.split(":", 1)
-            target_proj = p_parts[0]
-            target_branch = branch if branch != "main" else (p_parts[1] or "main")
-        else:
-            target_proj = resolved_proj
-            target_branch = branch or "main"
+        target_proj, target_source, target_branch = _resolve_project_source_branch(
+            project_id, source_id=source_id, branch=branch, scope=scope
+        )
+        eff_scope = "project_shared" if (scope == "project_shared" or target_source == "__shared__") else (scope or "source")
+        eff_source = "__shared__" if eff_scope == "project_shared" else target_source
+        eff_doc_role = (doc_role or "general").strip() or "general"
+        graph_target = _format_graph_target(target_proj, eff_source, eff_scope)
 
         pipeline = DocumentPipeline()
         process_kwargs: Dict[str, Any] = dict(
@@ -1676,6 +2137,13 @@ async def projectbrain_upload_document(
             payload["doc_version"] = doc_version or payload["document"].get("doc_version")
             payload["base_version"] = base_version
             payload["base_branch"] = base_branch or payload["document"].get("base_branch")
+            payload["source_id"] = eff_source
+            payload["scope"] = eff_scope
+            payload["doc_role"] = eff_doc_role
+            if eff_source is not None:
+                payload["document"]["source_id"] = eff_source
+            payload["document"]["scope"] = eff_scope
+            payload["document"]["doc_role"] = eff_doc_role
             if ocr_engine is not None:
                 payload["document"]["ocr_engine"] = ocr_engine
             if ocr_device is not None:
@@ -1692,6 +2160,14 @@ async def projectbrain_upload_document(
             return json.dumps(res, indent=2)
         else:
             doc = payload["document"]
+            extra_ingest = _filter_supported_kwargs(
+                ingest_document_versioned,
+                {
+                    "source_id": eff_source,
+                    "scope": eff_scope,
+                    "doc_role": eff_doc_role,
+                },
+            )
             ver_res = await ingest_document_versioned(
                 filename=doc.get("filename") or str(file_path),
                 markdown_content=doc.get("markdown_content", ""),
@@ -1704,6 +2180,7 @@ async def projectbrain_upload_document(
                 doc_version=doc_version or doc.get("doc_version"),
                 base_version=base_version,
                 base_branch=base_branch or doc.get("base_branch"),
+                **extra_ingest,
             )
 
             delta_dict = payload["graph_delta"]
@@ -1721,7 +2198,7 @@ async def projectbrain_upload_document(
             store = _get_mcp_graph_store()
             try:
                 sync_res = store.sync_branch_delta(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     branch_name=target_branch,
                     delta=delta,
                     partial=True,
@@ -1736,6 +2213,9 @@ async def projectbrain_upload_document(
                 "mode": "local",
                 "project_id": target_proj,
                 "branch": target_branch,
+                "source_id": eff_source,
+                "scope": eff_scope,
+                "doc_role": eff_doc_role,
                 "memories_created": ver_res["memories_created"],
                 "nodes_upserted": sync_res.get("nodes_upserted", len(delta.nodes)),
                 "edges_upserted": sync_res.get("edges_upserted", len(delta.edges)),
@@ -1768,6 +2248,9 @@ async def projectbrain_push_processed_document(
     doc_version: Optional[str] = None,
     base_version: Optional[str] = None,
     base_branch: Optional[str] = None,
+    source_id: Optional[str] = None,
+    scope: str = "source",
+    doc_role: str = "general",
 ) -> str:
     """
     Directly push pre-extracted document Markdown and Graphify entities to ProjectBrain server or local memory.
@@ -1780,19 +2263,26 @@ async def projectbrain_push_processed_document(
         from ..graphify_engine.doc_versioning import ingest_document_versioned
         from ..utils.chunking import chunk_text
 
-        resolved_proj = resolve_mcp_user_id(project_id)
-        if ":" in resolved_proj:
-            p_parts = resolved_proj.split(":", 1)
-            target_proj = p_parts[0]
-            target_branch = branch if branch != "main" else (p_parts[1] or "main")
-        else:
-            target_proj = resolved_proj
-            target_branch = branch or "main"
+        target_proj, target_source, target_branch = _resolve_project_source_branch(
+            project_id, source_id=source_id, branch=branch, scope=scope
+        )
+        eff_scope = "project_shared" if (scope == "project_shared" or target_source == "__shared__") else (scope or "source")
+        eff_source = "__shared__" if eff_scope == "project_shared" else target_source
+        eff_doc_role = (doc_role or "general").strip() or "general"
+        graph_target = _format_graph_target(target_proj, eff_source, eff_scope)
 
         import hashlib
         sha256 = hashlib.sha256(markdown_content.encode("utf-8")).hexdigest()
         extractor = GraphifyExtractor()
-        doc_metadata = {"author": author or "system", "sha256": sha256, "file_type": "document"}
+        doc_metadata: Dict[str, Any] = {
+            "author": author or "system",
+            "sha256": sha256,
+            "file_type": "document",
+            "scope": eff_scope,
+            "doc_role": eff_doc_role,
+        }
+        if eff_source is not None:
+            doc_metadata["source_id"] = eff_source
         delta = extractor.extract_document_graph(
             file_path=filename,
             markdown_content=markdown_content,
@@ -1804,13 +2294,16 @@ async def projectbrain_push_processed_document(
         raw_chunks = chunk_text(markdown_content, tgt=768, ovr=0.1)
         chunks = [{"content": c["text"], "chunk_id": f"p_{i+1}", "tags": tags or ["document"]} for i, c in enumerate(raw_chunks)]
 
-        payload = {
+        payload: Dict[str, Any] = {
             "project_id": target_proj,
             "branch": target_branch,
             "doc_key": doc_key,
             "doc_version": doc_version,
             "base_version": base_version,
             "base_branch": base_branch,
+            "source_id": eff_source,
+            "scope": eff_scope,
+            "doc_role": eff_doc_role,
             "document": {
                 "filename": filename,
                 "sha256": sha256,
@@ -1822,6 +2315,9 @@ async def projectbrain_push_processed_document(
                 "doc_version": doc_version,
                 "base_version": base_version,
                 "base_branch": base_branch,
+                "source_id": eff_source,
+                "scope": eff_scope,
+                "doc_role": eff_doc_role,
             },
             "graph_delta": delta.to_dict() if hasattr(delta, "to_dict") else delta.model_dump(),
         }
@@ -1835,6 +2331,14 @@ async def projectbrain_push_processed_document(
                 resp.raise_for_status()
                 return json.dumps(resp.json(), indent=2)
         else:
+            extra_ingest = _filter_supported_kwargs(
+                ingest_document_versioned,
+                {
+                    "source_id": eff_source,
+                    "scope": eff_scope,
+                    "doc_role": eff_doc_role,
+                },
+            )
             ver_res = await ingest_document_versioned(
                 filename=filename,
                 markdown_content=markdown_content,
@@ -1846,12 +2350,13 @@ async def projectbrain_push_processed_document(
                 doc_version=doc_version,
                 base_version=base_version,
                 base_branch=base_branch,
+                **extra_ingest,
             )
 
             store = _get_mcp_graph_store()
             try:
                 sync_res = store.sync_branch_delta(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     branch_name=target_branch,
                     delta=delta,
                     partial=True,
@@ -1866,6 +2371,9 @@ async def projectbrain_push_processed_document(
                 "mode": "local",
                 "project_id": target_proj,
                 "branch": target_branch,
+                "source_id": eff_source,
+                "scope": eff_scope,
+                "doc_role": eff_doc_role,
                 "memories_created": ver_res["memories_created"],
                 "nodes_upserted": sync_res.get("nodes_upserted", len(delta.nodes)),
                 "edges_upserted": sync_res.get("edges_upserted", len(delta.edges)),
@@ -2085,6 +2593,10 @@ async def projectbrain_build_complete_kb(
     semantic_engine: Optional[str] = None,
     ocr_engine: Optional[str] = None,
     ocr_device: Optional[str] = None,
+    source_id: Optional[str] = None,
+    source_version: Optional[str] = None,
+    upgrade_mode: str = "delta",
+    auto_link_sources: bool = True,
 ) -> str:
     """
     Build and cross-link complete ProjectBrain Knowledge Base for the workspace.
@@ -2093,28 +2605,30 @@ async def projectbrain_build_complete_kb(
         if check_read_only():
             return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
 
-        resolved_proj = resolve_mcp_user_id(project_id)
-        if ":" in resolved_proj:
-            p_parts = resolved_proj.split(":", 1)
-            target_proj = p_parts[0]
-            target_branch = branch if branch != "main" else (p_parts[1] or "main")
-        else:
-            target_proj = resolved_proj
-            target_branch = branch or "main"
+        target_proj, target_source, target_branch = _resolve_project_source_branch(
+            project_id, source_id=source_id, branch=branch
+        )
+        graph_target = _format_graph_target(target_proj, target_source)
 
         if is_pb_remote_mode():
             import httpx
             server_url = get_pb_server_url()
             api_key = get_pb_api_key()
             headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-            payload = {
-                "project_id": target_proj,
+            payload: Dict[str, Any] = {
+                "project_id": graph_target,
                 "branch": target_branch,
                 "workspace_path": workspace_path,
                 "persist_memory": persist_memory,
                 "output_dir": output_dir,
                 "generate_office_exports": generate_office_exports,
+                "upgrade_mode": upgrade_mode,
+                "auto_link_sources": auto_link_sources,
             }
+            if target_source is not None:
+                payload["source_id"] = target_source
+            if source_version is not None:
+                payload["source_version"] = source_version
             if device is not None:
                 payload["device"] = device
             if workers is not None:
@@ -2149,8 +2663,17 @@ async def projectbrain_build_complete_kb(
                     ocr_device=eff_ocr_device,
                     ocr_engine=eff_ocr_engine,
                 )
+                extra_kb = _filter_supported_kwargs(
+                    builder.build_unified_kb,
+                    {
+                        "source_id": target_source,
+                        "source_version": source_version,
+                        "upgrade_mode": upgrade_mode,
+                        "auto_link_sources": auto_link_sources,
+                    },
+                )
                 res = await builder.build_unified_kb(
-                    project_id=target_proj,
+                    project_id=graph_target,
                     branch=target_branch,
                     persist_memory=persist_memory,
                     output_dir=output_dir,
@@ -2162,10 +2685,25 @@ async def projectbrain_build_complete_kb(
                     ocr_engine=eff_ocr_engine,
                     workers=workers,
                     semantic_engine=eff_semantic_engine,
+                    **extra_kb,
                 )
-                return json.dumps(res, indent=2)
             finally:
                 store.close()
+            if isinstance(res, dict):
+                if target_source is not None:
+                    res["source_id"] = target_source
+                extra = _record_source_upgrade_and_auto_link(
+                    project_id=target_proj,
+                    source_id=target_source,
+                    branch=target_branch,
+                    source_version=source_version,
+                    upgrade_mode=upgrade_mode,
+                    auto_link_sources=auto_link_sources,
+                    workspace_path=workspace_path,
+                    docs_updated=int(res.get("total_chunks") or 0),
+                )
+                res.update(extra)
+            return json.dumps(res, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_build_complete_kb: {str(e)}"
@@ -2178,48 +2716,113 @@ async def projectbrain_trace_code_and_docs(
     target: str,
     project_id: Optional[str] = None,
     branch: str = "main",
-    workspace_path: str = "."
+    workspace_path: str = ".",
+    source_id: Optional[str] = None,
+    include_shared_docs: bool = True,
+    relation_depth: int = 1,
 ) -> str:
     """
     Trace code, doc chunks, and test links for a target query.
     """
     try:
-        resolved_proj = resolve_mcp_user_id(project_id)
-        if ":" in resolved_proj:
-            p_parts = resolved_proj.split(":", 1)
-            target_proj = p_parts[0]
-            target_branch = branch if branch != "main" else (p_parts[1] or "main")
-        else:
-            target_proj = resolved_proj
-            target_branch = branch or "main"
+        target_proj, target_source, target_branch = _resolve_project_source_branch(
+            project_id, source_id=source_id, branch=branch
+        )
+        graph_target = _format_graph_target(target_proj, target_source)
 
         if is_pb_remote_mode():
             import httpx
             server_url = get_pb_server_url()
             api_key = get_pb_api_key()
             headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-            params = {
+            params: Dict[str, Any] = {
                 "project_id": target_proj,
                 "target": target,
                 "branch": target_branch,
                 "workspace_path": workspace_path,
+                "include_shared_docs": include_shared_docs,
+                "relation_depth": relation_depth,
             }
+            if target_source is not None:
+                params["source_id"] = target_source
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.get(f"{server_url}/kb/trace", params=params, headers=headers)
                 resp.raise_for_status()
                 return json.dumps(resp.json(), indent=2)
         else:
             from ..graphify_engine.kb_linker import UnifiedKBBuilder
+            from ..core.tenant_manager import tenant_manager
+
             store = _get_mcp_graph_store()
             try:
                 builder = UnifiedKBBuilder(workspace_path=workspace_path)
                 builder.store = store
+                extra_tr = _filter_supported_kwargs(
+                    builder.trace_code_and_docs,
+                    {
+                        "source_id": target_source,
+                        "include_shared_docs": include_shared_docs,
+                        "relation_depth": relation_depth,
+                    },
+                )
+                tr_proj = target_proj if "source_id" in extra_tr else graph_target
                 res = builder.trace_code_and_docs(
-                    project_id=target_proj,
+                    project_id=tr_proj,
                     target=target,
                     branch=target_branch,
+                    **extra_tr,
                 )
-                return json.dumps(res.model_dump(), indent=2)
+                out = res.model_dump() if hasattr(res, "model_dump") else dict(res)
+                out["project_id"] = target_proj
+                out["branch"] = target_branch
+                out["source_id"] = target_source
+
+                if relation_depth and relation_depth > 0:
+                    try:
+                        rels = tenant_manager.list_cross_source_relations(
+                            target_proj, source_id=target_source, branch=target_branch
+                        )
+                        active_rels = [r for r in rels if r.get("status") != "rejected"]
+                        t_low = target.strip().lower()
+                        matched_contracts = [
+                            r for r in active_rels
+                            if not t_low or any(
+                                t_low in str(r.get(f) or "").lower()
+                                for f in ("contract_key", "src_node_id", "dst_node_id", "src_file_path", "dst_doc_key", "contract_metadata_json")
+                            )
+                        ]
+                        out["cross_source_relations"] = active_rels
+                        out["cross_source_contracts"] = matched_contracts
+                    except Exception:
+                        out["cross_source_relations"] = []
+                        out["cross_source_contracts"] = []
+
+                if include_shared_docs:
+                    try:
+                        bindings = tenant_manager.list_shared_doc_bindings(
+                            target_proj,
+                            target_source_id=target_source,
+                            include_wildcard=True,
+                        )
+                    except Exception:
+                        bindings = []
+                    shared_docs: List[Dict[str, Any]] = []
+                    try:
+                        shared_sub = store.get_resolved_subgraph(
+                            f"{target_proj}@__shared__", target_branch, limit=5000
+                        )
+                        t_low = target.strip().lower()
+                        for sn in shared_sub.get("nodes", []):
+                            if sn.get("file_type") == "document" or "doc" in str(sn.get("id", "")).lower():
+                                blob = f"{sn.get('id', '')} {sn.get('label', '')} {sn.get('source_file', '')} {json.dumps(sn.get('metadata') or {})}".lower()
+                                if not t_low or t_low in blob:
+                                    shared_docs.append(sn)
+                    except Exception:
+                        shared_docs = []
+                    out["shared_doc_bindings"] = bindings
+                    out["shared_docs"] = shared_docs
+
+                return json.dumps(out, default=str, indent=2)
             finally:
                 store.close()
     except Exception as e:
@@ -3146,6 +3749,7 @@ async def projectbrain_v3_rca_triage(
 @mcp_server.tool(
     name="projectbrain_database_topology",
     description="Inspect read-only Master DB -> Project DB -> Branch Schema topology and node/doc/memory counts.",
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def projectbrain_database_topology(
     project_id: Optional[str] = None,
@@ -3158,15 +3762,591 @@ async def projectbrain_database_topology(
                 "/master/topology",
                 params={"project_id": project_id} if project_id else None,
             )
+            if isinstance(res, dict):
+                for proj_item in res.get("projects") or []:
+                    if isinstance(proj_item, dict):
+                        proj_item.setdefault("sources", [])
+                        proj_item.setdefault("shared_doc_count", 0)
+                        proj_item.setdefault("relation_count", 0)
             return json.dumps(res, default=str, indent=2)
 
         from ..server.routes.master_topology import collect_master_topology
 
         topo = collect_master_topology(project_id=project_id)
+        if isinstance(topo, dict):
+            for proj_item in topo.get("projects") or []:
+                if isinstance(proj_item, dict):
+                    proj_item.setdefault("sources", [])
+                    proj_item.setdefault("shared_doc_count", 0)
+                    proj_item.setdefault("relation_count", 0)
         return json.dumps(topo, default=str, indent=2)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"Error executing projectbrain_database_topology: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_register_source",
+    description="Register or update a sub-source (service, web frontend, mobile app, worker, infra) under a ProjectBrain multi-source project.",
+    annotations=ToolAnnotations(readOnlyHint=False),
+)
+async def projectbrain_register_source(
+    project_id: str,
+    source_id: str,
+    display_name: Optional[str] = None,
+    source_type: str = "service",
+    tech_stack: Optional[List[str]] = None,
+    repo_url: Optional[str] = None,
+    workspace_subpath: Optional[str] = None,
+    current_version: str = "1.0.0",
+    inherit_shared_docs: bool = True,
+) -> str:
+    """Register or update a sub-source within `project_id`."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        from ..core.tenant_manager import parse_tenant_from_user_id, tenant_manager
+
+        base_proj = parse_tenant_from_user_id(project_id)[0]
+        if is_pb_remote_mode():
+            payload: Dict[str, Any] = {
+                "project_id": base_proj,
+                "source_id": source_id,
+                "display_name": display_name,
+                "source_type": source_type,
+                "tech_stack": tech_stack,
+                "repo_url": repo_url,
+                "workspace_subpath": workspace_subpath,
+                "current_version": current_version,
+                "inherit_shared_docs": inherit_shared_docs,
+            }
+            res = await _pb_remote_v3_request("POST", "/master/sources", json_body=payload)
+            return json.dumps(res, default=str, indent=2)
+
+        source = tenant_manager.register_project_source(
+            project_id=base_proj,
+            source_id=source_id,
+            display_name=display_name,
+            source_type=source_type,
+            tech_stack=tech_stack,
+            repo_url=repo_url,
+            workspace_subpath=workspace_subpath,
+            current_version=current_version,
+            inherit_shared_docs=inherit_shared_docs,
+        )
+        return json.dumps({"status": "ok", "source": source}, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_register_source: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_list_sources",
+    description="List all registered sub-sources for a ProjectBrain multi-source project.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def projectbrain_list_sources(
+    project_id: str,
+) -> str:
+    """List registered sub-sources for `project_id`."""
+    try:
+        from ..core.tenant_manager import parse_tenant_from_user_id, tenant_manager
+
+        base_proj = parse_tenant_from_user_id(project_id)[0]
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request(
+                "GET",
+                "/master/sources",
+                params={"project_id": base_proj},
+            )
+            return json.dumps(res, default=str, indent=2)
+
+        sources = tenant_manager.list_project_sources(base_proj)
+        return json.dumps(
+            {
+                "status": "ok",
+                "project_id": base_proj,
+                "sources": sources,
+            },
+            default=str,
+            indent=2,
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_list_sources: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_link_sources",
+    description="Create or update a typed cross-source relation edge (calls_api, shares_schema, consumes_events, deploys, depends_on, documented_by) between two sources.",
+    annotations=ToolAnnotations(readOnlyHint=False),
+)
+async def projectbrain_link_sources(
+    project_id: str,
+    src_source_id: str,
+    dst_source_id: str,
+    relation_type: str,
+    src_branch: str = "main",
+    dst_branch: str = "main",
+    contract_key: str = "",
+    contract_metadata: Optional[Dict[str, Any]] = None,
+    pin: bool = True,
+) -> str:
+    """Create or update a manual/pinned cross-source relation edge."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        from ..core.tenant_manager import parse_tenant_from_user_id, tenant_manager
+
+        base_proj = parse_tenant_from_user_id(project_id)[0]
+        if is_pb_remote_mode():
+            payload: Dict[str, Any] = {
+                "project_id": base_proj,
+                "src_source_id": src_source_id,
+                "dst_source_id": dst_source_id,
+                "relation_type": relation_type,
+                "src_branch": src_branch,
+                "dst_branch": dst_branch,
+                "contract_key": contract_key,
+                "contract_metadata": contract_metadata,
+                "pin": pin,
+            }
+            res = await _pb_remote_v3_request("POST", "/master/relations", json_body=payload)
+            return json.dumps(res, default=str, indent=2)
+
+        relation = tenant_manager.upsert_cross_source_relation(
+            project_id=base_proj,
+            src_source_id=src_source_id,
+            dst_source_id=dst_source_id,
+            relation_type=relation_type,
+            src_branch=src_branch,
+            dst_branch=dst_branch,
+            origin="manual",
+            confidence="MANUAL",
+            contract_key=contract_key,
+            contract_metadata=contract_metadata,
+            status="pinned" if pin else "active",
+            created_by="mcp",
+        )
+        return json.dumps({"status": "ok", "relation": relation}, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_link_sources: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_auto_link_sources",
+    description="Automatically extract contract surfaces (APIs, schemas, events, infra, shared docs) across registered sources and reconcile cross-source relations and drift.",
+    annotations=ToolAnnotations(readOnlyHint=False),
+)
+async def projectbrain_auto_link_sources(
+    project_id: str,
+    source_id: Optional[str] = None,
+    branch: str = "main",
+    workspace_map: Optional[Dict[str, str]] = None,
+) -> str:
+    """Extract contract surfaces across project sources and reconcile cross-source relations."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        from ..core.tenant_manager import parse_tenant_from_user_id
+
+        base_proj = parse_tenant_from_user_id(project_id)[0]
+        if is_pb_remote_mode():
+            payload: Dict[str, Any] = {
+                "project_id": base_proj,
+                "source_id": source_id,
+                "branch": branch,
+                "workspace_map": workspace_map,
+            }
+            res = await _pb_remote_v3_request(
+                "POST", "/master/relations/auto-link", json_body=payload, timeout=120.0
+            )
+            return json.dumps(res, default=str, indent=2)
+
+        validated_map: Optional[Dict[str, str]] = None
+        if workspace_map is not None:
+            validated_map = {}
+            for sid, raw_path in workspace_map.items():
+                clean_sid = str(sid or "").strip()
+                if not clean_sid:
+                    return "Error executing projectbrain_auto_link_sources: workspace_map keys must be non-empty source_ids."
+                validated_map[clean_sid] = str(_validate_mcp_safe_path(raw_path))
+
+        from ..graphify_engine.cross_source_linker import CrossSourceLinker
+
+        linker = CrossSourceLinker()
+        res = linker.auto_link_project(
+            project_id=base_proj,
+            source_id=source_id,
+            branch=branch,
+            workspace_map=validated_map,
+        )
+        return json.dumps(res, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_auto_link_sources: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_cross_source_impact",
+    description="Analyze read-only cross-source blast radius and impacted downstream/upstream services, schemas, events, and shared specs for a symbol, endpoint, or contract.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def projectbrain_cross_source_impact(
+    project_id: str,
+    target: str,
+    source_id: Optional[str] = None,
+    branch: str = "main",
+    relation_depth: int = 2,
+) -> str:
+    """Compute cross-source impact radius for `target` across `cross_source_relations`."""
+    try:
+        from collections import deque
+        from ..core.tenant_manager import parse_tenant_spec, tenant_manager
+
+        base_proj, parsed_src, parsed_br = parse_tenant_spec(
+            project_id, default_branch=branch or "main", default_source=source_id
+        )
+        eff_source = (
+            str(source_id).strip()
+            if isinstance(source_id, str) and source_id.strip()
+            else (parsed_src if parsed_src != "__default__" else None)
+        )
+        if eff_source == "__default__":
+            eff_source = None
+        eff_branch = branch if branch != "main" else parsed_br
+        max_depth = max(0, int(relation_depth))
+
+        if is_pb_remote_mode():
+            rel_resp = await _pb_remote_v3_request(
+                "GET",
+                "/master/relations",
+                params={"project_id": base_proj, "branch": eff_branch},
+            )
+            all_rels = list((rel_resp or {}).get("relations") or [])
+            bind_resp = await _pb_remote_v3_request(
+                "GET",
+                "/sources/shared-bindings",
+                params={"project_id": base_proj},
+            )
+            all_bindings = list((bind_resp or {}).get("bindings") or [])
+        else:
+            all_rels = tenant_manager.list_cross_source_relations(
+                base_proj, branch=eff_branch
+            )
+            all_bindings = tenant_manager.list_shared_doc_bindings(base_proj)
+
+        active_rels = [r for r in all_rels if r.get("status") != "rejected"]
+        t_low = (target or "").strip().lower()
+
+        def _rel_matches_target(rel: Dict[str, Any]) -> bool:
+            if not t_low:
+                return True
+            haystack = " ".join(
+                str(rel.get(k) or "")
+                for k in (
+                    "contract_key",
+                    "src_node_id",
+                    "dst_node_id",
+                    "src_file_path",
+                    "dst_doc_key",
+                    "relation_type",
+                    "contract_metadata_json",
+                )
+            ).lower()
+            return t_low in haystack
+
+        direct_relations: List[Dict[str, Any]] = []
+        seed_sources: set = set()
+        if eff_source:
+            seed_sources.add(eff_source)
+
+        for rel in active_rels:
+            src_s = str(rel.get("src_source_id") or "")
+            dst_s = str(rel.get("dst_source_id") or "")
+            if _rel_matches_target(rel):
+                if eff_source is None or eff_source in (src_s, dst_s):
+                    direct_relations.append(rel)
+                    if src_s:
+                        seed_sources.add(src_s)
+                    if dst_s:
+                        seed_sources.add(dst_s)
+
+        visited_sources: set = set(seed_sources)
+        propagated_relations: List[Dict[str, Any]] = []
+        seen_rel_ids: set = set()
+        queue = deque([(s, 0) for s in sorted(seed_sources)])
+
+        while queue:
+            curr_src, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            for rel in active_rels:
+                src_s = str(rel.get("src_source_id") or "")
+                dst_s = str(rel.get("dst_source_id") or "")
+                if curr_src not in (src_s, dst_s):
+                    continue
+                if depth == 0 and direct_relations and rel not in direct_relations and eff_source is None:
+                    continue
+                rid = rel.get("id") or f"{src_s}->{dst_s}:{rel.get('relation_type')}:{rel.get('contract_key')}"
+                if rid not in seen_rel_ids:
+                    seen_rel_ids.add(rid)
+                    propagated_relations.append({**rel, "hop": depth + 1})
+                other_s = dst_s if curr_src == src_s else src_s
+                if other_s and other_s not in visited_sources:
+                    visited_sources.add(other_s)
+                    queue.append((other_s, depth + 1))
+
+        drifted_relations = [
+            r for r in (propagated_relations or direct_relations)
+            if r.get("status") == "drifted"
+        ]
+        matching_bindings = [
+            b for b in all_bindings
+            if (
+                b.get("target_source_id") in (visited_sources | {"*"})
+                or (t_low and t_low in str(b.get("doc_key") or "").lower())
+            )
+        ]
+
+        intra_source_impact: Optional[Dict[str, Any]] = None
+        if not is_pb_remote_mode():
+            resolver = get_hybrid_resolver()
+            try:
+                graph_target = _format_graph_target(base_proj, eff_source)
+                cand_impact = resolver.get_impact_radius(
+                    project_id=graph_target,
+                    node_id=target,
+                    max_hops=max(1, max_depth),
+                    branch=eff_branch,
+                )
+                if isinstance(cand_impact, dict) and cand_impact.get("found"):
+                    intra_source_impact = cand_impact
+            except Exception:
+                intra_source_impact = None
+            finally:
+                if getattr(resolver, "store", None) is not None:
+                    resolver.store.close()
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "project_id": base_proj,
+                "target": target,
+                "source_id": eff_source,
+                "branch": eff_branch,
+                "relation_depth": max_depth,
+                "affected_sources": sorted(visited_sources),
+                "direct_relations": direct_relations,
+                "propagated_relations": propagated_relations,
+                "drifted_relations": drifted_relations,
+                "shared_doc_bindings": matching_bindings,
+                "intra_source_impact": intra_source_impact,
+            },
+            default=str,
+            indent=2,
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_cross_source_impact: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_bind_shared_doc",
+    description="Bind a project-shared document (doc_key) to '*' (all sources) or a specific sub-source, optionally pinning a document version.",
+    annotations=ToolAnnotations(readOnlyHint=False),
+)
+async def projectbrain_bind_shared_doc(
+    project_id: str,
+    doc_key: str,
+    target_source_id: str = "*",
+    pinned_version: Optional[str] = None,
+    binding_role: str = "reference",
+) -> str:
+    """Bind a shared document to `'*'` or a specific sub-source."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        from ..core.tenant_manager import parse_tenant_from_user_id, tenant_manager
+
+        base_proj = parse_tenant_from_user_id(project_id)[0]
+        if is_pb_remote_mode():
+            payload: Dict[str, Any] = {
+                "project_id": base_proj,
+                "doc_key": doc_key,
+                "target_source_id": target_source_id,
+                "pinned_version": pinned_version,
+                "binding_role": binding_role,
+            }
+            res = await _pb_remote_v3_request(
+                "POST", "/sources/shared-bindings", json_body=payload
+            )
+            return json.dumps(res, default=str, indent=2)
+
+        binding = tenant_manager.bind_shared_doc(
+            project_id=base_proj,
+            doc_key=doc_key,
+            target_source_id=target_source_id,
+            pinned_version=pinned_version,
+            binding_role=binding_role,
+        )
+        return json.dumps({"status": "ok", "binding": binding}, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_bind_shared_doc: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_discover_workspace_sources",
+    description="Scan a workspace directory (read-only) to auto-detect sub-sources (backend, frontend, worker, infra) and project-wide shared docs/contracts before bootstrapping.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def projectbrain_discover_workspace_sources(
+    workspace_root: str = ".",
+) -> str:
+    """Auto-discover sub-sources and shared docs inside `workspace_root`."""
+    try:
+        safe_root = _validate_mcp_safe_path(workspace_root)
+        if is_pb_remote_mode():
+            res = await _pb_remote_v3_request(
+                "POST",
+                "/master/hub/discover",
+                json_body={"workspace_root": workspace_root},
+            )
+            return json.dumps(res, default=str, indent=2)
+
+        from ..graphify_engine.hub_bootstrap import discover_workspace_sources
+
+        res = discover_workspace_sources(str(safe_root))
+        return json.dumps(res, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_discover_workspace_sources: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_bootstrap_project_hub",
+    description="Zero-touch one-shot ProjectBrain Multi-Source Hub setup: ensure project DB, auto-discover & register sub-sources, sync Graphify ASTs + HSG memories, ingest shared docs, and auto-link cross-source contracts.",
+    annotations=ToolAnnotations(readOnlyHint=False),
+)
+async def projectbrain_bootstrap_project_hub(
+    project_id: str,
+    workspace_root: str = ".",
+    sources: Optional[List[Dict[str, Any]]] = None,
+    shared_docs: Optional[List[Dict[str, Any]]] = None,
+    relations: Optional[List[Dict[str, Any]]] = None,
+    auto_discover: bool = True,
+    sync_graphs: bool = True,
+    auto_link: bool = True,
+    upgrade_mode: str = "delta",
+    root_branch: str = "main",
+    author: str = "agent",
+    description: Optional[str] = None,
+) -> str:
+    """One-shot zero-touch multi-source project hub provisioning, syncing, and cross-linking."""
+    try:
+        if check_read_only():
+            return "Error: Operation not permitted. The ProjectBrain server is currently running in Read-Only mode."
+
+        safe_root = _validate_mcp_safe_path(workspace_root)
+        if sources:
+            for s in sources:
+                if isinstance(s, dict):
+                    raw_p = s.get("path") or s.get("workspace_subpath")
+                    if isinstance(raw_p, str) and raw_p.strip() and Path(raw_p.strip()).is_absolute():
+                        _validate_mcp_safe_path(raw_p)
+        if shared_docs:
+            for d in shared_docs:
+                if isinstance(d, dict):
+                    raw_p = d.get("path")
+                    if isinstance(raw_p, str) and raw_p.strip() and Path(raw_p.strip()).is_absolute():
+                        _validate_mcp_safe_path(raw_p)
+
+        if is_pb_remote_mode():
+            payload: Dict[str, Any] = {
+                "project_id": project_id,
+                "workspace_root": workspace_root,
+                "sources": sources,
+                "shared_docs": shared_docs,
+                "relations": relations,
+                "auto_discover": auto_discover,
+                "sync_graphs": sync_graphs,
+                "auto_link": auto_link,
+                "upgrade_mode": upgrade_mode,
+                "root_branch": root_branch,
+                "author": author,
+                "description": description,
+            }
+            res = await _pb_remote_v3_request(
+                "POST",
+                "/master/hub/bootstrap",
+                json_body=payload,
+                timeout=180.0,
+            )
+            return json.dumps(res, default=str, indent=2)
+
+        from ..graphify_engine.hub_bootstrap import bootstrap_project_hub
+
+        res = await bootstrap_project_hub(
+            project_id=project_id,
+            workspace_root=str(safe_root),
+            sources=sources,
+            shared_docs=shared_docs,
+            relations=relations,
+            auto_discover=auto_discover,
+            sync_graphs=sync_graphs,
+            auto_link=auto_link,
+            upgrade_mode=upgrade_mode,
+            root_branch=root_branch,
+            author=author,
+            description=description,
+        )
+        return json.dumps(res, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_bootstrap_project_hub: {str(e)}"
+
+
+@mcp_server.tool(
+    name="projectbrain_get_agent_setup_playbook",
+    description="Return a zero-touch self-setup playbook, copy-paste MCP sequence, and agent rules snippet (Claude Code, Cursor, Antigravity, Codex) for ProjectBrain Multi-Source Hub.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def projectbrain_get_agent_setup_playbook(
+    project_id: Optional[str] = None,
+    workspace_root: str = ".",
+) -> str:
+    """Return structured multi-source onboarding steps, MCP sequence, and rules snippet."""
+    try:
+        safe_root = _validate_mcp_safe_path(workspace_root)
+        from ..graphify_engine.hub_bootstrap import build_agent_setup_playbook
+
+        res = build_agent_setup_playbook(
+            project_id=project_id,
+            workspace_root=str(safe_root),
+        )
+        return json.dumps(res, default=str, indent=2)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Error executing projectbrain_get_agent_setup_playbook: {str(e)}"
+
+
+@mcp_server.resource(
+    "projectbrain://guides/agent-multi-source-setup",
+    name="agent-multi-source-setup",
+    description="Zero-touch onboarding playbook and rules snippet for external AI agents (Claude Code, Cursor, Antigravity, Codex) using ProjectBrain Multi-Source Hub.",
+    mime_type="application/json",
+)
+def agent_multi_source_setup_resource() -> str:
+    """Serve the ProjectBrain Multi-Source Hub zero-touch setup playbook as an MCP resource."""
+    from ..graphify_engine.hub_bootstrap import build_agent_setup_playbook
+
+    return json.dumps(build_agent_setup_playbook(), default=str, indent=2)
 
 
 # Dynamically register custom extensions

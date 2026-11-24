@@ -52,20 +52,35 @@ class Memory:
                 res["id"] = res["root_memory_id"]
             return res
 
-    async def search(self, query: str, user_id: str = None, limit: int = 10, **kwargs) -> List[Dict[str, Any]]:
+    async def search(
+        self,
+        query: str,
+        user_id: str = None,
+        limit: int = 10,
+        source_id: Optional[str] = None,
+        include_shared_docs: bool = True,
+        relation_depth: int = 1,
+        relation_types: Optional[List[str]] = None,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
         uid = user_id or self.default_user
         if self.mode == "remote":
             import httpx
             headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            payload: Dict[str, Any] = {
+                "query": query,
+                "user_id": uid,
+                "limit": limit,
+                "source_id": source_id,
+                "include_shared_docs": include_shared_docs,
+                "relation_depth": relation_depth,
+                "relation_types": relation_types,
+                "filters": kwargs,
+            }
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
                     f"{self.url}/memory/search",
-                    json={
-                        "query": query,
-                        "user_id": uid,
-                        "limit": limit,
-                        "filters": kwargs
-                    },
+                    json=payload,
                     headers=headers
                 )
                 resp.raise_for_status()
@@ -73,6 +88,12 @@ class Memory:
         else:
             filters = kwargs.copy()
             filters["user_id"] = uid
+            if source_id is not None:
+                filters["source_id"] = source_id
+            filters.setdefault("include_shared_docs", include_shared_docs)
+            filters.setdefault("relation_depth", relation_depth)
+            if relation_types is not None and "relation_types" not in filters:
+                filters["relation_types"] = relation_types
             return await hsg_query(query, limit, filters)
 
     async def get(self, memory_id: str):
