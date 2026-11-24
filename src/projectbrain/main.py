@@ -1365,6 +1365,131 @@ def run_v3_rca(
     return res
 
 
+def run_client_install(
+    target_dir: str = ".",
+    server_url: Optional[str] = None,
+    token: Optional[str] = None,
+    project_id: Optional[str] = None,
+    source_id: Optional[str] = None,
+    ide: str = "all",
+    bootstrap: bool = False,
+    local_kit: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Install ProjectBrain skills, workflows, IDE commands, and .mcp.json into target_dir."""
+    import io
+    import json
+    import tarfile
+    import tempfile
+    from pathlib import Path
+    import httpx
+    from .server.routes.client_kit import (
+        get_kit_root,
+        merge_mcp_json,
+        safe_install_kit_tree,
+    )
+
+    resolved_target = Path(target_dir or ".").expanduser().resolve()
+    eff_server_url = (
+        server_url
+        or os.getenv("PB_SERVER_URL")
+        or os.getenv("PB_URL")
+        or os.getenv("PB_API_URL")
+        or os.getenv("OM_URL")
+        or os.getenv("OM_API_URL")
+        or "http://localhost:8080"
+    ).strip().rstrip("/")
+    eff_token = (
+        token
+        or os.getenv("PB_AUTH_TOKEN")
+        or os.getenv("PB_TOKEN")
+        or os.getenv("PB_API_KEY")
+        or os.getenv("OM_API_KEY")
+        or ""
+    ).strip()
+    eff_project_id = (
+        project_id
+        or os.getenv("PB_PROJECT_ID")
+        or os.getenv("PB_DEFAULT_USER_ID")
+        or resolved_target.name
+        or "default"
+    ).strip()
+
+    kit_source_label = "local"
+    if local_kit:
+        kit_root = Path(local_kit).expanduser().resolve()
+        if not (kit_root / ".agents" / "skills").is_dir():
+            print(f"Error: Local kit directory '{kit_root}' does not contain '.agents/skills'.")
+            sys.exit(1)
+        summary = safe_install_kit_tree(kit_root, resolved_target, ide=ide)
+    else:
+        resolved_local: Optional[Path] = None
+        try:
+            resolved_local = get_kit_root()
+        except Exception:
+            resolved_local = None
+
+        if resolved_local is not None:
+            summary = safe_install_kit_tree(resolved_local, resolved_target, ide=ide)
+        elif server_url:
+            kit_source_label = "remote"
+            resp = httpx.get(f"{eff_server_url}/client-kit/bundle.tar.gz", timeout=60.0)
+            resp.raise_for_status()
+            with tempfile.TemporaryDirectory(prefix="pb_remote_kit_") as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                with tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+                    for member in tar.getmembers():
+                        if member.islnk() or member.issym():
+                            continue
+                        member_path = (tmp_path / member.name).resolve()
+                        if not member_path.is_relative_to(tmp_path.resolve()):
+                            raise ValueError(f"Unsafe archive path: {member.name}")
+                        tar.extract(member, path=tmp_path)
+                summary = safe_install_kit_tree(tmp_path, resolved_target, ide=ide)
+        else:
+            print("Error: Could not locate local ProjectBrain kit and no --server-url provided.")
+            sys.exit(1)
+
+    mcp_path = merge_mcp_json(
+        resolved_target,
+        server_url=eff_server_url,
+        token=eff_token,
+        project_id=eff_project_id,
+        source_id=source_id,
+    )
+
+    bootstrap_res: Optional[Dict[str, Any]] = None
+    if bootstrap:
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if eff_token:
+            headers["Authorization"] = f"Bearer {eff_token}"
+        boot_resp = httpx.post(
+            f"{eff_server_url}/master/hub/bootstrap",
+            json={
+                "project_id": eff_project_id,
+                "workspace_root": str(resolved_target),
+                "auto_discover": True,
+                "sync_graphs": True,
+                "auto_link": True,
+            },
+            headers=headers,
+            timeout=120.0,
+        )
+        boot_resp.raise_for_status()
+        bootstrap_res = boot_resp.json()
+
+    result = {
+        "status": "ok",
+        "mode": kit_source_label,
+        "mcp_json": str(mcp_path),
+        **summary,
+    }
+    if bootstrap_res is not None:
+        result["bootstrap"] = bootstrap_res
+
+    print(json.dumps(result, default=str, indent=2))
+    return result
+
+
 _CLI_VALUE_FLAGS = frozenset({
     "--branch",
     "--base-branch",
@@ -1404,6 +1529,13 @@ _CLI_VALUE_FLAGS = frozenset({
     "--ocr-device",
     "--local-ai-model",
     "--local-ai-url",
+    "--target-dir",
+    "--server-url",
+    "--token",
+    "--project-id",
+    "--source-id",
+    "--ide",
+    "--local-kit",
 })
 
 
@@ -1767,6 +1899,26 @@ def cli_main() -> None:
             cache_id=cache_id,
             db_path=db_path,
         )
+    elif len(sys.argv) > 1 and sys.argv[1] == "client-install":
+        pos_args = _get_positional_args(sys.argv[2:], _CLI_VALUE_FLAGS)
+        target_dir = _get_flag("--target-dir", None) or (pos_args[0] if pos_args else ".")
+        server_url = _get_flag("--server-url", None) or _get_flag("--url", None)
+        token = _get_flag("--token", None)
+        project_id = _get_flag("--project-id", None)
+        source_id = _get_flag("--source-id", None)
+        ide = _get_flag("--ide", "all")
+        local_kit = _get_flag("--local-kit", None)
+        bootstrap = "--bootstrap" in sys.argv
+        run_client_install(
+            target_dir=str(target_dir),
+            server_url=str(server_url) if isinstance(server_url, str) else None,
+            token=str(token) if isinstance(token, str) else None,
+            project_id=str(project_id) if isinstance(project_id, str) else None,
+            source_id=str(source_id) if isinstance(source_id, str) else None,
+            ide=str(ide) if isinstance(ide, str) else "all",
+            bootstrap=bootstrap,
+            local_kit=str(local_kit) if isinstance(local_kit, str) else None,
+        )
     else:
         print("ProjectBrain Python SDK / Server")
         print("Usage:")
@@ -1789,6 +1941,7 @@ def cli_main() -> None:
         print("  python -m projectbrain.main v3-plan <project_id> [--branch B] [--version-tag V] [--files f1,f2] [--artifacts a1,a2] [--db-path DB]")
         print("  python -m projectbrain.main v3-oracle <project_id> [--intent-id I] [--version-tag V] [--uart-log L] [--db-path DB]")
         print("  python -m projectbrain.main v3-rca <project_id> <log_text_or_file> [--run-id R] [--db-path DB]")
+        print("  python -m projectbrain.main client-install [--target-dir .] [--server-url URL] [--token TOK] [--project-id P] [--source-id S] [--ide all|claude|cursor|antigravity|codex] [--local-kit DIR] [--bootstrap]")
 
 
 if __name__ == "__main__":

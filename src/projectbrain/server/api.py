@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from ..core.config import env
-from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth, graphify, kb, plugins_v3, master_topology, project_sources
+from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth, graphify, kb, plugins_v3, master_topology, project_sources, client_kit
 
 logger = logging.getLogger("server")
 
@@ -282,6 +282,8 @@ def create_app() -> FastAPI:
             or path.startswith("/static/")
             or path.startswith("/dashboard")
             or path.startswith("/mcp")
+            or normalized_path == "/client-kit"
+            or path.startswith("/client-kit/")
         ):
             return await call_next(request)
 
@@ -630,6 +632,7 @@ def create_app() -> FastAPI:
     app.include_router(kb.router)
     app.include_router(plugins_v3.router)
     app.include_router(pm.router, prefix="/pm", tags=["pm"])
+    app.include_router(client_kit.router)
 
     # Mount FastMCP SSE app and Streamable HTTP app
     from ..ai.mcp import mcp_server
