@@ -365,6 +365,7 @@ See the complete guide with copy-paste `AGENTS.md` / `CLAUDE.md` / `.cursorrules
 
 ## Documentation
 
+- **[Comprehensive End-to-End Vietnamese User Manual v3.0 (Hướng Dẫn Sử Dụng Toàn Diện)](docs/kb/HUONG_DAN_SU_DUNG_TOAN_DIEN_V3.md)** — Full visual guide from 1-click Server & Client Kit installation, 16-route Web UI walkthrough (18 screenshots), Multi-Source Hub, OCR/AI Settings, to AI Agent Skills (`SKILL.md` + `sub/*.md`) & `/pb-*` commands.
 - [Multi-Source Project Hub & Agent Auto-Setup Guide](docs/kb/HUONG_DAN_MULTI_SOURCE_VA_AGENT_AUTO_SETUP.md) — Zero-touch setup for external AI agents (`AGENTS.md` / `CLAUDE.md` / `.cursorrules`), `project_id@source_id:branch` isolation, `__shared__` docs, independent sub-source delta upgrades, and cross-source drift detection.
 - [Web UI & Multi-Tenant RBAC Guide](docs/kb/HUONG_DAN_WEB_UI_VA_PHAN_QUYEN_RBAC.md) — Dashboard workflows, project/branch isolation, and `admin` / `collaborator` / `reader` permissions.
 - [MCP, Branch Overlay, Document Versioning & Plugins Guide](docs/kb/HUONG_DAN_MCP_BRANCH_VERSION_VA_PLUGINS.md) — End-to-end MCP setup, multi-schema branch overlays, versioned document deltas, and plugin operations.
