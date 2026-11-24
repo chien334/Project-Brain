@@ -302,6 +302,10 @@ h2 {
     margin-bottom: 0.25rem;
 }
 
+h2[tabindex="-1"]:focus:not(:focus-visible) {
+    outline: none;
+}
+
 h3 {
     font-size: 1rem;
     font-weight: 600;
@@ -707,23 +711,108 @@ input:user-valid {
     white-space: nowrap;
 }
 
-.view-breadcrumb {
+.header-route-stack {
     display: flex;
     flex-direction: column;
-    line-height: 1.15;
+    gap: 0.18rem;
+    min-width: 0;
 }
 
-.breadcrumb-domain {
-    font-family: var(--font-mono);
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
+.breadcrumb > ol {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-size: 0.8rem;
+    line-height: 1.25;
+}
+
+.breadcrumb > ol > li {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+}
+
+.breadcrumb > ol > li + li::before {
+    content: "/" / "";
+    margin-inline-end: 0.35rem;
     color: var(--text-muted);
 }
 
-#activeViewTitle {
-    font-size: 1.05rem;
+.breadcrumb > ol > li > a {
+    color: var(--text-muted);
+    text-decoration: none;
+    font-weight: 500;
+    border-radius: 4px;
+    padding: 0.06rem 0.18rem;
+    position: relative;
+    transition: color var(--transition);
+}
+
+.breadcrumb > ol > li > a:hover,
+.breadcrumb > ol > li > a:focus-visible {
+    color: var(--text-primary);
+    text-decoration: underline;
+    text-underline-offset: 0.18em;
+}
+
+.breadcrumb > ol > li > a:focus-visible {
+    z-index: 1;
+    outline: 2px solid var(--brand);
+    outline-offset: 2px;
+}
+
+.breadcrumb > ol > li > a[aria-current="page"] {
+    color: var(--text-primary);
+    font-family: var(--font-display);
     font-weight: 700;
+    font-size: 0.92rem;
+}
+
+.route-url-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    min-width: 0;
+}
+
+.route-path-chip {
+    font-size: 0.72rem;
+    line-height: 1.25;
+    padding: 0.08rem 0.45rem;
+    border-radius: 4px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    color: var(--brand);
+    max-inline-size: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.btn-route-copy {
+    width: 22px;
+    height: 22px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.7rem;
+    flex-shrink: 0;
+    transition: color var(--transition), border-color var(--transition), background var(--transition);
+}
+
+.btn-route-copy:hover {
+    color: var(--brand);
+    border-color: var(--brand);
+    background: var(--brand-tint);
 }
 
 .project-selector-wrapper,
@@ -907,6 +996,7 @@ input:user-valid {
     background: var(--bg-elevated);
     border: 1px solid var(--border-subtle);
     color: var(--text-primary);
+    text-decoration: none;
     width: 32px;
     height: 32px;
     border-radius: var(--radius-sm);
@@ -1020,6 +1110,9 @@ input:user-valid {
     gap: 0.7rem;
     padding: 0.25rem 0.5rem 0.85rem;
     border-bottom: 1px solid var(--border-subtle);
+    text-decoration: none;
+    color: inherit;
+    border-radius: var(--radius-sm);
 }
 
 .sidebar-brand-text {
@@ -1069,6 +1162,7 @@ input:user-valid {
     background: transparent;
     border: 1px solid transparent;
     color: var(--text-muted);
+    text-decoration: none;
     padding: 0.55rem 0.65rem;
     border-radius: var(--radius-sm);
     text-align: left;
@@ -1079,7 +1173,7 @@ input:user-valid {
     display: flex;
     align-items: center;
     gap: 0.65rem;
-    transition: background var(--transition), color var(--transition), border-color var(--transition);
+    transition: background var(--transition), color var(--transition), border-color var(--transition), box-shadow var(--transition);
 }
 
 .menu-link i {
@@ -1111,13 +1205,16 @@ input:user-valid {
     color: var(--text-primary);
 }
 
+.menu-link[aria-current="page"],
 .menu-link.active {
     background: var(--brand-tint);
     color: var(--brand);
-    border-color: color-mix(in oklab, var(--brand) 30%, transparent);
+    border-color: var(--brand);
+    box-shadow: inset 3px 0 0 var(--brand);
     font-weight: 600;
 }
 
+.menu-link[aria-current="page"] .nav-badge,
 .menu-link.active .nav-badge {
     background: var(--brand);
     color: var(--brand-on);
@@ -1136,11 +1233,60 @@ input:user-valid {
     padding: 0.65rem;
 }
 
-/* Main Content Area */
+/* Main Content Area & Contextual Domain Sub-Navigation */
 .main-content {
-    padding: 1.75rem 2rem;
+    padding: 1.45rem 2rem 1.85rem;
     min-width: 0;
     overflow-y: auto;
+}
+
+.domain-subnav-bar {
+    margin-bottom: 1.35rem;
+    border-bottom: 1px solid var(--border-subtle);
+    overflow-x: auto;
+}
+
+.domain-subnav-list {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    list-style: none;
+    margin: 0;
+    padding: 0 0 0.6rem 0;
+    flex-wrap: wrap;
+}
+
+.domain-subnav-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.4rem 0.78rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 0.82rem;
+    font-weight: 500;
+    white-space: nowrap;
+    transition: background var(--transition), color var(--transition), border-color var(--transition), box-shadow var(--transition);
+}
+
+.domain-subnav-link i {
+    font-size: 0.85rem;
+}
+
+.domain-subnav-link:hover {
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    border-color: var(--border-subtle);
+}
+
+.domain-subnav-link[aria-current="page"] {
+    background: var(--brand-tint);
+    color: var(--brand);
+    border-color: var(--brand);
+    box-shadow: inset 0 -2px 0 var(--brand);
+    font-weight: 600;
 }
 
 .tab-content {
@@ -1150,6 +1296,12 @@ input:user-valid {
 .tab-content.active {
     display: block;
     animation: fadeIn 180ms ease-out;
+}
+
+@supports (view-transition-name: none) {
+    .tab-content.active {
+        animation: none;
+    }
 }
 
 @keyframes fadeIn {
@@ -1341,6 +1493,7 @@ input:user-valid {
     font-family: var(--font-sans);
     font-size: 0.85rem;
     font-weight: 500;
+    text-decoration: none;
     padding: 0.55rem 1rem;
     border-radius: var(--radius-sm);
     border: 1px solid transparent;
@@ -2984,6 +3137,51 @@ dialog::backdrop {
     gap: 1rem;
 }
 
+.dialog-header-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.ai-studio-layout {
+    display: grid;
+    grid-template-columns: minmax(280px, 0.85fr) minmax(0, 1.35fr);
+    gap: 1.25rem;
+    align-items: start;
+}
+
+.ai-routing-chain {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+}
+
+.ai-routing-chain li {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding: 0.65rem 0.8rem;
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-left: 3px solid var(--brand);
+    font-size: 0.82rem;
+}
+
+.ai-routing-chain li strong {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.ai-routing-chain li span {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    line-height: 1.45;
+}
+
 .dialog-header h2 {
     font-size: 1.15rem;
     margin: 0;
@@ -3136,9 +3334,20 @@ dialog::backdrop {
     .kpi-card,
     .wb-dialog,
     .menu-link.active,
+    .menu-link[aria-current="page"],
+    .domain-subnav-link[aria-current="page"],
     .status-tag,
     .diff-badge {
         border: 1px solid CanvasText;
+    }
+
+    .menu-link[aria-current="page"],
+    .domain-subnav-link[aria-current="page"] {
+        border: 2px solid Highlight;
+    }
+
+    .breadcrumb > ol > li > a[aria-current="page"] {
+        text-decoration: underline;
     }
 
     .sub-tab-btn[aria-selected="true"]::after,
@@ -3154,6 +3363,12 @@ dialog::backdrop {
         animation-duration: 0.01ms !important;
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
+    }
+
+    ::view-transition-group(*),
+    ::view-transition-old(*),
+    ::view-transition-new(*) {
+        animation: none !important;
     }
 }
 
@@ -3434,6 +3649,7 @@ dialog::backdrop {
     }
 
     .auth-layout,
+    .ai-studio-layout,
     .copilot-results-container,
     .graph-layout {
         grid-template-columns: 1fr;
