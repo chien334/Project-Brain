@@ -17,7 +17,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import uuid
 import xml.etree.ElementTree as ET
@@ -27,15 +29,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import networkx as nx
 
+from projectbrain.graphify_engine.extractor_registry import get_default_registry
 from projectbrain.graphify_engine.legacy_encoding import (
     decode_legacy_bytes,
     read_text_with_encoding,
 )
 
 logger = logging.getLogger(__name__)
-
-# Guard external graphify.extract calls in case Tree-sitter reuses module-level C Parser state.
-_TREE_SITTER_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Concurrency-Safe Defensive DTO Import Pattern
@@ -2715,114 +2715,14 @@ class GraphifyExtractor:
         project_id: str,
         branch: str,
     ) -> GraphDelta:
-        """Extract code symbols using `graphify.extract.extract`, Python AST, and legacy parsers."""
-        nodes: List[GraphNode] = []
-        edges: List[GraphEdge] = []
-        ext = file_path.suffix.lower()
-
-        text = ""
-        detected_encoding = "utf-8"
-        try:
-            text, detected_encoding = read_text_with_encoding(file_path)
-        except Exception as err:
-            logger.debug("read_text_with_encoding failed on %s: %s", rel_path, err)
-
-        # 1. Dispatch legacy/industrial formats handled directly by deterministic parsers
-        if ext in _ST_LASAL_EXTS:
-            nodes, edges = _parse_st_lasal(text, rel_path, project_id, detected_encoding)
-            return GraphDelta(project_id=project_id, branch=branch, nodes=nodes, edges=edges, hyperedges=[])
-        if ext in _IDL_EXTS:
-            nodes, edges = _parse_idl(text, rel_path, project_id, detected_encoding)
-            return GraphDelta(project_id=project_id, branch=branch, nodes=nodes, edges=edges, hyperedges=[])
-        if ext in _DEF_EXTS:
-            nodes, edges = _parse_def(text, rel_path, project_id, detected_encoding)
-            return GraphDelta(project_id=project_id, branch=branch, nodes=nodes, edges=edges, hyperedges=[])
-        if ext in _RC_EXTS:
-            nodes, edges = _parse_rc(text, rel_path, project_id, detected_encoding)
-            return GraphDelta(project_id=project_id, branch=branch, nodes=nodes, edges=edges, hyperedges=[])
-        if ext in _VB6_EXTS:
-            nodes, edges = _parse_vb6(text, rel_path, project_id, detected_encoding)
-            return GraphDelta(project_id=project_id, branch=branch, nodes=nodes, edges=edges, hyperedges=[])
-        if ext in _DELPHI_EXTS:
-            nodes, edges = _parse_delphi(text, rel_path, project_id, detected_encoding)
-            return GraphDelta(project_id=project_id, branch=branch, nodes=nodes, edges=edges, hyperedges=[])
-        if ext in _COBOL_EXTS:
-            nodes, edges = _parse_cobol(text, rel_path, project_id, detected_encoding)
-            return GraphDelta(project_id=project_id, branch=branch, nodes=nodes, edges=edges, hyperedges=[])
-        if ext in _SQL_EXTS or ext in _SCRIPT_REG_EXTS:
-            nodes, edges = _parse_sql_script_reg(text, rel_path, project_id, detected_encoding)
-            return GraphDelta(project_id=project_id, branch=branch, nodes=nodes, edges=edges, hyperedges=[])
-
-        # 2. Try graphify tree-sitter extraction (skip raw UTF-16 bytes where tree-sitter expects UTF-8)
-        extracted_ok = False
-        if not detected_encoding.startswith("utf-16") and ext not in (".inl", ".tpp"):
-            try:
-                import graphify.extract as g_extract  # type: ignore
-
-                with _TREE_SITTER_LOCK:
-                    raw = g_extract.extract([file_path])
-                if raw and (raw.get("nodes") or raw.get("edges")):
-                    for n in raw.get("nodes", []):
-                        nid = str(n.get("id") or "")
-                        if not nid:
-                            continue
-                        nodes.append(
-                            GraphNode(
-                                id=nid,
-                                project_id=project_id,
-                                label=str(n.get("label") or nid),
-                                file_type="code",
-                                source_file=rel_path,
-                                source_location=n.get("source_location"),
-                                metadata={
-                                    k: v
-                                    for k, v in n.items()
-                                    if k not in ("id", "label", "file_type", "source_file", "source_location", "community")
-                                },
-                            )
-                        )
-                    for e in raw.get("edges", []):
-                        src = str(e.get("source") or "")
-                        tgt = str(e.get("target") or "")
-                        if not src or not tgt:
-                            continue
-                        edges.append(
-                            GraphEdge(
-                                project_id=project_id,
-                                source=src,
-                                target=tgt,
-                                relation=str(e.get("relation") or "calls"),
-                                confidence=str(e.get("confidence") or "EXTRACTED"),
-                                confidence_score=float(e.get("confidence_score", 1.0)),
-                                source_file=rel_path,
-                                source_location=e.get("source_location"),
-                                weight=float(e.get("weight", 1.0)),
-                            )
-                        )
-                    extracted_ok = True
-            except Exception as err:
-                logger.debug("graphify.extract failed on %s: %s. Falling back to internal AST.", rel_path, err)
-
-        # 3. C/C++ legacy augmentation (macros, #pragma pack structs, enums, prototypes, Win32 APIs)
-        if ext in _CPP_LEGACY_EXTS:
-            nodes, edges = _parse_cpp_legacy(
-                text,
-                rel_path,
-                project_id,
-                detected_encoding,
-                existing_nodes=nodes,
-                existing_edges=edges,
-            )
-        # 4. Python AST Fallback if graphify produced nothing or errored on Python
-        elif not extracted_ok and ext in (".py", ".pyw"):
-            nodes, edges = self._python_ast_fallback(file_path, rel_path, project_id)
-
-        return GraphDelta(
+        """Extract code symbols via the unified ExtractorRegistry (UTF-8 staged Tree-sitter + legacy/C++ backends)."""
+        registry = getattr(self, "_extractor_registry", None) or get_default_registry()
+        return registry.extract_code(
+            file_path=file_path,
+            rel_path=rel_path,
             project_id=project_id,
             branch=branch,
-            nodes=nodes,
-            edges=edges,
-            hyperedges=[],
+            python_fallback_fn=self._python_ast_fallback,
         )
 
     def _python_ast_fallback(
@@ -3451,13 +3351,84 @@ class GraphifyExtractor:
             else:
                 resolved_workers = min(eff_workers, len(uncached_tasks))
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=resolved_workers) as executor:
-                for idx, file_delta in executor.map(_extract_single_file, uncached_tasks):
+        registry = getattr(self, "_extractor_registry", None) or get_default_registry()
+        batch_ts_tasks: List[Tuple[int, Path, str, bool, str, str]] = []
+        remaining_tasks: List[Tuple[int, Path, str, bool, str, str]] = []
+        for task in uncached_tasks:
+            _, fpath, _, is_code, _, _ = task
+            if is_code and registry.is_graphify_ts_batch_eligible(fpath.suffix):
+                batch_ts_tasks.append(task)
+            else:
+                remaining_tasks.append(task)
+
+        # Batch graphify.extract execution for pass-2 cross-file INFERRED edge resolution
+        if batch_ts_tasks:
+            ws_root_resolved = ws_root.resolve()
+            pb_dir = ws_root / ".projectbrain"
+            pb_dir_existed = pb_dir.exists() or pb_dir.is_symlink()
+            staging_dir: Optional[Path] = None
+            used_pb_dir = False
+            try:
+                if not pb_dir.is_symlink() and pb_dir.resolve().is_relative_to(ws_root_resolved):
+                    pb_dir.mkdir(parents=True, exist_ok=True)
+                    if (
+                        not pb_dir.is_symlink()
+                        and pb_dir.is_dir()
+                        and pb_dir.resolve().is_relative_to(ws_root_resolved)
+                    ):
+                        candidate_stage = Path(tempfile.mkdtemp(prefix="_utf8_stage_", dir=str(pb_dir)))
+                        os.chmod(candidate_stage, 0o700)
+                        if candidate_stage.resolve().is_relative_to(ws_root_resolved):
+                            staging_dir = candidate_stage
+                            used_pb_dir = True
+                        else:
+                            shutil.rmtree(candidate_stage, ignore_errors=True)
+            except OSError:
+                staging_dir = None
+
+            if staging_dir is None:
+                try:
+                    staging_dir = Path(tempfile.mkdtemp(prefix="pb_batch_"))
+                    os.chmod(staging_dir, 0o700)
+                except OSError:
+                    staging_dir = None
+
+            try:
+                batch_items = [(idx, fpath, rel_path) for idx, fpath, rel_path, _, _, _ in batch_ts_tasks]
+                batch_deltas = registry.extract_graphify_ts_batch(
+                    batch_items,
+                    project_id=project_id,
+                    branch=branch,
+                    staging_dir=staging_dir,
+                    python_fallback_fn=self._python_ast_fallback,
+                )
+                for task in batch_ts_tasks:
+                    idx, _, _, _, cache_key, _ = task
+                    if idx in batch_deltas:
+                        file_delta = batch_deltas[idx]
+                        per_file_deltas[idx] = file_delta
+                        if use_cache:
+                            self.save_cached_delta(cache_key, file_delta)
+                    else:
+                        remaining_tasks.append(task)
+            finally:
+                if staging_dir is not None and staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                if used_pb_dir and not pb_dir_existed and pb_dir.exists() and not pb_dir.is_symlink():
+                    try:
+                        pb_dir.rmdir()
+                    except OSError:
+                        pass
+
+        if remaining_tasks:
+            if resolved_workers > 1 and len(remaining_tasks) >= 2:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=resolved_workers) as executor:
+                    for idx, file_delta in executor.map(_extract_single_file, remaining_tasks):
+                        per_file_deltas[idx] = file_delta
+            else:
+                for task in remaining_tasks:
+                    idx, file_delta = _extract_single_file(task)
                     per_file_deltas[idx] = file_delta
-        else:
-            for task in uncached_tasks:
-                idx, file_delta = _extract_single_file(task)
-                per_file_deltas[idx] = file_delta
 
         nodes: List[GraphNode] = []
         edges: List[GraphEdge] = []
