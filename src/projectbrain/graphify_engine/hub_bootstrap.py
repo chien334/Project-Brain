@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -24,6 +25,11 @@ from ..memory.hsg import (
 from .cross_source_linker import CrossSourceLinker
 from .doc_versioning import derive_doc_key, ingest_document_versioned
 from .extractor import CODE_EXTENSIONS, GraphifyExtractor
+from .legacy_encoding import (
+    _looks_like_utf16_no_bom,
+    decode_legacy_bytes,
+    read_text_with_encoding,
+)
 from .store import get_graph_store
 
 logger = logging.getLogger(__name__)
@@ -224,6 +230,432 @@ def _has_typescript_files(dir_path: Path) -> bool:
     return False
 
 
+_SLN_SOLUTION_FOLDER_GUID = "2150E333-8FDC-42A3-9474-1A3956D46DE8"
+
+_SLN_TYPE_GUID_LANG: Dict[str, str] = {
+    "8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942": "cpp",
+    "FAE04EC0-301F-11D3-BF4B-00C04F79EFBC": "csharp",
+    "9A19103F-16F7-4668-BE54-9A1E7A4F7556": "csharp",
+    "F184B08F-C81C-45F6-A57F-5ABD9991F28F": "vbnet",
+    "778DAE3C-4631-46EA-AA77-85C1314464D9": "vbnet",
+}
+
+_VS_EXT_LANG: Dict[str, str] = {
+    ".vcxproj": "cpp",
+    ".vcproj": "cpp",
+    ".csproj": "csharp",
+    ".vbproj": "vbnet",
+}
+
+_LEGACY_TEXT_DOC_EXTS: Set[str] = {
+    ".md",
+    ".markdown",
+    ".txt",
+    ".rst",
+    ".adoc",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".ini",
+    ".conf",
+}
+
+_LEGACY_MANIFEST_EXTS: Set[str] = {
+    ".sln",
+    ".vcxproj",
+    ".vcproj",
+    ".csproj",
+    ".vbproj",
+    ".lcp",
+    ".lxp",
+    ".pro",
+    ".vbp",
+    ".dpr",
+    ".dproj",
+}
+
+_LEGACY_MANIFEST_NAMES: Set[str] = {
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "Cargo.toml",
+    "pom.xml",
+    "CMakeLists.txt",
+    "Makefile",
+    "GNUmakefile",
+}
+
+
+def _xml_local_tag(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def _inspect_legacy_code_hints(dir_path: Path, entries: Dict[str, Path]) -> Dict[str, Any]:
+    """Quickly inspect project source files for Windows Service, DLL, or Desktop UI indicators."""
+    hints: Dict[str, Any] = {
+        "is_service": False,
+        "is_dll": False,
+        "is_desktop": False,
+        "has_mfc": False,
+        "has_win32": False,
+        "has_rc": False,
+        "has_def": False,
+        "has_c_only": True,
+        "has_cpp": False,
+    }
+    scan_exts = {".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".cs", ".rc", ".def", ".idl"}
+    files_to_scan: List[Path] = []
+    for name, p in sorted(entries.items()):
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext == ".rc":
+            hints["has_rc"] = True
+            hints["is_desktop"] = True
+        elif ext == ".def":
+            hints["has_def"] = True
+            hints["is_dll"] = True
+        if ext in (".cpp", ".hpp", ".cc", ".cxx"):
+            hints["has_cpp"] = True
+            hints["has_c_only"] = False
+        elif ext == ".c":
+            pass
+        if ext in scan_exts:
+            files_to_scan.append(p)
+
+    # Also check immediate src/ or include/ files if top dir only holds manifest
+    for sub_name in ("src", "source", "include"):
+        sub_p = entries.get(sub_name)
+        if sub_p is not None and sub_p.is_dir():
+            try:
+                for item in sorted(sub_p.iterdir()):
+                    if item.is_file() and item.suffix.lower() in scan_exts:
+                        if item.suffix.lower() in (".cpp", ".hpp", ".cc", ".cxx"):
+                            hints["has_cpp"] = True
+                            hints["has_c_only"] = False
+                        files_to_scan.append(item)
+            except Exception:
+                pass
+
+    svc_re = re.compile(
+        r"\b(?:RegisterServiceCtrlHandler(?:Ex)?[AW]?|StartServiceCtrlDispatcher[AW]?|ServiceMain|ServiceBase|SERVICE_STATUS|SERVICE_TABLE_ENTRY)\b"
+    )
+    ui_re = re.compile(
+        r"\b(?:SendMessage(?:Timeout)?[AW]?|PostMessage[AW]?|FindWindow(?:Ex)?[AW]?|DialogBox(?:Param)?[AW]?|CreateWindow(?:Ex)?[AW]?|Application\.Run|InitializeComponent)\b"
+    )
+    mfc_re = re.compile(r"\b(?:CDialog|CWinApp|CWnd|BEGIN_MESSAGE_MAP|ON_MESSAGE|afxwin\.h)\b")
+    win32_re = re.compile(r"\b(?:CreateNamedPipe|CreateFileMapping|OpenFileMapping|CoCreateInstance|LoadLibrary|WSAStartup)\b")
+
+    for fpath in files_to_scan[:20]:
+        try:
+            if fpath.stat().st_size > 512 * 1024:
+                continue
+            txt, _ = read_text_with_encoding(fpath)
+        except Exception:
+            continue
+        if svc_re.search(txt):
+            hints["is_service"] = True
+        if "__declspec" in txt and "dllexport" in txt:
+            hints["is_dll"] = True
+        if ui_re.search(txt):
+            hints["is_desktop"] = True
+        if mfc_re.search(txt):
+            hints["has_mfc"] = True
+            hints["is_desktop"] = True
+        if win32_re.search(txt):
+            hints["has_win32"] = True
+
+    return hints
+
+
+def _parse_vs_project_manifest(proj_file: Path, entries: Dict[str, Path]) -> Dict[str, Any]:
+    """Parse `.vcxproj`/`.vcproj`/`.csproj`/`.vbproj` XML for language, source_type, and references."""
+    ext = proj_file.suffix.lower()
+    lang = _VS_EXT_LANG.get(ext, "cpp")
+    tech_stack: List[str] = [lang]
+    if lang == "cpp":
+        tech_stack.append("msvc")
+    elif lang in ("csharp", "vbnet"):
+        tech_stack.append("dotnet")
+
+    config_type = ""
+    subsystem = ""
+    output_type = ""
+    use_mfc = ""
+    use_atl = ""
+    use_winforms = ""
+    use_wpf = ""
+    project_guid = ""
+    target_name = ""
+    project_refs: List[Dict[str, str]] = []
+    lib_deps: List[str] = []
+
+    try:
+        raw_xml, _ = read_text_with_encoding(proj_file)
+        root_elem = ET.fromstring(raw_xml)
+        for elem in root_elem.iter():
+            tag = _xml_local_tag(elem.tag)
+            txt = (elem.text or "").strip()
+            if tag == "ConfigurationType" and txt:
+                config_type = txt
+            elif tag == "SubSystem" and txt:
+                subsystem = txt
+            elif tag == "OutputType" and txt:
+                output_type = txt
+            elif tag == "UseOfMfc" and txt:
+                use_mfc = txt
+            elif tag == "UseOfAtl" and txt:
+                use_atl = txt
+            elif tag == "UseWindowsForms" and txt:
+                use_winforms = txt
+            elif tag == "UseWPF" and txt:
+                use_wpf = txt
+            elif tag == "ProjectGuid" and txt:
+                project_guid = txt.strip("{}").upper()
+            elif tag in ("TargetName", "AssemblyName") and txt and not target_name:
+                target_name = txt
+            elif tag == "ProjectReference":
+                inc = elem.get("Include") or ""
+                ref_guid = ""
+                for child in elem:
+                    if _xml_local_tag(child.tag) == "Project" and child.text:
+                        ref_guid = child.text.strip("{}").upper()
+                if inc or ref_guid:
+                    project_refs.append({"include": inc, "guid": ref_guid})
+            elif tag == "AdditionalDependencies" and txt:
+                for tok in txt.split(";"):
+                    clean_tok = tok.strip()
+                    if clean_tok and not clean_tok.startswith("%"):
+                        lib_deps.append(clean_tok)
+            elif tag == "Configuration" and ext == ".vcproj":
+                ct_attr = elem.get("ConfigurationType") or ""
+                if ct_attr == "2":
+                    config_type = "DynamicLibrary"
+                elif ct_attr == "4":
+                    config_type = "StaticLibrary"
+                elif ct_attr == "1" and not config_type:
+                    config_type = "Application"
+    except Exception:
+        pass
+
+    hints = _inspect_legacy_code_hints(proj_file.parent, entries)
+    dir_low = proj_file.parent.name.lower()
+
+    if (use_mfc and use_mfc.lower() not in ("false", "0", "none")) or hints["has_mfc"]:
+        if "mfc" not in tech_stack:
+            tech_stack.append("mfc")
+    if use_atl and use_atl.lower() not in ("false", "0", "none"):
+        tech_stack.append("atl")
+    if use_winforms.lower() == "true":
+        tech_stack.append("winforms")
+    if use_wpf.lower() == "true":
+        tech_stack.append("wpf")
+    if hints["has_win32"] or hints["is_service"] or hints["has_rc"]:
+        if "win32" not in tech_stack:
+            tech_stack.append("win32")
+
+    ct_low = config_type.lower()
+    ot_low = output_type.lower()
+    if ct_low in ("dynamiclibrary", "staticlibrary") or ot_low == "library" or (hints["has_def"] and not hints["is_service"]):
+        source_type = "native_lib"
+    elif hints["is_service"] or any(tok in dir_low for tok in ("service", "svc", "daemon")):
+        source_type = "win_service"
+    elif (
+        subsystem.lower() == "windows"
+        or ot_low == "winexe"
+        or use_winforms.lower() == "true"
+        or use_wpf.lower() == "true"
+        or (use_mfc and use_mfc.lower() not in ("false", "0", "none"))
+        or hints["is_desktop"]
+        or any(tok in dir_low for tok in ("hmi", "ui", "gui", "desktop", "client", "viewer"))
+    ):
+        source_type = "desktop_client"
+    else:
+        source_type = "backend"
+
+    return {
+        "source_type": source_type,
+        "tech_stack": tech_stack,
+        "language": lang,
+        "markers": [proj_file.name],
+        "_project_guid": project_guid,
+        "_target_name": target_name or proj_file.stem,
+        "_project_file": str(proj_file.resolve()),
+        "_project_references": project_refs,
+        "_additional_dependencies": lib_deps,
+    }
+
+
+def _has_dir_st_lasal_files(dir_path: Path, entries: Dict[str, Path]) -> Tuple[List[str], bool]:
+    """Check for LASAL `.lcp`/`.lxp` or Structured Text `.st`/`.scl`/`.pou` files."""
+    lcp_files = sorted(
+        name for name, p in entries.items() if p.is_file() and p.suffix.lower() in (".lcp", ".lxp")
+    )
+    st_files = sorted(
+        name for name, p in entries.items() if p.is_file() and p.suffix.lower() in (".st", ".scl", ".pou")
+    )
+    is_lasal = bool(lcp_files) or any(name.lower().endswith(".pou") for name in st_files)
+
+    if lcp_files and not st_files:
+        for sub_name in ("Source", "source", "src"):
+            sub_p = entries.get(sub_name)
+            if sub_p is not None and sub_p.is_dir():
+                try:
+                    for item in sorted(sub_p.iterdir()):
+                        if item.is_file() and item.suffix.lower() in (".st", ".scl", ".pou", ".exp"):
+                            st_files.append(f"{sub_name}/{item.name}")
+                except Exception:
+                    pass
+
+    if not is_lasal and st_files:
+        for rel_st in st_files[:5]:
+            try:
+                txt, _ = read_text_with_encoding(dir_path / rel_st)
+                if re.search(r"\b(?:SERVER|CLIENT|END_SERVER|END_CLIENT|LASAL)\b", txt, re.IGNORECASE):
+                    is_lasal = True
+                    break
+            except Exception:
+                pass
+
+    return lcp_files + st_files, is_lasal
+
+
+def _detect_legacy_source_markers(
+    dir_path: Path,
+    entries: Dict[str, Path],
+    rel_parts: Tuple[str, ...] = (),
+) -> Optional[Dict[str, Any]]:
+    """Inspect legacy C/C++/VS/PLC-ST/Qt/VB6/Delphi/CMake/Make manifests inside `dir_path`."""
+    # 7. Visual Studio project files (.vcxproj, .vcproj, .csproj, .vbproj)
+    for vs_ext in (".vcxproj", ".vcproj", ".csproj", ".vbproj"):
+        vs_files = sorted(
+            p for name, p in entries.items() if p.is_file() and name.lower().endswith(vs_ext)
+        )
+        if vs_files:
+            return _parse_vs_project_manifest(vs_files[0], entries)
+
+    # 8. PLC / Structured Text / Sigmatek LASAL (.lcp, .lxp, *.st, *.scl, *.pou)
+    plc_markers, is_lasal = _has_dir_st_lasal_files(dir_path, entries)
+    if plc_markers:
+        plc_stack = ["iec61131-st"]
+        if is_lasal:
+            plc_stack.append("lasal")
+        return {
+            "source_type": "plc_st",
+            "tech_stack": plc_stack,
+            "language": "st",
+            "markers": plc_markers[:5],
+        }
+
+    # 9. Qt project (*.pro)
+    pro_files = sorted(
+        p for name, p in entries.items() if p.is_file() and name.lower().endswith(".pro")
+    )
+    if pro_files:
+        pro_txt = ""
+        try:
+            pro_txt, _ = read_text_with_encoding(pro_files[0])
+        except Exception:
+            pass
+        if re.search(r"\b(?:QT|TARGET|SOURCES|HEADERS|TEMPLATE)\s*[+=]", pro_txt) or any(
+            p.is_file() and p.suffix.lower() in (".cpp", ".hpp", ".c", ".h") for p in entries.values()
+        ):
+            is_lib = bool(re.search(r"\bTEMPLATE\s*=\s*lib\b", pro_txt, re.IGNORECASE))
+            return {
+                "source_type": "native_lib" if is_lib else "desktop_client",
+                "tech_stack": ["cpp", "qt"],
+                "language": "cpp",
+                "markers": [pro_files[0].name],
+            }
+
+    # 10. VB6 project (*.vbp)
+    vbp_files = sorted(
+        p for name, p in entries.items() if p.is_file() and name.lower().endswith(".vbp")
+    )
+    if vbp_files:
+        vbp_txt = ""
+        try:
+            vbp_txt, _ = read_text_with_encoding(vbp_files[0])
+        except Exception:
+            pass
+        is_dll = bool(re.search(r"^\s*Type\s*=\s*(?:OleDll|Control)\b", vbp_txt, re.IGNORECASE | re.MULTILINE))
+        return {
+            "source_type": "native_lib" if is_dll else "desktop_client",
+            "tech_stack": ["vb6"],
+            "language": "vb6",
+            "markers": [vbp_files[0].name],
+        }
+
+    # 11. Delphi project (*.dpr, *.dproj)
+    dpr_files = sorted(
+        p
+        for name, p in entries.items()
+        if p.is_file() and name.lower().endswith((".dpr", ".dproj"))
+    )
+    if dpr_files:
+        dpr_txt = ""
+        try:
+            dpr_txt, _ = read_text_with_encoding(dpr_files[0])
+        except Exception:
+            pass
+        is_lib = bool(re.match(r"^\s*library\b", dpr_txt, re.IGNORECASE))
+        is_svc = "TService" in dpr_txt
+        return {
+            "source_type": "native_lib" if is_lib else ("win_service" if is_svc else "desktop_client"),
+            "tech_stack": ["delphi"],
+            "language": "delphi",
+            "markers": [dpr_files[0].name],
+        }
+
+    # 12. CMakeLists.txt
+    if "CMakeLists.txt" in entries and entries["CMakeLists.txt"].is_file():
+        cm_txt = ""
+        try:
+            cm_txt, _ = read_text_with_encoding(entries["CMakeLists.txt"])
+        except Exception:
+            pass
+        hints = _inspect_legacy_code_hints(dir_path, entries)
+        lang = "c" if hints["has_c_only"] and not hints["has_cpp"] else "cpp"
+        stack = [lang, "cmake"]
+        if "qt" in cm_txt.lower():
+            stack.append("qt")
+        has_lib = bool(re.search(r"\badd_library\s*\(", cm_txt, re.IGNORECASE))
+        has_exe = bool(re.search(r"\badd_executable\s*\(", cm_txt, re.IGNORECASE))
+        if has_lib and not has_exe:
+            src_type = "native_lib"
+        elif hints["is_service"]:
+            src_type = "win_service"
+        elif hints["is_desktop"] or "qt" in stack:
+            src_type = "desktop_client"
+        else:
+            src_type = "backend"
+        return {
+            "source_type": src_type,
+            "tech_stack": stack,
+            "language": lang,
+            "markers": ["CMakeLists.txt"],
+        }
+
+    # 13. Makefile / GNUmakefile
+    mk_name = next((m for m in ("Makefile", "GNUmakefile") if m in entries and entries[m].is_file()), None)
+    if mk_name:
+        hints = _inspect_legacy_code_hints(dir_path, entries)
+        lang = "c" if hints["has_c_only"] and not hints["has_cpp"] else "cpp"
+        src_type = (
+            "win_service"
+            if hints["is_service"]
+            else ("native_lib" if hints["is_dll"] else ("desktop_client" if hints["is_desktop"] else "backend"))
+        )
+        return {
+            "source_type": src_type,
+            "tech_stack": [lang, "make"],
+            "language": lang,
+            "markers": [mk_name],
+        }
+
+    return None
+
+
 def _detect_source_markers(
     dir_path: Path,
     *,
@@ -373,7 +805,144 @@ def _detect_source_markers(
             "markers": infra_markers,
         }
 
-    return None
+    # 7-13. Legacy C/C++, VS, PLC/LASAL ST, Qt, VB6, Delphi, CMake, Makefile
+    return _detect_legacy_source_markers(dir_path, entries, rel_parts=rel_parts)
+
+
+def _discover_sln_projects(
+    root: Path,
+) -> Tuple[List[Tuple[Path, Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Parse `.sln` files under `root` to discover child VS project directories and dependencies."""
+    sln_files: List[Path] = []
+    try:
+        sln_files = sorted(
+            (p for p in root.iterdir() if p.is_file() and p.suffix.lower() == ".sln"),
+            key=lambda p: p.name.lower(),
+        )
+    except Exception:
+        return [], []
+
+    if not sln_files:
+        return [], []
+
+    proj_header_re = re.compile(
+        r'^\s*Project\(\s*"\{?([0-9A-Fa-f-]+)\}?"\s*\)\s*=\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"\{?([0-9A-Fa-f-]+)\}?"',
+        re.IGNORECASE,
+    )
+    dep_guid_re = re.compile(r"^\s*\{?([0-9A-Fa-f-]+)\}?\s*=\s*\{?[0-9A-Fa-f-]+\}?\s*$")
+
+    discovered: List[Tuple[Path, Dict[str, Any]]] = []
+    raw_sln_deps: List[Dict[str, str]] = []
+
+    for sln_path in sln_files:
+        try:
+            content, _ = read_text_with_encoding(sln_path)
+        except Exception:
+            continue
+
+        lines = content.splitlines()
+        idx = 0
+        while idx < len(lines):
+            m_proj = proj_header_re.match(lines[idx])
+            if not m_proj:
+                idx += 1
+                continue
+
+            type_guid = m_proj.group(1).upper()
+            proj_name = m_proj.group(2).strip()
+            raw_rel = m_proj.group(3).strip().replace("\\", "/")
+            proj_guid = m_proj.group(4).upper()
+            idx += 1
+
+            dep_guids: List[str] = []
+            in_deps = False
+            while idx < len(lines):
+                line_s = lines[idx].strip()
+                if line_s.startswith("EndProject"):
+                    idx += 1
+                    break
+                if re.match(r"^ProjectSection\s*\(\s*ProjectDependencies\s*\)", line_s, re.IGNORECASE):
+                    in_deps = True
+                elif line_s.startswith("EndProjectSection"):
+                    in_deps = False
+                elif in_deps:
+                    dm = dep_guid_re.match(line_s)
+                    if dm:
+                        dep_guids.append(dm.group(1).upper())
+                idx += 1
+
+            # Ignore Solution Folders ({2150E333-8FDC-42A3-9474-1A3956D46DE8})
+            if type_guid == _SLN_SOLUTION_FOLDER_GUID:
+                continue
+            if not raw_rel or raw_rel.startswith(("http://", "https://")):
+                continue
+
+            rel_parts = Path(raw_rel).parts
+            if ".." in rel_parts or Path(raw_rel).is_absolute():
+                continue
+
+            cand_target = (sln_path.parent / raw_rel).resolve()
+            try:
+                _check_forbidden_path(raw_rel, cand_target)
+                if not cand_target.is_relative_to(root):
+                    continue
+            except Exception:
+                continue
+
+            if cand_target.is_dir():
+                proj_dir = cand_target
+                proj_file: Optional[Path] = None
+            else:
+                proj_dir = cand_target.parent
+                proj_file = cand_target if cand_target.is_file() else None
+
+            if not proj_dir.is_dir():
+                continue
+
+            try:
+                dir_entries = {p.name: p for p in proj_dir.iterdir()}
+            except Exception:
+                dir_entries = {}
+
+            if proj_file is not None and proj_file.suffix.lower() in _VS_EXT_LANG:
+                meta = _parse_vs_project_manifest(proj_file, dir_entries)
+            else:
+                meta = _detect_source_markers(proj_dir, rel_parts=proj_dir.relative_to(root).parts[:-1]) or {}
+                if not meta:
+                    inferred_lang = _SLN_TYPE_GUID_LANG.get(type_guid) or _VS_EXT_LANG.get(
+                        Path(raw_rel).suffix.lower(), "cpp"
+                    )
+                    meta = {
+                        "source_type": "backend",
+                        "tech_stack": [inferred_lang],
+                        "language": inferred_lang,
+                        "markers": [Path(raw_rel).name],
+                    }
+
+            if "language" not in meta:
+                meta["language"] = _SLN_TYPE_GUID_LANG.get(type_guid, "cpp")
+            markers = list(meta.get("markers") or [])
+            if sln_path.name not in markers:
+                markers.append(sln_path.name)
+            meta["markers"] = markers
+            meta["_sln_guid"] = proj_guid
+            meta["_sln_name"] = proj_name
+            meta["_sln_file"] = sln_path.name
+            if proj_file is not None:
+                meta["_project_file"] = str(proj_file.resolve())
+            discovered.append((proj_dir, meta))
+
+            for dg in dep_guids:
+                raw_sln_deps.append(
+                    {
+                        "from_guid": proj_guid,
+                        "from_dir": str(proj_dir.resolve()),
+                        "to_guid": dg,
+                        "sln_file": sln_path.name,
+                    }
+                )
+
+    return discovered, raw_sln_deps
 
 
 def _classify_shared_doc_role(rel_path: str) -> str:
@@ -392,13 +961,22 @@ def _classify_shared_doc_role(rel_path: str) -> str:
 
 
 def _is_probably_binary(file_path: Path) -> bool:
-    """Return True when file exceeds size limit or contains NUL bytes in prefix."""
+    """Return True when file exceeds size limit or contains non-UTF16 NUL bytes in prefix."""
     try:
         if file_path.stat().st_size > _MAX_SHARED_DOC_BYTES:
             return True
         with file_path.open("rb") as fh:
             chunk = fh.read(2048)
-        return b"\x00" in chunk
+        if b"\x00" not in chunk:
+            return False
+        # Allow UTF-16 LE/BE text files (with BOM or BOM-less heuristic)
+        if chunk.startswith(b"\xff\xfe") and not chunk.startswith(b"\xff\xfe\x00\x00"):
+            return False
+        if chunk.startswith(b"\xfe\xff"):
+            return False
+        if _looks_like_utf16_no_bom(chunk) is not None:
+            return False
+        return True
     except Exception:
         return True
 
@@ -507,18 +1085,164 @@ def _discover_shared_docs(root: Path) -> List[Dict[str, Any]]:
     return shared_docs
 
 
+def _merge_discovered_entry(
+    discovered_map: Dict[Path, Tuple[Path, Dict[str, Any]]],
+    src_dir: Path,
+    meta: Dict[str, Any],
+) -> None:
+    """Insert or merge discovered sub-source directory metadata keyed by resolved Path."""
+    res_dir = src_dir.resolve()
+    if res_dir not in discovered_map:
+        discovered_map[res_dir] = (src_dir, dict(meta))
+        return
+
+    _, existing = discovered_map[res_dir]
+    markers = list(existing.get("markers") or [])
+    for m in meta.get("markers") or []:
+        if m not in markers:
+            markers.append(m)
+    existing["markers"] = markers
+
+    tech = list(existing.get("tech_stack") or [])
+    for t in meta.get("tech_stack") or []:
+        if t not in tech:
+            tech.append(t)
+    existing["tech_stack"] = tech
+
+    for key in ("_sln_guid", "_sln_name", "_sln_file", "_project_guid", "_project_file", "_target_name", "language"):
+        if not existing.get(key) and meta.get(key):
+            existing[key] = meta[key]
+    if not existing.get("_project_references") and meta.get("_project_references"):
+        existing["_project_references"] = list(meta["_project_references"])
+    if not existing.get("_additional_dependencies") and meta.get("_additional_dependencies"):
+        existing["_additional_dependencies"] = list(meta["_additional_dependencies"])
+
+
+def _resolve_discovered_relations(
+    root: Path,
+    sources_meta: List[Tuple[str, Path, Dict[str, Any]]],
+    raw_sln_deps: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """Resolve `.sln` ProjectDependencies and `.vcxproj` `<ProjectReference>` into `depends_on` relations."""
+    by_guid: Dict[str, str] = {}
+    by_proj_file: Dict[Path, str] = {}
+    by_dir: Dict[Path, str] = {}
+    by_target_low: Dict[str, str] = {}
+
+    for sid, sdir, meta in sources_meta:
+        res_dir = sdir.resolve()
+        by_dir[res_dir] = sid
+        by_target_low.setdefault(sid.lower(), sid)
+        if meta.get("_sln_guid"):
+            by_guid[str(meta["_sln_guid"]).upper()] = sid
+        if meta.get("_project_guid"):
+            by_guid[str(meta["_project_guid"]).upper()] = sid
+        if meta.get("_sln_name"):
+            by_target_low.setdefault(str(meta["_sln_name"]).lower(), sid)
+        if meta.get("_target_name"):
+            by_target_low.setdefault(str(meta["_target_name"]).lower(), sid)
+        if meta.get("_project_file"):
+            by_proj_file[Path(str(meta["_project_file"])).resolve()] = sid
+
+    relations: List[Dict[str, Any]] = []
+    seen_edges: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    def _add_dep(src_sid: str, dst_sid: str, via: str, extra: Dict[str, Any]) -> None:
+        if not src_sid or not dst_sid or src_sid == dst_sid:
+            return
+        ek = (src_sid, dst_sid, "depends_on")
+        if ek in seen_edges:
+            prev_via = seen_edges[ek]["contract_metadata"].get("via", "")
+            if via not in prev_via:
+                seen_edges[ek]["contract_metadata"]["via"] = f"{prev_via}+{via}" if prev_via else via
+            return
+        rel_obj = {
+            "src_source_id": src_sid,
+            "dst_source_id": dst_sid,
+            "relation_type": "depends_on",
+            "contract_key": f"project_ref:{dst_sid}",
+            "contract_metadata": {"via": via, **extra},
+        }
+        seen_edges[ek] = rel_obj
+        relations.append(rel_obj)
+
+    # 1. .sln ProjectSection(ProjectDependencies)
+    for dep in raw_sln_deps:
+        src_sid = by_guid.get(dep["from_guid"]) or by_dir.get(Path(dep["from_dir"]).resolve())
+        dst_sid = by_guid.get(dep["to_guid"])
+        if src_sid and dst_sid:
+            _add_dep(
+                src_sid,
+                dst_sid,
+                "sln_project_dependencies",
+                {"sln_file": dep.get("sln_file"), "target_guid": dep["to_guid"]},
+            )
+
+    # 2. .vcxproj / .csproj <ProjectReference>
+    for sid, _sdir, meta in sources_meta:
+        proj_file_str = meta.get("_project_file")
+        if not proj_file_str:
+            continue
+        proj_file = Path(str(proj_file_str))
+        for pref in meta.get("_project_references") or []:
+            inc_raw = str(pref.get("include") or "").strip().replace("\\", "/")
+            ref_guid = str(pref.get("guid") or "").strip("{}").upper()
+            dst_sid: Optional[str] = None
+            target_proj_rel = inc_raw
+            if inc_raw and not Path(inc_raw).is_absolute():
+                cand = (proj_file.parent / inc_raw).resolve()
+                try:
+                    _check_forbidden_path(inc_raw, cand)
+                    if cand.is_relative_to(root):
+                        dst_sid = by_proj_file.get(cand) or by_dir.get(cand.parent)
+                except Exception:
+                    dst_sid = None
+            if dst_sid is None and ref_guid:
+                dst_sid = by_guid.get(ref_guid)
+            if dst_sid is None and inc_raw:
+                dst_sid = by_target_low.get(Path(inc_raw).stem.lower())
+            if dst_sid:
+                _add_dep(
+                    sid,
+                    dst_sid,
+                    "vcxproj_project_reference",
+                    {
+                        "project_file": proj_file.name,
+                        "target_project_file": target_proj_rel,
+                    },
+                )
+
+    return relations
+
+
 def discover_workspace_sources(workspace_root: str = ".") -> Dict[str, Any]:
-    """Scan a workspace directory and auto-detect sub-sources and shared project docs."""
+    """Scan a workspace directory and auto-detect sub-sources, dependencies, and shared project docs."""
     root = _validate_safe_workspace_dir(workspace_root)
     root_marker = _detect_source_markers(root)
     has_monorepo_containers = any((root / c).is_dir() for c in ("apps", "services", "packages"))
+    root_is_generic_make = bool(
+        root_marker
+        and set(root_marker.get("markers") or []) <= {"Makefile", "GNUmakefile", "CMakeLists.txt"}
+    )
     root_is_single_module = (
         bool(root_marker)
         and not has_monorepo_containers
         and not _is_monorepo_root(root)
+        and not root_is_generic_make
     )
 
-    discovered_dirs: List[Tuple[Path, Dict[str, Any]]] = []
+    discovered_map: Dict[Path, Tuple[Path, Dict[str, Any]]] = {}
+    raw_sln_deps: List[Dict[str, str]] = []
+
+    # 1. Discover Visual Studio `.sln` child projects at root (excluding root `.` unless single-project)
+    sln_entries, sln_deps = _discover_sln_projects(root)
+    raw_sln_deps.extend(sln_deps)
+    sln_root_entries: List[Tuple[Path, Dict[str, Any]]] = []
+    for proj_dir, meta in sln_entries:
+        if proj_dir.resolve() == root.resolve():
+            sln_root_entries.append((proj_dir, meta))
+        else:
+            _merge_discovered_entry(discovered_map, proj_dir, meta)
 
     try:
         top_children = sorted(
@@ -532,8 +1256,17 @@ def discover_workspace_sources(workspace_root: str = ".") -> Dict[str, Any]:
         rel_parts = child.relative_to(root).parts[:-1]
         direct_meta = _detect_source_markers(child, rel_parts=rel_parts)
         if direct_meta is not None:
-            discovered_dirs.append((child, direct_meta))
+            _merge_discovered_entry(discovered_map, child, direct_meta)
             continue
+
+        # Check for nested `.sln` inside a dedicated subfolder (e.g. `legacy/App.sln`)
+        if child.name not in _CONTAINER_DIRS:
+            nested_sln, nested_deps = _discover_sln_projects(child)
+            if nested_sln:
+                raw_sln_deps.extend(nested_deps)
+                for proj_dir, meta in nested_sln:
+                    _merge_discovered_entry(discovered_map, proj_dir, meta)
+                continue
 
         if child.name in _CONTAINER_DIRS:
             if child.name == "src" and root_is_single_module:
@@ -554,7 +1287,7 @@ def discover_workspace_sources(workspace_root: str = ".") -> Dict[str, Any]:
             for lvl1 in lvl1_dirs:
                 lvl1_meta = _detect_source_markers(lvl1, rel_parts=lvl1.relative_to(root).parts[:-1])
                 if lvl1_meta is not None:
-                    discovered_dirs.append((lvl1, lvl1_meta))
+                    _merge_discovered_entry(discovered_map, lvl1, lvl1_meta)
                     continue
 
                 try:
@@ -571,11 +1304,19 @@ def discover_workspace_sources(workspace_root: str = ".") -> Dict[str, Any]:
                 for lvl2 in lvl2_dirs:
                     lvl2_meta = _detect_source_markers(lvl2, rel_parts=lvl2.relative_to(root).parts[:-1])
                     if lvl2_meta is not None:
-                        discovered_dirs.append((lvl2, lvl2_meta))
+                        _merge_discovered_entry(discovered_map, lvl2, lvl2_meta)
+
+    discovered_dirs: List[Tuple[Path, Dict[str, Any]]] = sorted(
+        discovered_map.values(),
+        key=lambda item: str(item[0].relative_to(root)).replace("\\", "/").lower(),
+    )
 
     # Avoid treating root `.` as a sub-source when child sub-sources were found
-    if not discovered_dirs and root_marker is not None:
-        discovered_dirs.append((root, root_marker))
+    if not discovered_dirs:
+        for _, sln_root_meta in sln_root_entries:
+            discovered_dirs.append((root, sln_root_meta))
+        if not discovered_dirs and root_marker is not None:
+            discovered_dirs.append((root, root_marker))
 
     # Build normalized source descriptors with unique source_ids
     raw_names = [d.name for d, _ in discovered_dirs]
@@ -584,6 +1325,7 @@ def discover_workspace_sources(workspace_root: str = ".") -> Dict[str, Any]:
         name_counts[rn] = name_counts.get(rn, 0) + 1
 
     sources: List[Dict[str, Any]] = []
+    sources_meta: List[Tuple[str, Path, Dict[str, Any]]] = []
     used_source_ids: Set[str] = set()
     for src_dir, meta in discovered_dirs:
         if src_dir == root:
@@ -606,19 +1348,22 @@ def discover_workspace_sources(workspace_root: str = ".") -> Dict[str, Any]:
             suffix += 1
         used_source_ids.add(unique_id)
 
-        sources.append(
-            {
-                "source_id": unique_id,
-                "display_name": _format_display_name(unique_id),
-                "source_type": meta["source_type"],
-                "tech_stack": list(meta["tech_stack"]),
-                "workspace_subpath": rel_subpath,
-                "path": str(src_dir.resolve()),
-                "markers": list(meta["markers"]),
-                "inherit_shared_docs": True,
-            }
-        )
+        desc: Dict[str, Any] = {
+            "source_id": unique_id,
+            "display_name": _format_display_name(unique_id),
+            "source_type": meta["source_type"],
+            "tech_stack": list(meta["tech_stack"]),
+            "workspace_subpath": rel_subpath,
+            "path": str(src_dir.resolve()),
+            "markers": list(meta["markers"]),
+            "inherit_shared_docs": True,
+        }
+        if meta.get("language"):
+            desc["language"] = meta["language"]
+        sources.append(desc)
+        sources_meta.append((unique_id, src_dir, meta))
 
+    discovered_relations = _resolve_discovered_relations(root, sources_meta, raw_sln_deps)
     shared_docs = _discover_shared_docs(root)
 
     return {
@@ -626,6 +1371,7 @@ def discover_workspace_sources(workspace_root: str = ".") -> Dict[str, Any]:
         "workspace_root": str(root),
         "sources": sources,
         "shared_docs": shared_docs,
+        "relations": discovered_relations,
         "suggested_project_id": _slugify_project_id(root.name),
     }
 
@@ -660,12 +1406,10 @@ async def _sync_source_hsg_memories(
         for fname in sorted(files):
             fpath = Path(cur_root) / fname
             ext = fpath.suffix.lower()
-            if ext in CODE_EXTENSIONS or fname in (
-                "package.json",
-                "pyproject.toml",
-                "go.mod",
-                "Cargo.toml",
-                "pom.xml",
+            if (
+                ext in CODE_EXTENSIONS
+                or ext in _LEGACY_MANIFEST_EXTS
+                or fname in _LEGACY_MANIFEST_NAMES
             ):
                 rel_norm = str(fpath.relative_to(src_dir)).replace("\\", "/")
                 if rel_norm not in seen_rel:
@@ -679,7 +1423,8 @@ async def _sync_source_hsg_memories(
         try:
             if fpath.stat().st_size > _MAX_SOURCE_MEMORY_FILE_BYTES:
                 continue
-            text = fpath.read_text(encoding="utf-8", errors="replace").strip()
+            decoded_text, _ = read_text_with_encoding(fpath)
+            text = decoded_text.strip()
         except Exception:
             continue
         if not text:
@@ -852,6 +1597,7 @@ async def bootstrap_project_hub(
                     "workspace_root": str(root),
                     "relative_subpath": rel_sub,
                     "markers": list(src_entry.get("markers") or []),
+                    **({"language": src_entry["language"]} if src_entry.get("language") else {}),
                 },
             )
             tenant_manager.ensure_source_branch_schema(
@@ -955,6 +1701,9 @@ async def bootstrap_project_hub(
                     filename = doc_path.name
                 if explicit_content is None:
                     file_bytes = doc_path.read_bytes()
+                    if doc_path.suffix.lower() in _LEGACY_TEXT_DOC_EXTS:
+                        decoded_doc, _ = decode_legacy_bytes(file_bytes)
+                        explicit_content = decoded_doc
             elif not filename:
                 filename = f"{explicit_doc_key or 'shared_doc'}.md"
 
@@ -1041,6 +1790,26 @@ async def bootstrap_project_hub(
                 created_by=eff_author,
             )
             relations_applied.append(saved_rel)
+
+        if relations is None and not auto_link and discovered and discovered.get("relations"):
+            for d_rel in discovered["relations"]:
+                saved_rel = tenant_manager.upsert_cross_source_relation(
+                    project_id=base_proj,
+                    src_source_id=str(d_rel["src_source_id"]),
+                    dst_source_id=str(d_rel["dst_source_id"]),
+                    relation_type=str(d_rel["relation_type"]),
+                    src_branch=eff_root_branch,
+                    dst_branch=eff_root_branch,
+                    origin="auto_detected",
+                    confidence="high",
+                    confidence_score=0.95,
+                    contract_key=str(d_rel.get("contract_key") or ""),
+                    contract_metadata=d_rel.get("contract_metadata"),
+                    status="active",
+                    is_bidirectional=False,
+                    created_by="hub_bootstrap",
+                )
+                relations_applied.append(saved_rel)
 
         auto_link_summary: Dict[str, Any] = {
             "status": "skipped",

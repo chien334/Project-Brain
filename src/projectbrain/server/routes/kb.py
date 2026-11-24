@@ -227,8 +227,21 @@ async def export_kb_artifacts(req: KBExportRequest):
     artifacts: List[Dict[str, Any]] = []
     target_formats = [f.lower().strip() for f in req.formats] if req.formats else ["wiki", "docx", "xlsx", "pptx"]
 
+    cross_source_relations: Optional[List[Dict[str, Any]]] = None
+    try:
+        from ...core.tenant_manager import tenant_manager
+        if getattr(tenant_manager, "_master_db", None) is not None:
+            raw_rels = tenant_manager.list_cross_source_relations(req.project_id)
+            cross_source_relations = [r for r in raw_rels if r.get("status") != "rejected"]
+    except Exception as exc:
+        logger.debug("Cross-source relations lookup skipped in /kb/export for %s: %s", req.project_id, exc)
+
     if "wiki" in target_formats:
-        wiki_pages = synthesizer.synthesize_wiki(subgraph, output_dir=wiki_dir)
+        wiki_pages = synthesizer.synthesize_wiki(
+            subgraph,
+            output_dir=wiki_dir,
+            cross_source_relations=cross_source_relations,
+        )
         artifacts.append({"format": "wiki", "count": len(wiki_pages), "dir": str(wiki_dir)})
 
     if "docx" in target_formats:
