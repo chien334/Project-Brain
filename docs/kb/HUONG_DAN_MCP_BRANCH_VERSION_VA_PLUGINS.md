@@ -18,6 +18,7 @@
   - [2.2. Kiến trúc 3-Tier Hybrid Knowledge Base (`Local Partial` → `Server Branch` → `Server Root`)](#22-kiến-trúc-3-tier-hybrid-knowledge-base-local-partial--server-branch--server-root)
   - [2.3. Chiều 3: `version_tag` cho Firmware / App Build & Tìm kiếm liên nhánh `project:%`](#23-chiều-3-version_tag-cho-firmware--app-build--tìm-kiếm-liên-nhánh-project)
   - [2.4. Bảng quyết định nhanh: Khi nào dùng tham số nào?](#24-bảng-quyết-định-nhanh-khi-nào-dùng-tham-số-nào)
+  - [2.5. Multi-Source Project Hub (`project_id@source_id:branch`) & Zero-Touch Auto-Bootstrap](#25-multi-source-project-hub-project_idsource_idbranch--zero-touch-auto-bootstrap)
 - [Phần 3 — Hướng dẫn chi tiết từng nhóm công cụ MCP (kèm JSON arguments mẫu)](#phần-3--hướng-dẫn-chi-tiết-từng-nhóm-công-cụ-mcp-kèm-json-arguments-mẫu)
   - [3.1. Nhóm A — Graphify, Diff một phần giữa các Branch & Hybrid Knowledge Base](#31-nhóm-a--graphify-diff-một-phần-giữa-các-branch--hybrid-knowledge-base)
   - [3.2. Nhóm B — Upload / Xử lý Tài liệu đa phương thức, Local OCR GPU/CPU & Local AI Document Parsing](#32-nhóm-b--upload--xử-lý-tài-liệu-đa-phương-thức-local-ocr-gpucpu--local-ai-document-parsing)
@@ -288,6 +289,17 @@ Trong hệ thống nhúng, IoT và kiểm thử đa thiết bị (Mobile + Firmw
 | Tìm kiếm ghi chú/lỗi đã từng gặp ở *mọi* nhánh | `"smartlock:%"` | *(trong `user_id`)* | *(không cần)* | Dùng `projectbrain_query` với `user_id="smartlock:%"`. |
 | Nạp Datasheet UART / OpenAPI / Kiểm thử bản build mới | `"smartlock"` | `"release/1.2"` | `"fw-v1.2.0"` | Dùng `projectbrain_v3_ingest_etl`, `projectbrain_v3_plan_test_dag`, `projectbrain_v3_oracle_context`. |
 | Tra cứu/lưu kịch bản điều khiển thiết bị UDCP | `"smartlock"` | *(ngầm định)* | `build_version="app-v3.0.1"` | Dùng `projectbrain_v3_script_cache_lookup` & `store` kèm `platform` và `screen_hash`. |
+
+### 2.5. Multi-Source Project Hub (`project_id@source_id:branch`) & Zero-Touch Auto-Bootstrap
+
+Khi dự án gồm nhiều repo/module con (`backend-api`, `web-frontend`, `mobile-app`, `infra`) dùng chung một bộ tài liệu kiến trúc/API (`__shared__`), Project-Brain mở rộng định danh thành **3 phần**:
+
+- `project_id@source_id:branch` — định tuyến trực tiếp vào schema nhánh riêng của từng sub-source (`pb_src_<slug>_<h6>_root` / `_br_*`).
+- `project_id@__shared__` — lưu tài liệu dùng chung tại `pb_root` (`Shared Hub`) cùng 2 bảng hợp đồng liên source (`cross_source_relations`, `cross_source_contract_artifacts`).
+- **Auto-Bootstrap không cần thao tác UI:** AI Agent chỉ cần kết nối MCP và gọi `projectbrain_get_agent_setup_playbook` (hoặc resource `projectbrain://guides/agent-multi-source-setup`) → `projectbrain_discover_workspace_sources` → `projectbrain_bootstrap_project_hub` (hoặc REST `POST /master/hub/discover` và `POST /master/hub/bootstrap`), sau đó nâng cấp từng phần bằng `projectbrain_sync_graphify(..., source_id=..., upgrade_mode="delta", auto_link_sources=True)` và kiểm tra cảnh báo `drifted` qua `projectbrain_cross_source_impact`.
+
+> [!TIP]
+> Xem hướng dẫn đầy đủ, sơ đồ kiến trúc, bảng tham chiếu 9 MCP tools / REST API mới, Web UI `/app/workspace/sources` và các template copy-paste cho `AGENTS.md` / `CLAUDE.md` / `.cursorrules` tại **[Hướng Dẫn Multi-Source Project Hub & Agent Auto-Setup](HUONG_DAN_MULTI_SOURCE_VA_AGENT_AUTO_SETUP.md)**.
 
 ---
 
