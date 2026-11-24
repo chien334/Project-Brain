@@ -259,6 +259,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Workspace context bar
     const currentProjectSelect = document.getElementById('currentProject');
+    const sourceSelectorContainer = document.getElementById('sourceSelectorContainer');
+    const currentSourceSelect = document.getElementById('currentSource');
     const currentBranchSelect = document.getElementById('currentBranch');
     const branchSelectorContainer = document.getElementById('branchSelectorContainer');
     const btnAddProject = document.getElementById('btnAddProject');
@@ -332,6 +334,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const docUploadFile = document.getElementById('docUploadFile');
     const docUploadTags = document.getElementById('docUploadTags');
+    const docUploadScope = document.getElementById('docUploadScope');
+    const docUploadRole = document.getElementById('docUploadRole');
     const docOcrEngine = document.getElementById('docOcrEngine');
     const docOcrDevice = document.getElementById('docOcrDevice');
     const btnUploadDoc = document.getElementById('btnUploadDoc');
@@ -354,6 +358,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // Search
     const searchQuery = document.getElementById('searchQuery');
     const btnSearch = document.getElementById('btnSearch');
+    const searchScopeControls = document.getElementById('searchScopeControls');
+    const searchIncludeSharedDocs = document.getElementById('searchIncludeSharedDocs');
+    const searchRelationDepth = document.getElementById('searchRelationDepth');
     const searchResults = document.getElementById('searchResults');
     const searchActiveAiBadge = document.getElementById('searchActiveAiBadge');
     const btnOpenAiSettingsSearch = document.getElementById('btnOpenAiSettingsSearch');
@@ -389,6 +396,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const cgProjectSelect = document.getElementById('cgProjectSelect');
     const cgSearchInput = document.getElementById('cgSearchInput');
     const cgKindSelect = document.getElementById('cgKindSelect');
+    const cgRelationDepthSelect = document.getElementById('cgRelationDepthSelect');
     const btnLoadCodeGraph = document.getElementById('btnLoadCodeGraph');
     const graphLayout = document.getElementById('graphLayout');
     const graphContainer = document.getElementById('graphContainer');
@@ -404,6 +412,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const nodeDetailsPanel = document.getElementById('nodeDetailsPanel');
     const ndName = document.getElementById('ndName');
     const ndKind = document.getElementById('ndKind');
+    const ndSourceRow = document.getElementById('ndSourceRow');
+    const ndSourceId = document.getElementById('ndSourceId');
     const ndFilePath = document.getElementById('ndFilePath');
     const ndLines = document.getElementById('ndLines');
     const ndSignature = document.getElementById('ndSignature');
@@ -553,6 +563,46 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnPageTestAi = document.getElementById('btnPageTestAi');
     const btnPageSaveAi = document.getElementById('btnPageSaveAi');
 
+    // Multi-Source Hub & Cross-Source Relations (/app/workspace/sources)
+    const sourcesHubProjectBadge = document.getElementById('sourcesHubProjectBadge');
+    const btnRefreshSourcesHub = document.getElementById('btnRefreshSourcesHub');
+    const registerSourceForm = document.getElementById('registerSourceForm');
+    const regSourceId = document.getElementById('regSourceId');
+    const regSourceDisplayName = document.getElementById('regSourceDisplayName');
+    const regSourceType = document.getElementById('regSourceType');
+    const regSourceVersion = document.getElementById('regSourceVersion');
+    const btnRegisterSourceSubmit = document.getElementById('btnRegisterSourceSubmit');
+    const sourcesHubList = document.getElementById('sourcesHubList');
+
+    const bindSharedDocForm = document.getElementById('bindSharedDocForm');
+    const bindSharedDocKey = document.getElementById('bindSharedDocKey');
+    const bindSharedTargetSource = document.getElementById('bindSharedTargetSource');
+    const bindSharedRole = document.getElementById('bindSharedRole');
+    const btnBindSharedDoc = document.getElementById('btnBindSharedDoc');
+    const sharedDocBindingsList = document.getElementById('sharedDocBindingsList');
+
+    const btnRunAutoLinkSources = document.getElementById('btnRunAutoLinkSources');
+    const createRelationForm = document.getElementById('createRelationForm');
+    const relSrcSource = document.getElementById('relSrcSource');
+    const relTypeSelect = document.getElementById('relTypeSelect');
+    const relDstSource = document.getElementById('relDstSource');
+    const relContractKey = document.getElementById('relContractKey');
+    const btnCreateRelationSubmit = document.getElementById('btnCreateRelationSubmit');
+    const relFilterStatus = document.getElementById('relFilterStatus');
+    const relFilterType = document.getElementById('relFilterType');
+    const relFilterText = document.getElementById('relFilterText');
+    const crossSourceRelationsList = document.getElementById('crossSourceRelationsList');
+
+    const upgradeSourceDialog = document.getElementById('upgradeSourceDialog');
+    const upgradeSourceDialogHint = document.getElementById('upgradeSourceDialogHint');
+    const upgradeSourceForm = document.getElementById('upgradeSourceForm');
+    const upgradeSourceTargetId = document.getElementById('upgradeSourceTargetId');
+    const upgradeSourceToVersion = document.getElementById('upgradeSourceToVersion');
+    const upgradeSourceMode = document.getElementById('upgradeSourceMode');
+    const upgradeSourceBranch = document.getElementById('upgradeSourceBranch');
+    const btnCancelUpgradeSource = document.getElementById('btnCancelUpgradeSource');
+    const btnSubmitUpgradeSource = document.getElementById('btnSubmitUpgradeSource');
+
     const toastRegion = document.getElementById('toastRegion');
     const srAnnouncer = document.getElementById('srAnnouncer');
 
@@ -560,9 +610,12 @@ document.addEventListener('DOMContentLoaded', () => {
     // 3. Application State & Canonical Route Table (History API)
     // =========================================================================
     let activeUser = 'default';
+    let activeSource = '';
     let projectGroups = {};
     let lastTopologyData = null;
     let topologyProjectsMap = {};
+    let sourcesHubSourcesCache = [];
+    let sourcesHubRelationsCache = [];
     let currentAccount = null;
     let userRole = 'reader';
     let isInitialized = false;
@@ -590,9 +643,17 @@ document.addEventListener('DOMContentLoaded', () => {
         settings: { slug: 'settings', label: 'Settings & IAM', defaultPath: '/app/settings/ai' }
     };
 
+    const DOMAIN_DEFAULT_ROUTE = {
+        Workspace: '/app/overview',
+        'Code & Knowledge': '/app/graph/explorer',
+        'Platform & QA': '/app/platform/plugins',
+        'Settings & IAM': '/app/settings/ai'
+    };
+
     const ROUTES = [
         { path: '/app/overview', tabId: 'dashboardTab', title: 'Overview', icon: 'fa-gauge-high', domainSlug: 'workspace', domainLabel: 'Workspace' },
         { path: '/app/workspace/projects', tabId: 'projectRegistryTab', title: 'Projects & Databases', icon: 'fa-folder-tree', domainSlug: 'workspace', domainLabel: 'Workspace' },
+        { path: '/app/workspace/sources', tabId: 'sourcesHubTab', title: 'Sources & Relations', icon: 'fa-sitemap', domainSlug: 'workspace', domainLabel: 'Workspace' },
         { path: '/app/workspace/memories', tabId: 'memoriesTab', title: 'Memories & Docs', icon: 'fa-layer-group', domainSlug: 'workspace', domainLabel: 'Workspace' },
         { path: '/app/workspace/search', tabId: 'searchTab', title: 'Semantic Search', icon: 'fa-magnifying-glass', domainSlug: 'workspace', domainLabel: 'Workspace' },
 
@@ -615,6 +676,7 @@ document.addEventListener('DOMContentLoaded', () => {
         '/app': '/app/overview',
         '/app/workspace': '/app/overview',
         '/app/projects': '/app/workspace/projects',
+        '/app/sources': '/app/workspace/sources',
         '/app/memories': '/app/workspace/memories',
         '/app/search': '/app/workspace/search',
         '/app/graph': '/app/graph/explorer',
@@ -681,6 +743,10 @@ document.addEventListener('DOMContentLoaded', () => {
             const urlBranch = (initParams.get('branch') || '').trim();
             if (urlProj) {
                 localStorage.setItem('activeProject', urlProj);
+                if (initParams.has('source')) {
+                    const rawSrc = (initParams.get('source') || '').trim();
+                    localStorage.setItem(`source_${urlProj}`, rawSrc === '*' ? '' : rawSrc);
+                }
                 if (urlBranch) {
                     localStorage.setItem(`branch_${urlProj}`, urlBranch === 'all' ? '%' : urlBranch);
                 }
@@ -1261,6 +1327,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 keywords: 'ai llm settings gemini openai ollama minimax local rag provider api key model modal',
                 icon: 'fa-sliders',
                 run: () => openAiSettingsModal()
+            },
+            {
+                id: 'action:sources-hub',
+                title: 'Manage Sub-Sources, Shared Docs & Cross-Source Relations',
+                subtitle: '/app/workspace/sources',
+                keywords: 'sources relations shared docs bindings drift auto link cross source hub',
+                icon: 'fa-sitemap',
+                run: () => navigateTo(buildContextualHref('/app/workspace/sources'))
             },
             {
                 id: 'action:copy-route',
@@ -1901,9 +1975,24 @@ document.addEventListener('DOMContentLoaded', () => {
     // =========================================================================
     function getProjectContext() {
         const baseProject = (currentProjectSelect?.value || '').trim() || 'default';
+        const rawSource = currentSourceSelect ? currentSourceSelect.value : activeSource;
+        const cleanSource = (rawSource || '').trim();
+        const sourceId = cleanSource === '*' ? '' : cleanSource;
         const rawBranch = currentBranchSelect ? currentBranchSelect.value : '';
         const branch = (!rawBranch || rawBranch === '%') ? 'main' : rawBranch;
-        return { baseProject, rawBranch, branch, scopedId: activeUser || 'default' };
+        return { baseProject, sourceId, rawBranch, branch, scopedId: activeUser || 'default' };
+    }
+
+    function parseProjectSourceBranch(rawSpec) {
+        const val = String(rawSpec || '').trim();
+        if (!val) return { project: 'default', source: '', branch: '' };
+        const colonIdx = val.indexOf(':');
+        const head = colonIdx >= 0 ? val.slice(0, colonIdx) : val;
+        const branch = colonIdx >= 0 ? val.slice(colonIdx + 1) : '';
+        const atIdx = head.indexOf('@');
+        const project = (atIdx >= 0 ? head.slice(0, atIdx) : head) || 'default';
+        const source = atIdx >= 0 ? head.slice(atIdx + 1) : '';
+        return { project, source: source === '*' ? '' : source, branch };
     }
 
     function buildContextualSearchParams(targetPath, { includeViewState = false, baseSearch = '', extraParams = {} } = {}) {
@@ -1911,12 +2000,17 @@ document.addEventListener('DOMContentLoaded', () => {
         // Strip auth-only params on /app/... routes
         params.delete('next');
 
-        const { baseProject, rawBranch } = getProjectContext();
+        const { baseProject, sourceId, rawBranch } = getProjectContext();
         if (!baseSearch) {
             if (baseProject && baseProject !== 'default') {
                 params.set('project', baseProject);
             } else {
                 params.delete('project');
+            }
+            if (sourceId) {
+                params.set('source', sourceId);
+            } else {
+                params.delete('source');
             }
             if (rawBranch && rawBranch !== '%') {
                 params.set('branch', rawBranch);
@@ -1926,6 +2020,9 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             if (!params.has('project') && baseProject && baseProject !== 'default') {
                 params.set('project', baseProject);
+            }
+            if (!params.has('source') && sourceId) {
+                params.set('source', sourceId);
             }
             if (!params.has('branch') && rawBranch && rawBranch !== '%') {
                 params.set('branch', rawBranch);
@@ -1951,13 +2048,17 @@ document.addEventListener('DOMContentLoaded', () => {
             if (targetPath === '/app/graph/explorer') {
                 const symVal = (cgSearchInput?.value || '').trim();
                 const kindsVal = cgKindSelect ? cgKindSelect.value : 'class,function,method,file';
+                const depthVal = cgRelationDepthSelect ? cgRelationDepthSelect.value : '0';
                 if (symVal) params.set('symbol', symVal);
                 else params.delete('symbol');
                 if (kindsVal && kindsVal !== 'class,function,method,file') params.set('kinds', kindsVal);
                 else params.delete('kinds');
+                if (depthVal && depthVal !== '0') params.set('depth', depthVal);
+                else params.delete('depth');
             } else {
                 params.delete('symbol');
                 params.delete('kinds');
+                params.delete('depth');
             }
 
             if (targetPath === '/app/graph/diff') {
@@ -2102,6 +2203,47 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshAllRouteLinks();
     }
 
+    function updateSourceDropdown(baseId) {
+        if (!currentSourceSelect) return;
+        currentSourceSelect.innerHTML = '';
+
+        const optAll = document.createElement('option');
+        optAll.value = '';
+        optAll.textContent = 'All Sources (*)';
+        currentSourceSelect.appendChild(optAll);
+
+        const optShared = document.createElement('option');
+        optShared.value = '__shared__';
+        optShared.textContent = 'Shared Docs Hub (__shared__)';
+        currentSourceSelect.appendChild(optShared);
+
+        const group = projectGroups[baseId] || topologyProjectsMap[baseId];
+        const sources = Array.isArray(group?.sources) ? group.sources : [];
+        const seen = new Set(['', '__shared__', '__default__']);
+
+        sources.forEach(src => {
+            const sid = toDisplayText(src?.source_id, '').trim();
+            if (!sid || seen.has(sid)) return;
+            seen.add(sid);
+            const opt = document.createElement('option');
+            opt.value = sid;
+            const dName = toDisplayText(src?.display_name, '').trim();
+            opt.textContent = dName && dName !== sid ? `${dName} (${sid})` : sid;
+            currentSourceSelect.appendChild(opt);
+        });
+
+        const rawCached = localStorage.getItem(`source_${baseId}`) || '';
+        const cached = rawCached === '*' ? '' : rawCached;
+        if (cached && !Array.from(currentSourceSelect.options).some(o => o.value === cached)) {
+            const optCached = document.createElement('option');
+            optCached.value = cached;
+            optCached.textContent = cached;
+            currentSourceSelect.appendChild(optCached);
+        }
+        currentSourceSelect.value = Array.from(currentSourceSelect.options).some(o => o.value === cached) ? cached : '';
+        activeSource = currentSourceSelect.value || '';
+    }
+
     function updateBranchDropdown(baseId) {
         if (!currentBranchSelect || !branchSelectorContainer) return;
         currentBranchSelect.innerHTML = '';
@@ -2141,7 +2283,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function updateActiveTenantStorageHint() {
         if (!activeTenantStorageHint) return;
-        const { baseProject, rawBranch } = getProjectContext();
+        const { baseProject, sourceId, rawBranch } = getProjectContext();
         const projTopo = topologyProjectsMap[baseProject];
         const dbName = toDisplayText(projTopo?.db_name, sanitizeProjectDbName(baseProject));
         const rootBranch = toDisplayText(projTopo?.root_branch, 'main');
@@ -2163,23 +2305,30 @@ document.addEventListener('DOMContentLoaded', () => {
             matchedBranch?.schema_name,
             sanitizeBranchSchemaName(targetBranch, rootBranch)
         );
-        const msg = `Target Storage: DB ${dbName} → Schema ${schemaName} (Graph + Docs)`;
+        const sourceSuffix = sourceId ? ` · Source: ${sourceId}` : '';
+        const msg = `Target Storage: DB ${dbName} → Schema ${schemaName}${sourceSuffix} (Graph + Docs)`;
         if (textSpan) textSpan.textContent = msg;
         else activeTenantStorageHint.textContent = msg;
     }
 
-    function recalculateActiveUser() {
+    function recalculateActiveUser({ skipHistorySync = false } = {}) {
         const selectedProj = (currentProjectSelect?.value || '').trim() || 'default';
+        const rawSource = currentSourceSelect ? currentSourceSelect.value : activeSource;
+        const cleanSource = (rawSource || '').trim();
+        activeSource = cleanSource === '*' ? '' : cleanSource;
         const selectedBranch = currentBranchSelect ? currentBranchSelect.value : '';
 
-        if (selectedProj === 'default') {
+        if (selectedProj === 'default' && !activeSource) {
             activeUser = 'default';
-        } else if (selectedBranch === '%') {
-            activeUser = `${selectedProj}:%`;
-        } else if (selectedBranch) {
-            activeUser = `${selectedProj}:${selectedBranch}`;
         } else {
-            activeUser = selectedProj;
+            const projWithSource = activeSource ? `${selectedProj}@${activeSource}` : selectedProj;
+            if (selectedBranch === '%') {
+                activeUser = `${projWithSource}:%`;
+            } else if (selectedBranch) {
+                activeUser = `${projWithSource}:${selectedBranch}`;
+            } else {
+                activeUser = projWithSource;
+            }
         }
         updateLocalProjectConfig();
         updateActiveTenantStorageHint();
@@ -2187,11 +2336,22 @@ document.addEventListener('DOMContentLoaded', () => {
         if (kbBranchInput && branch) {
             kbBranchInput.value = branch;
         }
+        if (docUploadScope) {
+            docUploadScope.value = activeSource === '__shared__' ? 'project_shared' : 'source';
+        }
+        if (!skipHistorySync) {
+            syncCurrentRouteUrl({ replace: true });
+        } else {
+            refreshAllRouteLinks();
+        }
     }
 
     function applyQueryStateFromSearch(searchStr) {
         const params = new URLSearchParams(searchStr || '');
         const urlProj = (params.get('project') || '').trim();
+        const hasUrlSource = params.has('source');
+        const rawUrlSource = (params.get('source') || '').trim();
+        const urlSource = rawUrlSource === '*' ? '' : rawUrlSource;
         const rawUrlBranch = (params.get('branch') || '').trim();
         const urlBranch = rawUrlBranch === 'all' ? '%' : rawUrlBranch;
 
@@ -2206,6 +2366,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (currentProjectSelect.value !== urlProj) {
                 currentProjectSelect.value = urlProj;
                 localStorage.setItem('activeProject', urlProj);
+                updateSourceDropdown(urlProj);
                 updateBranchDropdown(urlProj);
                 contextChanged = true;
             }
@@ -2225,8 +2386,24 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
+        if (hasUrlSource && currentSourceSelect) {
+            const effProj = (currentProjectSelect?.value || '').trim() || 'default';
+            if (urlSource && !Array.from(currentSourceSelect.options).some(o => o.value === urlSource)) {
+                const optS = document.createElement('option');
+                optS.value = urlSource;
+                optS.textContent = urlSource;
+                currentSourceSelect.appendChild(optS);
+            }
+            if (currentSourceSelect.value !== urlSource || activeSource !== urlSource) {
+                currentSourceSelect.value = urlSource;
+                activeSource = urlSource;
+                localStorage.setItem(`source_${effProj}`, urlSource);
+                contextChanged = true;
+            }
+        }
+
         if (contextChanged) {
-            recalculateActiveUser();
+            recalculateActiveUser({ skipHistorySync: true });
             syncActiveProjectOnServer();
             if (cgProjectSelect) {
                 if (activeUser !== 'default' && !Array.from(cgProjectSelect.options).some(o => o.value === activeUser)) {
@@ -2245,6 +2422,7 @@ document.addEventListener('DOMContentLoaded', () => {
             mode: params.get('mode') || null,
             symbol: params.has('symbol') ? (params.get('symbol') || '') : null,
             kinds: params.get('kinds') || null,
+            depth: params.get('depth') || null,
             base: params.get('base') || null,
             target: params.get('target') || null
         };
@@ -2316,6 +2494,8 @@ document.addEventListener('DOMContentLoaded', () => {
             loadHardwareStatus();
         } else if (targetTabId === 'projectRegistryTab') {
             loadProjectsList();
+        } else if (targetTabId === 'sourcesHubTab') {
+            loadSourcesHub();
         } else if (targetTabId === 'memoriesTab') {
             loadMemories();
             loadIngestedDocuments();
@@ -2355,6 +2535,11 @@ document.addEventListener('DOMContentLoaded', () => {
                         cgKindSelect.appendChild(optK);
                     }
                     cgKindSelect.value = queryContext.kinds;
+                }
+                if (queryContext.depth !== null && cgRelationDepthSelect) {
+                    if (Array.from(cgRelationDepthSelect.options).some(o => o.value === queryContext.depth)) {
+                        cgRelationDepthSelect.value = queryContext.depth;
+                    }
                 }
             }
             setTimeout(() => loadCodeGraph({ skipUrlSync: true }), 40);
@@ -2612,6 +2797,10 @@ document.addEventListener('DOMContentLoaded', () => {
         if (kbTab && kbTab.classList.contains('active')) {
             loadKbCoverage();
         }
+        const sourcesTab = document.getElementById('sourcesHubTab');
+        if (sourcesTab && sourcesTab.classList.contains('active')) {
+            loadSourcesHub();
+        }
     }
 
     function bindWorkbenchListeners() {
@@ -2626,8 +2815,20 @@ document.addEventListener('DOMContentLoaded', () => {
             currentProjectSelect.addEventListener('change', (e) => {
                 const selectedProj = e.target.value.trim() || 'default';
                 localStorage.setItem('activeProject', selectedProj);
+                updateSourceDropdown(selectedProj);
                 updateBranchDropdown(selectedProj);
-                recalculateActiveUser();
+                recalculateActiveUser({ skipHistorySync: true });
+                onWorkspaceContextChanged();
+            });
+        }
+
+        if (currentSourceSelect) {
+            currentSourceSelect.addEventListener('change', () => {
+                const selectedProj = (currentProjectSelect?.value || '').trim() || 'default';
+                const val = currentSourceSelect.value.trim();
+                activeSource = val === '*' ? '' : val;
+                localStorage.setItem(`source_${selectedProj}`, activeSource);
+                recalculateActiveUser({ skipHistorySync: true });
                 onWorkspaceContextChanged();
             });
         }
@@ -2636,7 +2837,7 @@ document.addEventListener('DOMContentLoaded', () => {
             currentBranchSelect.addEventListener('change', () => {
                 const selectedProj = (currentProjectSelect?.value || '').trim() || 'default';
                 localStorage.setItem(`branch_${selectedProj}`, currentBranchSelect.value);
-                recalculateActiveUser();
+                recalculateActiveUser({ skipHistorySync: true });
                 onWorkspaceContextChanged();
             });
         }
@@ -2759,6 +2960,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // CodeGraph Listeners
         if (btnLoadCodeGraph) btnLoadCodeGraph.addEventListener('click', () => loadCodeGraph());
         if (cgKindSelect) cgKindSelect.addEventListener('change', () => loadCodeGraph());
+        if (cgRelationDepthSelect) cgRelationDepthSelect.addEventListener('change', () => loadCodeGraph());
         if (btnGraphZoomIn) {
             btnGraphZoomIn.addEventListener('click', () => {
                 if (!cgNetwork) return;
@@ -2808,12 +3010,25 @@ document.addEventListener('DOMContentLoaded', () => {
                 const val = e.target.value.trim();
                 activeUser = val || 'default';
                 if (currentProjectSelect) {
-                    const colonIdx = val.indexOf(':');
-                    const base = colonIdx >= 0 ? val.slice(0, colonIdx) : (val || 'default');
-                    const br = colonIdx >= 0 ? val.slice(colonIdx + 1) : '';
+                    const parsed = parseProjectSourceBranch(val);
+                    const base = parsed.project || 'default';
+                    const src = parsed.source || '';
+                    const br = parsed.branch || '';
                     if (Array.from(currentProjectSelect.options).some(o => o.value === base)) {
                         currentProjectSelect.value = base;
                         localStorage.setItem('activeProject', base);
+                        updateSourceDropdown(base);
+                        if (currentSourceSelect) {
+                            if (src && !Array.from(currentSourceSelect.options).some(o => o.value === src)) {
+                                const optS = document.createElement('option');
+                                optS.value = src;
+                                optS.textContent = src;
+                                currentSourceSelect.appendChild(optS);
+                            }
+                            currentSourceSelect.value = src;
+                            activeSource = src;
+                            localStorage.setItem(`source_${base}`, src);
+                        }
                         updateBranchDropdown(base);
                         if (br && currentBranchSelect && Array.from(currentBranchSelect.options).some(o => o.value === br)) {
                             currentBranchSelect.value = br;
@@ -2821,7 +3036,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         }
                     }
                 }
-                recalculateActiveUser();
+                recalculateActiveUser({ skipHistorySync: true });
                 syncCurrentRouteUrl({ replace: true });
                 loadStats();
                 loadMemories();
@@ -2906,6 +3121,48 @@ document.addEventListener('DOMContentLoaded', () => {
                     btnRefreshTopology.disabled = false;
                 }
             });
+        }
+
+        // Multi-Source Hub & Cross-Source Relations Listeners
+        if (btnRefreshSourcesHub) {
+            btnRefreshSourcesHub.addEventListener('click', () => loadSourcesHub());
+        }
+        if (registerSourceForm) {
+            registerSourceForm.addEventListener('submit', registerProjectSource);
+        }
+        if (bindSharedDocForm) {
+            bindSharedDocForm.addEventListener('submit', bindSharedDocument);
+        }
+        if (createRelationForm) {
+            createRelationForm.addEventListener('submit', createCrossSourceRelation);
+        }
+        if (btnRunAutoLinkSources) {
+            btnRunAutoLinkSources.addEventListener('click', runAutoLinkSources);
+        }
+        if (relFilterStatus) {
+            relFilterStatus.addEventListener('change', renderFilteredCrossSourceRelations);
+        }
+        if (relFilterType) {
+            relFilterType.addEventListener('change', renderFilteredCrossSourceRelations);
+        }
+        if (relFilterText) {
+            relFilterText.addEventListener('input', renderFilteredCrossSourceRelations);
+        }
+        if (upgradeSourceDialog) {
+            const closeUpgradeBtn = upgradeSourceDialog.querySelector('[command="close"][commandfor="upgradeSourceDialog"]');
+            if (closeUpgradeBtn) {
+                closeUpgradeBtn.addEventListener('click', () => {
+                    if (upgradeSourceDialog.open) upgradeSourceDialog.close('cancel');
+                });
+            }
+            if (btnCancelUpgradeSource && btnCancelUpgradeSource !== closeUpgradeBtn) {
+                btnCancelUpgradeSource.addEventListener('click', () => {
+                    if (upgradeSourceDialog.open) upgradeSourceDialog.close('cancel');
+                });
+            }
+        }
+        if (upgradeSourceForm) {
+            upgradeSourceForm.addEventListener('submit', submitUpgradeProjectSource);
         }
     }
 
@@ -3350,7 +3607,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const file = docUploadFile.files[0];
         const tags = (docUploadTags?.value || '').trim();
-        const { baseProject, branch } = getProjectContext();
+        const { baseProject, sourceId, branch } = getProjectContext();
+        const scopeVal = docUploadScope ? docUploadScope.value : (sourceId === '__shared__' ? 'project_shared' : 'source');
+        const docRoleVal = docUploadRole ? docUploadRole.value : 'general';
 
         if (btnUploadDoc) {
             btnUploadDoc.disabled = true;
@@ -3363,6 +3622,13 @@ document.addEventListener('DOMContentLoaded', () => {
         formData.append('branch', branch);
         formData.append('tags', tags);
         formData.append('author', (currentUser?.value || '').trim());
+        formData.append('scope', scopeVal);
+        formData.append('doc_role', docRoleVal);
+        if (scopeVal === 'project_shared') {
+            formData.append('source_id', '__shared__');
+        } else if (sourceId) {
+            formData.append('source_id', sourceId);
+        }
         formData.append('ocr_engine', docOcrEngine ? docOcrEngine.value : 'auto');
         formData.append('ocr_device', docOcrDevice ? docOcrDevice.value : 'auto');
 
@@ -3399,13 +3665,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function loadIngestedDocuments() {
         if (!ingestedDocsList) return;
-        const { baseProject, rawBranch } = getProjectContext();
+        const { baseProject, sourceId, rawBranch } = getProjectContext();
         ingestedDocsList.innerHTML = '<div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading documents...</div>';
 
         try {
-            const params = new URLSearchParams({ project_id: baseProject, status: 'all' });
+            const params = new URLSearchParams({ project_id: baseProject, status: 'all', include_shared: 'true' });
             if (rawBranch && rawBranch !== '%') {
                 params.set('branch', rawBranch);
+            }
+            if (sourceId) {
+                params.set('source_id', sourceId);
             }
             const res = await fetch(`/sources/documents?${params.toString()}`);
             if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to load ingested documents'));
@@ -3426,6 +3695,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 const ts = formatEpochTimestamp(doc.created_at, 'N/A');
                 const unitCount = Array.isArray(doc.units) ? doc.units.length : (doc.total_units ?? doc.units ?? 0);
+                const docSrc = toDisplayText(doc.source_id || doc.metadata?.source_id, '').trim();
+                const docScope = toDisplayText(doc.scope || doc.metadata?.scope, '').trim();
+                const docRole = toDisplayText(doc.doc_role || doc.metadata?.doc_role, '').trim();
+                const sourceBadgeHtml = (docSrc === '__shared__' || docScope === 'project_shared')
+                    ? '<span class="provenance-pill provenance-shared"><i class="fa-solid fa-book-open" aria-hidden="true"></i> __shared__</span>'
+                    : (docSrc && docSrc !== '__default__'
+                        ? `<span class="provenance-pill provenance-source">${escapeHTML(docSrc)}</span>`
+                        : '');
+                const roleBadgeHtml = (docRole && docRole !== 'general')
+                    ? `<span class="nav-badge mono-num">${escapeHTML(docRole)}</span>`
+                    : '';
                 const metaSummary = (doc.metadata && typeof doc.metadata === 'object' && Object.keys(doc.metadata).length > 0)
                     ? `<span>Meta: ${escapeHTML(formatDetailsSummary(doc.metadata))}</span>`
                     : '';
@@ -3436,6 +3716,8 @@ document.addEventListener('DOMContentLoaded', () => {
                             <span class="status-tag info">${escapeHTML(doc.version || 'v1')}</span>
                             <span class="status-tag ${doc.status === 'active' ? 'success' : 'warning'}">${escapeHTML(doc.status || 'active')}</span>
                             <span class="nav-badge mono-num">${escapeHTML(doc.branch || 'main')}</span>
+                            ${sourceBadgeHtml}
+                            ${roleBadgeHtml}
                         </div>
                         <button type="button" class="btn btn-secondary btn-sm btn-doc-versions">
                             <i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i> Version History
@@ -3833,6 +4115,27 @@ document.addEventListener('DOMContentLoaded', () => {
     // =========================================================================
     // 13. Semantic Search & PM Copilot
     // =========================================================================
+    function buildProvenancePillsHtml(item) {
+        if (!item || typeof item !== 'object') return '';
+        const pills = [];
+        const srcId = toDisplayText(item.source_id || item.metadata?.source_id, '').trim();
+        const scope = toDisplayText(item.scope || item.metadata?.scope, '').trim();
+        const isShared = srcId === '__shared__' || scope === 'project_shared';
+        if (isShared) {
+            pills.push('<span class="provenance-pill provenance-shared"><i class="fa-solid fa-book-open" aria-hidden="true"></i> Shared Project Doc</span>');
+        } else if (srcId && srcId !== '__default__') {
+            pills.push(`<span class="provenance-pill provenance-source"><i class="fa-solid fa-cube" aria-hidden="true"></i> ${escapeHTML(srcId)}</span>`);
+        }
+        const via = item.via_relation;
+        if (via && typeof via === 'object') {
+            const relType = toDisplayText(via.relation_type, 'related').trim();
+            const contractKey = toDisplayText(via.contract_key, '').trim();
+            const viaText = contractKey ? `via ${relType} ${contractKey}` : `via ${relType}`;
+            pills.push(`<span class="provenance-pill provenance-via"><i class="fa-solid fa-link" aria-hidden="true"></i> ${escapeHTML(viaText)}</span>`);
+        }
+        return pills.length > 0 ? `<div class="provenance-pills-row">${pills.join('')}</div>` : '';
+    }
+
     async function performSearch({ skipUrlSync = false } = {}) {
         const query = (searchQuery?.value || '').trim();
         if (!query || !searchResults) return;
@@ -3843,6 +4146,10 @@ document.addEventListener('DOMContentLoaded', () => {
         searchResults.innerHTML = '<div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Searching ProjectBrain...</div>';
         const modeEl = document.querySelector('input[name="searchMode"]:checked');
         const mode = modeEl ? modeEl.value : 'rag';
+        const { sourceId } = getProjectContext();
+        const includeSharedDocs = searchIncludeSharedDocs ? Boolean(searchIncludeSharedDocs.checked) : true;
+        const parsedDepth = searchRelationDepth ? parseInt(searchRelationDepth.value, 10) : 1;
+        const relationDepth = Number.isFinite(parsedDepth) ? parsedDepth : 1;
 
         try {
             if (mode === 'rag') {
@@ -3852,7 +4159,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     body: JSON.stringify({
                         query,
                         user_id: activeUser,
-                        author: (currentUser?.value || '').trim()
+                        author: (currentUser?.value || '').trim(),
+                        source_id: sourceId || null,
+                        include_shared_docs: includeSharedDocs,
+                        relation_depth: relationDepth
                     })
                 });
                 if (!res.ok) {
@@ -3911,6 +4221,7 @@ document.addEventListener('DOMContentLoaded', () => {
                                 <span class="graph-match-label">${escapeHTML(symLabel)}</span>
                                 <span class="status-tag info">${escapeHTML(symKind)}</span>
                             </div>
+                            ${buildProvenancePillsHtml(sym)}
                             <div class="graph-match-meta code-font">
                                 ${sourceFile ? `<span><i class="fa-regular fa-file-code" aria-hidden="true"></i> ${escapeHTML(sourceFile)}</span>` : ''}
                                 ${sourceLoc ? `<span><i class="fa-solid fa-location-dot" aria-hidden="true"></i> ${escapeHTML(sourceLoc)}</span>` : ''}
@@ -3935,7 +4246,10 @@ document.addEventListener('DOMContentLoaded', () => {
                         query,
                         user_id: activeUser,
                         limit: 10,
-                        author: (currentUser?.value || '').trim()
+                        author: (currentUser?.value || '').trim(),
+                        source_id: sourceId || null,
+                        include_shared_docs: includeSharedDocs,
+                        relation_depth: relationDepth
                     })
                 });
                 if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to perform raw search.'));
@@ -3998,6 +4312,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         <span class="status-tag info">Score: ${round(node.score ?? node.salience, 3)}</span>
                     </div>
                 </div>
+                ${buildProvenancePillsHtml(node)}
                 <div class="memory-content">${escapeHTML(node.content)}</div>
                 ${tagsHtml}
             `;
@@ -4510,6 +4825,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const q = (cgSearchInput?.value || '').trim();
         const k = cgKindSelect ? cgKindSelect.value : 'class,function,method,file';
         const pId = cgProjectSelect ? cgProjectSelect.value : '';
+        const relationDepth = cgRelationDepthSelect ? (parseInt(cgRelationDepthSelect.value, 10) || 0) : 0;
 
         try {
             const url = `/codegraph/data?project_id=${encodeURIComponent(pId)}&query=${encodeURIComponent(q)}&kinds=${encodeURIComponent(k)}`;
@@ -4517,8 +4833,154 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to load codegraph data.'));
 
             const data = await res.json();
-            cgNodesList = data.nodes || [];
-            cgEdgesList = data.edges || [];
+            cgNodesList = Array.isArray(data.nodes) ? [...data.nodes] : [];
+            cgEdgesList = Array.isArray(data.edges) ? [...data.edges] : [];
+
+            if (relationDepth > 0) {
+                const parsed = pId ? parseProjectSourceBranch(pId) : (() => {
+                    const ctx = getProjectContext();
+                    return { project: ctx.baseProject, source: ctx.sourceId, branch: ctx.branch };
+                })();
+                const effProj = parsed.project;
+                const effBranch = (!parsed.branch || parsed.branch === '%') ? 'main' : parsed.branch;
+                const effSrc = parsed.source || null;
+
+                if (effProj && effProj !== 'default') {
+                    const relParams = new URLSearchParams({ project_id: effProj });
+                    if (effSrc && effSrc !== '__shared__') {
+                        relParams.set('source_id', effSrc);
+                    }
+                    const [hybRes, relRes] = await Promise.allSettled([
+                        fetch('/graphify/hybrid-query', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                query: q || '*',
+                                project_id: effProj,
+                                branch: effBranch,
+                                source_id: effSrc,
+                                include_shared_docs: true,
+                                expand_relations: true,
+                                relation_depth: relationDepth,
+                                include_memories: false
+                            })
+                        }),
+                        fetch(`/master/relations?${relParams.toString()}`)
+                    ]);
+
+                    const nodeMap = new Map();
+                    cgNodesList.forEach(n => {
+                        if (n && n.id) nodeMap.set(String(n.id), n);
+                    });
+
+                    const edgeKeySet = new Set();
+                    cgEdgesList.forEach(e => {
+                        const s = e.source || e.from || '';
+                        const t = e.target || e.to || '';
+                        const lbl = e.kind || e.type || e.label || e.relation || '';
+                        edgeKeySet.add(`${s}->${t}:${lbl}`);
+                    });
+
+                    let relationsList = [];
+                    if (relRes.status === 'fulfilled' && relRes.value.ok) {
+                        try {
+                            const relJson = await relRes.value.json();
+                            relationsList = Array.isArray(relJson.relations) ? relJson.relations : [];
+                        } catch (_) {
+                            relationsList = [];
+                        }
+                    }
+
+                    if (hybRes.status === 'fulfilled' && hybRes.value.ok) {
+                        try {
+                            const hybJson = await hybRes.value.json();
+                            const hybGraph = hybJson.graph || {};
+                            const hybNodes = Array.isArray(hybGraph.nodes) ? hybGraph.nodes : [];
+                            const hybEdges = Array.isArray(hybGraph.edges) ? hybGraph.edges : [];
+                            if (Array.isArray(hybJson.cross_source_relations) && relationsList.length === 0) {
+                                relationsList = hybJson.cross_source_relations;
+                            }
+                            hybNodes.forEach(hn => {
+                                if (!hn || !hn.id) return;
+                                const idStr = String(hn.id);
+                                if (!nodeMap.has(idStr)) {
+                                    const normalized = {
+                                        ...hn,
+                                        kind: hn.kind || hn.file_type || hn.group || 'code',
+                                        name: hn.name || hn.label || idStr,
+                                        source_id: hn.source_id || hn.metadata?.source_id || effSrc || '__default__'
+                                    };
+                                    nodeMap.set(idStr, normalized);
+                                    cgNodesList.push(normalized);
+                                } else {
+                                    const existing = nodeMap.get(idStr);
+                                    if (!existing.source_id && (hn.source_id || hn.metadata?.source_id)) {
+                                        existing.source_id = hn.source_id || hn.metadata?.source_id;
+                                    }
+                                }
+                            });
+                            hybEdges.forEach(he => {
+                                const s = he.source || he.from;
+                                const t = he.target || he.to;
+                                if (!s || !t) return;
+                                const isCross = Boolean(he.metadata?.cross_source || he.relation === 'CROSS_SOURCE' || he.kind === 'CROSS_SOURCE');
+                                const lbl = he.metadata?.relation_type || he.relation || he.kind || '';
+                                const ek = `${s}->${t}:${lbl}`;
+                                if (!edgeKeySet.has(ek)) {
+                                    edgeKeySet.add(ek);
+                                    cgEdgesList.push({
+                                        ...he,
+                                        isCrossSource: isCross,
+                                        driftStatus: he.metadata?.drift_status || he.drift_status || 'active',
+                                        relation_type: he.metadata?.relation_type || '',
+                                        contract_key: he.metadata?.contract_key || ''
+                                    });
+                                }
+                            });
+                        } catch (_) {
+                            // Ignore malformed hybrid response
+                        }
+                    }
+
+                    // Overlay any /master/relations edges whose endpoints match loaded nodes
+                    if (relationsList.length > 0 && cgNodesList.length > 0) {
+                        const findMatchNodeId = (srcId, nodeId, pathHint) => {
+                            if (nodeId && nodeMap.has(String(nodeId))) return String(nodeId);
+                            const byPath = pathHint
+                                ? cgNodesList.find(n => (n.file_path || n.source_file || '') === pathHint || (n.label || n.name || '') === pathHint)
+                                : null;
+                            if (byPath) return String(byPath.id);
+                            if (srcId) {
+                                const bySrc = cgNodesList.find(n => (n.source_id || n.metadata?.source_id || '') === srcId);
+                                if (bySrc) return String(bySrc.id);
+                            }
+                            return null;
+                        };
+                        relationsList.forEach(rel => {
+                            if (!rel || String(rel.status || '').toLowerCase() === 'rejected') return;
+                            const fromId = findMatchNodeId(rel.src_source_id, rel.src_node_id, rel.src_file_path);
+                            const toId = findMatchNodeId(rel.dst_source_id, rel.dst_node_id, rel.dst_doc_key || rel.dst_file_path);
+                            if (!fromId || !toId || fromId === toId) return;
+                            const relType = rel.relation_type || 'CROSS_SOURCE';
+                            const ek = `${fromId}->${toId}:${relType}`;
+                            if (!edgeKeySet.has(ek)) {
+                                edgeKeySet.add(ek);
+                                cgEdgesList.push({
+                                    id: `cross_${rel.id || ek}`,
+                                    source: fromId,
+                                    target: toId,
+                                    kind: 'CROSS_SOURCE',
+                                    relation: 'CROSS_SOURCE',
+                                    relation_type: relType,
+                                    contract_key: rel.contract_key || '',
+                                    driftStatus: rel.status || 'active',
+                                    isCrossSource: true
+                                });
+                            }
+                        });
+                    }
+                }
+            }
 
             if (cgNodesList.length === 0) {
                 updateGraphHudStats(0, 0);
@@ -4622,12 +5084,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const visNodes = nodes.map(n => {
             const nodeKind = (n.kind || n.group || 'code').toLowerCase();
             const nodeName = n.name || n.label || n.id;
+            const nodeSrc = toDisplayText(n.source_id || n.metadata?.source_id, '').trim();
             const colors = kindColors[nodeKind] || defaultColor;
             const isFile = nodeKind === 'file';
             return {
                 id: n.id,
                 label: nodeName,
-                title: `${n.qualified_name || nodeName} (${nodeKind})`,
+                title: `${n.qualified_name || nodeName} (${nodeKind})${nodeSrc ? ` [${nodeSrc}]` : ''}`,
                 shape: isFile ? 'box' : 'dot',
                 size: kindSizes[nodeKind] || 16,
                 borderWidth: 2,
@@ -4654,16 +5117,39 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const MAX_VIS_EDGES = 600;
         const cappedEdges = Array.isArray(edges) && edges.length > MAX_VIS_EDGES ? edges.slice(0, MAX_VIS_EDGES) : (edges || []);
-        const visEdges = cappedEdges.map(e => ({
-            id: e.id,
-            from: e.source || e.from,
-            to: e.target || e.to,
-            label: e.kind || e.type || e.label || e.relation || '',
-            arrows: 'to',
-            color: { color: edgeColor, highlight: brandAccent, hover: '#10b981' },
-            font: { size: 9, color: edgeFontColor, strokeWidth: 0, face: 'JetBrains Mono' },
-            smooth: { type: 'continuous' }
-        }));
+        const visEdges = cappedEdges.map(e => {
+            const isCross = Boolean(
+                e.isCrossSource ||
+                e.cross_source ||
+                e.metadata?.cross_source ||
+                e.kind === 'CROSS_SOURCE' ||
+                e.relation === 'CROSS_SOURCE'
+            );
+            const driftStatus = String(e.driftStatus || e.metadata?.drift_status || e.status || 'active').toLowerCase();
+            const isDrifted = driftStatus === 'drifted';
+            const crossColor = isDrifted ? '#ef4444' : '#f59e0b';
+            const relLabel = isCross
+                ? (() => {
+                    const rt = toDisplayText(e.relation_type || e.metadata?.relation_type || e.relation || e.kind, 'CROSS_SOURCE');
+                    const ck = toDisplayText(e.contract_key || e.metadata?.contract_key, '').trim();
+                    return ck ? `${rt} (${ck})` : rt;
+                })()
+                : (e.kind || e.type || e.label || e.relation || '');
+            return {
+                id: e.id,
+                from: e.source || e.from,
+                to: e.target || e.to,
+                label: relLabel,
+                arrows: 'to',
+                dashes: isCross,
+                width: isCross ? 2.2 : 1,
+                color: isCross
+                    ? { color: crossColor, highlight: crossColor, hover: crossColor }
+                    : { color: edgeColor, highlight: brandAccent, hover: '#10b981' },
+                font: { size: 9, color: isCross ? crossColor : edgeFontColor, strokeWidth: 0, face: 'JetBrains Mono' },
+                smooth: { type: 'continuous' }
+            };
+        });
 
         const visData = {
             nodes: new vis.DataSet(visNodes),
@@ -4727,6 +5213,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if (ndKind) {
             ndKind.textContent = toDisplayText(node.kind, '').toUpperCase();
             ndKind.className = 'status-tag info';
+        }
+        const nodeSrc = toDisplayText(node.source_id || node.metadata?.source_id, '').trim();
+        if (ndSourceRow && ndSourceId) {
+            ndSourceRow.style.display = 'flex';
+            ndSourceId.textContent = nodeSrc === '__shared__'
+                ? 'Shared Docs (__shared__)'
+                : (nodeSrc || '__default__');
         }
         if (ndFilePath) ndFilePath.textContent = toDisplayText(node.file_path || node.source_file, '');
 
@@ -4896,6 +5389,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     root_branch: rootBranch,
                     root_schema: rootSchema,
                     branches: sortedBranches,
+                    sources: Array.isArray(tp?.sources) ? tp.sources : [],
+                    shared_doc_count: Number(tp?.shared_doc_count ?? 0) || 0,
+                    relation_count: Number(tp?.relation_count ?? 0) || 0,
                     sync_ip: toDisplayText(tp?.sync_ip || legacy.sync_ip, ''),
                     sync_author: toDisplayText(tp?.sync_author || legacy.sync_author, ''),
                     project_path: toDisplayText(tp?.project_path || legacy.project_path, ''),
@@ -4936,6 +5432,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 root_branch: rootBranch,
                 root_schema: 'pb_root',
                 branches,
+                sources: [],
+                shared_doc_count: 0,
+                relation_count: 0,
                 sync_ip: legacy.sync_ip || '',
                 sync_author: legacy.sync_author || '',
                 project_path: legacy.project_path || '',
@@ -4984,6 +5483,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     id: proj.project_id,
                     name: proj.name || proj.project_id,
                     branches: branchSet,
+                    sources: Array.isArray(proj.sources) ? proj.sources : [],
+                    shared_doc_count: Number(proj.shared_doc_count ?? 0) || 0,
+                    relation_count: Number(proj.relation_count ?? 0) || 0,
                     sync_ip: proj.sync_ip,
                     sync_author: proj.sync_author,
                     project_path: proj.project_path,
@@ -5035,6 +5537,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
                 const urlParams = new URLSearchParams(window.location.search);
                 const urlProject = (urlParams.get('project') || '').trim();
+                const hasUrlSource = urlParams.has('source');
+                const rawUrlSource = (urlParams.get('source') || '').trim();
+                const urlSource = rawUrlSource === '*' ? '' : rawUrlSource;
                 const rawUrlBranch = (urlParams.get('branch') || '').trim();
                 const urlBranch = rawUrlBranch === 'all' ? '%' : rawUrlBranch;
                 const savedProject = localStorage.getItem('activeProject');
@@ -5050,6 +5555,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else {
                     currentProjectSelect.value = 'default';
                 }
+                updateSourceDropdown(currentProjectSelect.value);
+                if (hasUrlSource && currentSourceSelect) {
+                    if (urlSource && !Array.from(currentSourceSelect.options).some(o => o.value === urlSource)) {
+                        const optUrlSrc = document.createElement('option');
+                        optUrlSrc.value = urlSource;
+                        optUrlSrc.textContent = urlSource;
+                        currentSourceSelect.appendChild(optUrlSrc);
+                    }
+                    currentSourceSelect.value = urlSource;
+                    activeSource = urlSource;
+                    localStorage.setItem(`source_${currentProjectSelect.value}`, urlSource);
+                }
                 updateBranchDropdown(currentProjectSelect.value);
                 if (urlBranch && currentBranchSelect) {
                     if (!Array.from(currentBranchSelect.options).some(o => o.value === urlBranch)) {
@@ -5062,12 +5579,16 @@ document.addEventListener('DOMContentLoaded', () => {
                     currentBranchSelect.value = urlBranch;
                     localStorage.setItem(`branch_${currentProjectSelect.value}`, urlBranch);
                 }
-                recalculateActiveUser();
+                recalculateActiveUser({ skipHistorySync: true });
                 if (cgProjectSelect) {
                     const desiredCg = activeUser === 'default' ? '' : activeUser;
-                    if (desiredCg && Array.from(cgProjectSelect.options).some(o => o.value === desiredCg)) {
-                        cgProjectSelect.value = desiredCg;
+                    if (desiredCg && !Array.from(cgProjectSelect.options).some(o => o.value === desiredCg)) {
+                        const optCg = document.createElement('option');
+                        optCg.value = desiredCg;
+                        optCg.textContent = desiredCg;
+                        cgProjectSelect.appendChild(optCg);
                     }
+                    cgProjectSelect.value = desiredCg;
                 }
                 refreshAllRouteLinks();
             } else {
@@ -5403,10 +5924,14 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function switchWorkspaceContext(projectId, branchName) {
+    function switchWorkspaceContext(projectId, branchName, sourceId = null) {
         const targetProj = (projectId || '').trim() || 'default';
         const targetBranch = (branchName || '').trim();
         localStorage.setItem('activeProject', targetProj);
+        if (sourceId !== null && sourceId !== undefined) {
+            const cleanSrc = String(sourceId).trim();
+            localStorage.setItem(`source_${targetProj}`, cleanSrc === '*' ? '' : cleanSrc);
+        }
         if (targetBranch) {
             localStorage.setItem(`branch_${targetProj}`, targetBranch);
         }
@@ -5418,6 +5943,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentProjectSelect.appendChild(opt);
             }
             currentProjectSelect.value = targetProj;
+            updateSourceDropdown(targetProj);
+            if (currentSourceSelect && sourceId !== null && sourceId !== undefined) {
+                const cleanSrc = String(sourceId).trim();
+                const effSrc = cleanSrc === '*' ? '' : cleanSrc;
+                if (effSrc && !Array.from(currentSourceSelect.options).some(o => o.value === effSrc)) {
+                    const optS = document.createElement('option');
+                    optS.value = effSrc;
+                    optS.textContent = effSrc;
+                    currentSourceSelect.appendChild(optS);
+                }
+                currentSourceSelect.value = effSrc;
+                activeSource = effSrc;
+            }
             updateBranchDropdown(targetProj);
             if (currentBranchSelect && targetBranch) {
                 if (!Array.from(currentBranchSelect.options).some(o => o.value === targetBranch)) {
@@ -5429,7 +5967,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentBranchSelect.value = targetBranch;
             }
         }
-        recalculateActiveUser();
+        recalculateActiveUser({ skipHistorySync: true });
         onWorkspaceContextChanged();
         showToast(
             targetBranch
@@ -5570,6 +6108,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     `
                     : '';
 
+                const sourcesCount = Array.isArray(p.sources) ? p.sources.length : 0;
+                const sharedDocCount = Number(p.shared_doc_count ?? 0) || 0;
+                const relationCount = Number(p.relation_count ?? 0) || 0;
+                const manageSourcesLinkHtml = `<a href="/app/workspace/sources?project=${encodeURIComponent(p.project_id)}" class="btn btn-secondary btn-sm" data-route-link><i class="fa-solid fa-sitemap" aria-hidden="true"></i> Manage Sources &amp; Relations</a>`;
+
                 card.innerHTML = `
                     <div class="project-topo-header">
                         <div class="project-topo-title-group">
@@ -5577,6 +6120,11 @@ document.addEventListener('DOMContentLoaded', () => {
                             <span class="account-role-badge collaborator">${escapeHTML(p.project_id)}</span>
                             <span class="backend-pill ${escapeHTML(backendPillClass)}">${escapeHTML(backendPillLabel)}</span>
                             <span class="db-badge">DB: ${escapeHTML(p.db_name)}</span>
+                        </div>
+                        <div class="project-hub-badges mono-num">
+                            <span class="project-hub-badge"><i class="fa-solid fa-cubes-stacked" aria-hidden="true"></i> Sources: <strong>${escapeHTML(sourcesCount)}</strong></span>
+                            <span class="project-hub-badge"><i class="fa-solid fa-book-open" aria-hidden="true"></i> Shared Docs: <strong>${escapeHTML(sharedDocCount)}</strong></span>
+                            <span class="project-hub-badge"><i class="fa-solid fa-diagram-project" aria-hidden="true"></i> Relations: <strong>${escapeHTML(relationCount)}</strong></span>
                         </div>
                     </div>
                     <div class="info-text">${escapeHTML(p.description || 'No description provided.')}</div>
@@ -5607,7 +6155,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             </button>
                         </div>
                     </div>
-                    ${(newBranchBtnHtml || dropProjectBtnHtml) ? `<div class="project-card-actions">${newBranchBtnHtml}${dropProjectBtnHtml}</div>` : ''}
+                    <div class="project-card-actions">${manageSourcesLinkHtml}${newBranchBtnHtml}${dropProjectBtnHtml}</div>
                 `;
 
                 card.querySelectorAll('.btn-switch-branch-schema').forEach(btn => {
@@ -5705,6 +6253,604 @@ document.addEventListener('DOMContentLoaded', () => {
             await loadProjectsList();
         } catch (err) {
             showToast('Error dropping project database: ' + err.message, 'error');
+        }
+    }
+
+    // =========================================================================
+    // 16b. Multi-Source Hub, Shared Docs (__shared__) & Cross-Source Relations
+    // =========================================================================
+    function syncSourcesHubSelects(sources) {
+        const list = Array.isArray(sources) ? sources : [];
+        const sourceIds = list.map(s => toDisplayText(s?.source_id, '').trim()).filter(Boolean);
+
+        if (bindSharedTargetSource) {
+            const prev = bindSharedTargetSource.value || '*';
+            bindSharedTargetSource.innerHTML = '<option value="*">All Sub-Sources (*)</option>';
+            sourceIds.forEach(sid => {
+                const opt = document.createElement('option');
+                opt.value = sid;
+                opt.textContent = sid;
+                bindSharedTargetSource.appendChild(opt);
+            });
+            if (Array.from(bindSharedTargetSource.options).some(o => o.value === prev)) {
+                bindSharedTargetSource.value = prev;
+            }
+        }
+
+        [relSrcSource, relDstSource].forEach((sel, idx) => {
+            if (!sel) return;
+            const prev = sel.value;
+            sel.innerHTML = '';
+            const defaults = idx === 0 ? ['__default__', '__shared__'] : ['__shared__', '__default__'];
+            sourceIds.forEach(sid => {
+                const opt = document.createElement('option');
+                opt.value = sid;
+                opt.textContent = sid;
+                sel.appendChild(opt);
+            });
+            defaults.forEach(defId => {
+                if (!sourceIds.includes(defId)) {
+                    const opt = document.createElement('option');
+                    opt.value = defId;
+                    opt.textContent = defId === '__shared__' ? 'Shared Docs Hub (__shared__)' : '__default__';
+                    sel.appendChild(opt);
+                }
+            });
+            if (prev && Array.from(sel.options).some(o => o.value === prev)) {
+                sel.value = prev;
+            } else if (idx === 0 && sourceIds.length > 0) {
+                sel.value = sourceIds[0];
+            } else if (idx === 1 && sourceIds.length > 1) {
+                sel.value = sourceIds[1];
+            }
+        });
+    }
+
+    function renderSourcesHubList(sources, baseProject) {
+        if (!sourcesHubList) return;
+        const list = Array.isArray(sources) ? sources : [];
+        const isReader = isReaderRole();
+
+        sourcesHubList.innerHTML = '';
+        if (list.length === 0) {
+            sourcesHubList.innerHTML = '<div class="placeholder-item">No child sub-sources registered yet. Use the form above to register your first sub-source (e.g. backend-api, web-ui).</div>';
+            return;
+        }
+
+        list.forEach(src => {
+            const sid = toDisplayText(src?.source_id, '').trim();
+            if (!sid) return;
+            const dName = toDisplayText(src?.display_name, sid);
+            const srcType = toDisplayText(src?.source_type, 'service');
+            const version = toDisplayText(src?.current_version, '1.0.0');
+            const syncGen = Number(src?.sync_generation ?? 0) || 0;
+            const rootSchema = toDisplayText(src?.root_schema, 'pb_root');
+            const rootBranch = toDisplayText(src?.root_branch, 'main');
+            const status = toDisplayText(src?.status, 'active');
+
+            const card = document.createElement('article');
+            card.className = 'source-card-item';
+            const focusBtnHtml = `<button type="button" class="btn btn-secondary btn-sm btn-focus-source" data-source="${escapeHTML(sid)}"><i class="fa-solid fa-crosshairs" aria-hidden="true"></i> Focus</button>`;
+            const upgradeBtnHtml = !isReader
+                ? `<button type="button" class="btn btn-secondary btn-sm btn-upgrade-source" data-source="${escapeHTML(sid)}" data-version="${escapeHTML(version)}" data-branch="${escapeHTML(rootBranch)}"><i class="fa-solid fa-arrow-up-right-dots" aria-hidden="true"></i> Upgrade</button>`
+                : '';
+            const dropBtnHtml = !isReader
+                ? `<button type="button" class="btn btn-danger btn-sm btn-drop-source" data-source="${escapeHTML(sid)}"><i class="fa-solid fa-trash-can" aria-hidden="true"></i> Drop</button>`
+                : '';
+
+            card.innerHTML = `
+                <div class="source-card-header">
+                    <div class="source-card-title">
+                        <span class="account-username">${escapeHTML(dName)}</span>
+                        <span class="account-role-badge collaborator code-font">${escapeHTML(sid)}</span>
+                        <span class="status-tag info">${escapeHTML(srcType)}</span>
+                    </div>
+                    <span class="status-tag ${status === 'active' ? 'success' : 'warning'}">${escapeHTML(status)}</span>
+                </div>
+                <div class="source-card-meta">
+                    <span>Version: <strong>${escapeHTML(version)}</strong></span>
+                    <span>Sync Gen: <strong>#${escapeHTML(syncGen)}</strong></span>
+                    <span>Branch: <strong>${escapeHTML(rootBranch)}</strong></span>
+                    <span>Root Schema: <code>${escapeHTML(rootSchema)}</code></span>
+                </div>
+                <div class="source-card-actions">
+                    ${focusBtnHtml}
+                    ${upgradeBtnHtml}
+                    ${dropBtnHtml}
+                </div>
+            `;
+
+            const focusBtn = card.querySelector('.btn-focus-source');
+            if (focusBtn) {
+                focusBtn.addEventListener('click', () => {
+                    switchWorkspaceContext(baseProject, rootBranch, sid);
+                });
+            }
+            const upgBtn = card.querySelector('.btn-upgrade-source');
+            if (upgBtn) {
+                upgBtn.addEventListener('click', () => openUpgradeSourceDialog(src));
+            }
+            const dropBtn = card.querySelector('.btn-drop-source');
+            if (dropBtn) {
+                dropBtn.addEventListener('click', () => dropProjectSource(baseProject, sid));
+            }
+
+            sourcesHubList.appendChild(card);
+        });
+    }
+
+    function renderSharedDocBindingsList(bindings) {
+        if (!sharedDocBindingsList) return;
+        const list = Array.isArray(bindings) ? bindings : [];
+        sharedDocBindingsList.innerHTML = '';
+        if (list.length === 0) {
+            sharedDocBindingsList.innerHTML = '<div class="placeholder-item">No shared document bindings configured for this project yet.</div>';
+            return;
+        }
+
+        list.forEach(b => {
+            const docKey = toDisplayText(b?.doc_key, 'unknown');
+            const targetSrc = toDisplayText(b?.target_source_id, '*');
+            const role = toDisplayText(b?.binding_role, 'reference');
+            const pinnedVer = toDisplayText(b?.pinned_version, '').trim();
+            const priority = b?.priority !== undefined && b?.priority !== null ? b.priority : 1.0;
+            const status = toDisplayText(b?.status, 'active');
+
+            const card = document.createElement('article');
+            card.className = 'source-card-item';
+            card.innerHTML = `
+                <div class="source-card-header">
+                    <div class="source-card-title">
+                        <span class="account-username code-font">${escapeHTML(docKey)}</span>
+                        <span class="status-tag info">${escapeHTML(role)}</span>
+                    </div>
+                    <span class="status-tag ${status === 'active' ? 'success' : 'warning'}">${escapeHTML(status)}</span>
+                </div>
+                <div class="source-card-meta">
+                    <span>Target: <strong>${escapeHTML(targetSrc === '*' ? 'All Sources (*)' : targetSrc)}</strong></span>
+                    ${pinnedVer ? `<span>Pinned: <strong>${escapeHTML(pinnedVer)}</strong></span>` : ''}
+                    <span>Priority: <strong>${escapeHTML(priority)}</strong></span>
+                </div>
+            `;
+            sharedDocBindingsList.appendChild(card);
+        });
+    }
+
+    function renderFilteredCrossSourceRelations() {
+        if (!crossSourceRelationsList) return;
+        const statusFilter = (relFilterStatus?.value || '').trim().toLowerCase();
+        const typeFilter = (relFilterType?.value || '').trim().toLowerCase();
+        const textFilter = (relFilterText?.value || '').trim().toLowerCase();
+        const isReader = isReaderRole();
+        const { baseProject } = getProjectContext();
+
+        const filtered = (sourcesHubRelationsCache || []).filter(rel => {
+            const st = String(rel?.status || 'active').toLowerCase();
+            const rt = String(rel?.relation_type || '').toLowerCase();
+            if (statusFilter && st !== statusFilter) return false;
+            if (typeFilter && rt !== typeFilter) return false;
+            if (textFilter) {
+                const haystack = [
+                    rel?.id,
+                    rel?.src_source_id,
+                    rel?.dst_source_id,
+                    rel?.relation_type,
+                    rel?.contract_key,
+                    rel?.origin
+                ].map(v => toDisplayText(v, '')).join(' ').toLowerCase();
+                if (!haystack.includes(textFilter)) return false;
+            }
+            return true;
+        });
+
+        crossSourceRelationsList.innerHTML = '';
+        if (filtered.length === 0) {
+            crossSourceRelationsList.innerHTML = '<div class="placeholder-item">No cross-source relations match the current filter.</div>';
+            return;
+        }
+
+        filtered.forEach(rel => {
+            const relId = toDisplayText(rel?.id, '').trim();
+            const srcSid = toDisplayText(rel?.src_source_id, '__default__');
+            const dstSid = toDisplayText(rel?.dst_source_id, '__shared__');
+            const relType = toDisplayText(rel?.relation_type, 'calls_api');
+            const contractKey = toDisplayText(rel?.contract_key, '').trim();
+            const origin = toDisplayText(rel?.origin, 'manual');
+            const confidence = toDisplayText(rel?.confidence, 'MANUAL');
+            const status = toDisplayText(rel?.status, 'active').toLowerCase();
+            const allowedStatuses = new Set(['active', 'drifted', 'stale', 'pinned', 'rejected']);
+            const statusClass = allowedStatuses.has(status) ? status : 'active';
+
+            const row = document.createElement('article');
+            row.className = `relation-row-card${status === 'drifted' ? ' is-drifted' : ''}${status === 'stale' ? ' is-stale' : ''}`;
+
+            const actionsHtml = !isReader
+                ? `
+                    <div class="relation-row-actions">
+                        <button type="button" class="btn btn-secondary btn-sm btn-pin-relation" ${status === 'pinned' ? 'disabled' : ''}>
+                            <i class="fa-solid fa-thumbtack" aria-hidden="true"></i> Pin
+                        </button>
+                        <button type="button" class="btn btn-secondary btn-sm btn-reject-relation" ${status === 'rejected' ? 'disabled' : ''}>
+                            <i class="fa-solid fa-ban" aria-hidden="true"></i> Reject
+                        </button>
+                        <button type="button" class="btn btn-danger btn-sm btn-delete-relation">
+                            <i class="fa-solid fa-trash-can" aria-hidden="true"></i> Delete
+                        </button>
+                    </div>
+                `
+                : '';
+
+            row.innerHTML = `
+                <div class="relation-row-main">
+                    <div class="relation-edge-path">
+                        <code class="code-font">${escapeHTML(srcSid)}</code>
+                        <span aria-hidden="true">&rarr;</span>
+                        <span class="relation-type-pill">${escapeHTML(relType)}</span>
+                        <span aria-hidden="true">&rarr;</span>
+                        <code class="code-font">${escapeHTML(dstSid)}</code>
+                        <span class="relation-status-badge status-${escapeHTML(statusClass)}">${escapeHTML(status)}</span>
+                    </div>
+                    <div class="relation-meta-line">
+                        ${contractKey ? `<span>Contract: <code>${escapeHTML(contractKey)}</code></span>` : '<span>Contract: (untyped)</span>'}
+                        <span>Origin: ${escapeHTML(origin)}</span>
+                        <span>Confidence: ${escapeHTML(confidence)}</span>
+                        ${relId ? `<span>ID: <code>${escapeHTML(relId)}</code></span>` : ''}
+                    </div>
+                </div>
+                ${actionsHtml}
+            `;
+
+            const pinBtn = row.querySelector('.btn-pin-relation');
+            if (pinBtn && relId) {
+                pinBtn.addEventListener('click', () => updateCrossSourceRelation(baseProject, relId, { status: 'pinned', pin: true }));
+            }
+            const rejectBtn = row.querySelector('.btn-reject-relation');
+            if (rejectBtn && relId) {
+                rejectBtn.addEventListener('click', () => updateCrossSourceRelation(baseProject, relId, { status: 'rejected', pin: false }));
+            }
+            const delBtn = row.querySelector('.btn-delete-relation');
+            if (delBtn && relId) {
+                delBtn.addEventListener('click', () => deleteCrossSourceRelation(baseProject, relId, `${srcSid} → ${dstSid}`));
+            }
+
+            crossSourceRelationsList.appendChild(row);
+        });
+    }
+
+    async function loadSourcesHub() {
+        const { baseProject } = getProjectContext();
+        if (sourcesHubProjectBadge) {
+            sourcesHubProjectBadge.textContent = `Project: ${baseProject}`;
+        }
+        if (sourcesHubList) {
+            sourcesHubList.innerHTML = '<div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading sub-sources...</div>';
+        }
+        if (sharedDocBindingsList) {
+            sharedDocBindingsList.innerHTML = '<div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading shared bindings...</div>';
+        }
+        if (crossSourceRelationsList) {
+            crossSourceRelationsList.innerHTML = '<div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading cross-source relations...</div>';
+        }
+
+        const qProj = encodeURIComponent(baseProject);
+        const [srcRes, bindRes, relRes] = await Promise.allSettled([
+            fetch(`/master/sources?project_id=${qProj}`),
+            fetch(`/sources/shared-bindings?project_id=${qProj}`),
+            fetch(`/master/relations?project_id=${qProj}`)
+        ]);
+
+        if (srcRes.status === 'fulfilled' && srcRes.value.ok) {
+            try {
+                const srcData = await srcRes.value.json();
+                sourcesHubSourcesCache = Array.isArray(srcData.sources) ? srcData.sources : [];
+                syncSourcesHubSelects(sourcesHubSourcesCache);
+                renderSourcesHubList(sourcesHubSourcesCache, baseProject);
+            } catch (err) {
+                if (sourcesHubList) sourcesHubList.innerHTML = `<div class="error-msg is-visible">${escapeHTML(err.message)}</div>`;
+            }
+        } else if (sourcesHubList) {
+            const msg = srcRes.status === 'fulfilled'
+                ? await extractErrorMessage(srcRes.value, 'Failed to load sub-sources.')
+                : 'Failed to load sub-sources.';
+            sourcesHubList.innerHTML = `<div class="error-msg is-visible">${escapeHTML(msg)}</div>`;
+        }
+
+        if (bindRes.status === 'fulfilled' && bindRes.value.ok) {
+            try {
+                const bindData = await bindRes.value.json();
+                renderSharedDocBindingsList(bindData.bindings || []);
+            } catch (err) {
+                if (sharedDocBindingsList) sharedDocBindingsList.innerHTML = `<div class="error-msg is-visible">${escapeHTML(err.message)}</div>`;
+            }
+        } else if (sharedDocBindingsList) {
+            const msg = bindRes.status === 'fulfilled'
+                ? await extractErrorMessage(bindRes.value, 'Failed to load shared bindings.')
+                : 'Failed to load shared bindings.';
+            sharedDocBindingsList.innerHTML = `<div class="error-msg is-visible">${escapeHTML(msg)}</div>`;
+        }
+
+        if (relRes.status === 'fulfilled' && relRes.value.ok) {
+            try {
+                const relData = await relRes.value.json();
+                sourcesHubRelationsCache = Array.isArray(relData.relations) ? relData.relations : [];
+                renderFilteredCrossSourceRelations();
+            } catch (err) {
+                if (crossSourceRelationsList) crossSourceRelationsList.innerHTML = `<div class="error-msg is-visible">${escapeHTML(err.message)}</div>`;
+            }
+        } else if (crossSourceRelationsList) {
+            const msg = relRes.status === 'fulfilled'
+                ? await extractErrorMessage(relRes.value, 'Failed to load cross-source relations.')
+                : 'Failed to load cross-source relations.';
+            crossSourceRelationsList.innerHTML = `<div class="error-msg is-visible">${escapeHTML(msg)}</div>`;
+        }
+    }
+
+    async function registerProjectSource(e) {
+        e.preventDefault();
+        const { baseProject, branch } = getProjectContext();
+        const sourceId = (regSourceId?.value || '').trim();
+        const displayName = (regSourceDisplayName?.value || '').trim() || sourceId;
+        const sourceType = regSourceType ? regSourceType.value : 'service';
+        const currentVersion = (regSourceVersion?.value || '').trim() || '1.0.0';
+        if (!sourceId) {
+            showToast('Source ID is required.', 'warning');
+            return;
+        }
+        if (btnRegisterSourceSubmit) btnRegisterSourceSubmit.disabled = true;
+        try {
+            const res = await fetch('/master/sources', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    project_id: baseProject,
+                    source_id: sourceId,
+                    display_name: displayName,
+                    source_type: sourceType,
+                    root_branch: branch || 'main',
+                    current_version: currentVersion
+                })
+            });
+            if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to register sub-source.'));
+            showToast(`Registered sub-source '${sourceId}' in '${baseProject}'.`, 'success');
+            registerSourceForm?.reset();
+            if (regSourceVersion) regSourceVersion.value = '1.0.0';
+            await loadProjects();
+            await loadSourcesHub();
+        } catch (err) {
+            showToast('Error registering sub-source: ' + err.message, 'error');
+        } finally {
+            if (btnRegisterSourceSubmit) btnRegisterSourceSubmit.disabled = false;
+        }
+    }
+
+    function openUpgradeSourceDialog(src) {
+        if (!upgradeSourceDialog) return;
+        const sid = toDisplayText(src?.source_id, '').trim();
+        const curVer = toDisplayText(src?.current_version, '1.0.0').trim();
+        const curBranch = toDisplayText(src?.root_branch, 'main').trim() || 'main';
+        if (upgradeSourceTargetId) upgradeSourceTargetId.value = sid;
+        if (upgradeSourceDialogHint) {
+            upgradeSourceDialogHint.textContent = `Source: ${sid} · Current Version: ${curVer}`;
+        }
+        if (upgradeSourceToVersion) upgradeSourceToVersion.value = curVer;
+        if (upgradeSourceBranch) upgradeSourceBranch.value = curBranch;
+        if (!upgradeSourceDialog.open) {
+            upgradeSourceDialog.returnValue = '';
+            upgradeSourceDialog.showModal();
+        }
+        if (upgradeSourceToVersion) {
+            requestAnimationFrame(() => upgradeSourceToVersion.focus());
+        }
+    }
+
+    async function submitUpgradeProjectSource(e) {
+        e.preventDefault();
+        const { baseProject } = getProjectContext();
+        const sourceId = (upgradeSourceTargetId?.value || '').trim();
+        const toVersion = (upgradeSourceToVersion?.value || '').trim();
+        const upgradeMode = upgradeSourceMode ? upgradeSourceMode.value : 'delta';
+        const branchName = (upgradeSourceBranch?.value || '').trim() || 'main';
+        const actor = (currentAccount?.username || currentUser?.value || '').trim() || 'system';
+        if (!sourceId || !toVersion) {
+            showToast('Source ID and Target Version are required.', 'warning');
+            return;
+        }
+        if (btnSubmitUpgradeSource) btnSubmitUpgradeSource.disabled = true;
+        try {
+            const res = await fetch(`/master/sources/${encodeURIComponent(sourceId)}/upgrade`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    project_id: baseProject,
+                    branch_name: branchName,
+                    to_version: toVersion,
+                    upgrade_mode: upgradeMode,
+                    actor
+                })
+            });
+            if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to upgrade sub-source.'));
+            if (upgradeSourceDialog?.open) upgradeSourceDialog.close('upgraded');
+            showToast(`Upgraded '${sourceId}' to ${toVersion} (${upgradeMode}).`, 'success');
+            await loadProjects();
+            await loadSourcesHub();
+        } catch (err) {
+            showToast('Error upgrading sub-source: ' + err.message, 'error');
+        } finally {
+            if (btnSubmitUpgradeSource) btnSubmitUpgradeSource.disabled = false;
+        }
+    }
+
+    async function dropProjectSource(projectId, sourceId) {
+        const ok = await confirmAction({
+            title: 'Drop Sub-Source',
+            message: `Are you sure you want to drop sub-source '${sourceId}' from project '${projectId}'? This removes its source registration and isolated schema metadata.`,
+            confirmLabel: 'Drop Sub-Source',
+            danger: true
+        });
+        if (!ok) return;
+        try {
+            const res = await fetch(
+                `/master/sources/${encodeURIComponent(sourceId)}?project_id=${encodeURIComponent(projectId)}`,
+                { method: 'DELETE' }
+            );
+            if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to drop sub-source.'));
+            showToast(`Sub-source '${sourceId}' dropped.`, 'success');
+            if (localStorage.getItem(`source_${projectId}`) === sourceId) {
+                localStorage.setItem(`source_${projectId}`, '');
+            }
+            await loadProjects();
+            await loadSourcesHub();
+        } catch (err) {
+            showToast('Error dropping sub-source: ' + err.message, 'error');
+        }
+    }
+
+    async function bindSharedDocument(e) {
+        e.preventDefault();
+        const { baseProject } = getProjectContext();
+        const docKey = (bindSharedDocKey?.value || '').trim();
+        const targetSourceId = (bindSharedTargetSource?.value || '*').trim() || '*';
+        const bindingRole = bindSharedRole ? bindSharedRole.value : 'reference';
+        if (!docKey) {
+            showToast('Shared Document Key is required.', 'warning');
+            return;
+        }
+        if (btnBindSharedDoc) btnBindSharedDoc.disabled = true;
+        try {
+            const res = await fetch('/sources/shared-bindings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    project_id: baseProject,
+                    doc_key: docKey,
+                    target_source_id: targetSourceId,
+                    binding_role: bindingRole
+                })
+            });
+            if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to bind shared document.'));
+            showToast(`Bound shared doc '${docKey}' to '${targetSourceId}'.`, 'success');
+            bindSharedDocForm?.reset();
+            await loadProjects();
+            await loadSourcesHub();
+        } catch (err) {
+            showToast('Error binding shared document: ' + err.message, 'error');
+        } finally {
+            if (btnBindSharedDoc) btnBindSharedDoc.disabled = false;
+        }
+    }
+
+    async function createCrossSourceRelation(e) {
+        e.preventDefault();
+        const { baseProject, branch } = getProjectContext();
+        const srcSourceId = (relSrcSource?.value || '').trim();
+        const relationType = relTypeSelect ? relTypeSelect.value : 'calls_api';
+        const dstSourceId = (relDstSource?.value || '').trim();
+        const contractKey = (relContractKey?.value || '').trim();
+        const createdBy = (currentAccount?.username || currentUser?.value || '').trim() || 'user';
+        if (!srcSourceId || !dstSourceId) {
+            showToast('Origin and Target sources are required.', 'warning');
+            return;
+        }
+        if (btnCreateRelationSubmit) btnCreateRelationSubmit.disabled = true;
+        try {
+            const res = await fetch('/master/relations', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    project_id: baseProject,
+                    src_source_id: srcSourceId,
+                    dst_source_id: dstSourceId,
+                    relation_type: relationType,
+                    src_branch: branch || 'main',
+                    dst_branch: branch || 'main',
+                    contract_key: contractKey,
+                    pin: true,
+                    created_by: createdBy
+                })
+            });
+            if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to create relation.'));
+            showToast(`Linked ${srcSourceId} → ${dstSourceId} (${relationType}).`, 'success');
+            if (relContractKey) relContractKey.value = '';
+            await loadProjects();
+            await loadSourcesHub();
+        } catch (err) {
+            showToast('Error creating relation: ' + err.message, 'error');
+        } finally {
+            if (btnCreateRelationSubmit) btnCreateRelationSubmit.disabled = false;
+        }
+    }
+
+    async function runAutoLinkSources() {
+        const { baseProject, sourceId, branch } = getProjectContext();
+        if (btnRunAutoLinkSources) {
+            btnRunAutoLinkSources.disabled = true;
+            btnRunAutoLinkSources.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Auto-Linking...';
+        }
+        try {
+            const res = await fetch('/master/relations/auto-link', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    project_id: baseProject,
+                    source_id: sourceId && sourceId !== '__shared__' ? sourceId : null,
+                    branch: branch || 'main'
+                })
+            });
+            if (!res.ok) throw new Error(await extractErrorMessage(res, 'Auto-linker failed.'));
+            const data = await res.json();
+            const created = data.created ?? data.relations_created ?? 0;
+            const updated = data.updated ?? data.relations_updated ?? 0;
+            const drifted = data.drifted ?? data.drifted_count ?? 0;
+            showToast(`Auto-linker complete: ${created} created, ${updated} updated, ${drifted} drifted.`, 'success');
+            await loadProjects();
+            await loadSourcesHub();
+        } catch (err) {
+            showToast('Auto-linker error: ' + err.message, 'error');
+        } finally {
+            if (btnRunAutoLinkSources) {
+                btnRunAutoLinkSources.disabled = false;
+                btnRunAutoLinkSources.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Run Auto-Linker';
+            }
+        }
+    }
+
+    async function updateCrossSourceRelation(projectId, relationId, payload) {
+        try {
+            const res = await fetch(
+                `/master/relations/${encodeURIComponent(relationId)}?project_id=${encodeURIComponent(projectId)}`,
+                {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ project_id: projectId, ...payload })
+                }
+            );
+            if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to update relation.'));
+            showToast(`Relation updated (${payload.status || 'ok'}).`, 'success', 2600);
+            await loadSourcesHub();
+        } catch (err) {
+            showToast('Error updating relation: ' + err.message, 'error');
+        }
+    }
+
+    async function deleteCrossSourceRelation(projectId, relationId, label = '') {
+        const ok = await confirmAction({
+            title: 'Delete Cross-Source Relation',
+            message: `Delete cross-source relation ${label ? `'${label}' ` : ''}(${relationId})?`,
+            confirmLabel: 'Delete Relation',
+            danger: true
+        });
+        if (!ok) return;
+        try {
+            const res = await fetch(
+                `/master/relations/${encodeURIComponent(relationId)}?project_id=${encodeURIComponent(projectId)}`,
+                { method: 'DELETE' }
+            );
+            if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to delete relation.'));
+            showToast('Cross-source relation deleted.', 'success', 2600);
+            await loadProjects();
+            await loadSourcesHub();
+        } catch (err) {
+            showToast('Error deleting relation: ' + err.message, 'error');
         }
     }
 

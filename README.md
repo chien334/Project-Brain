@@ -206,6 +206,7 @@ All commands run via `python3 -m projectbrain.main <command>`:
 | :--- | :--- |
 | **HSG Memory** | `projectbrain_query`, `projectbrain_store`, `projectbrain_get`, `projectbrain_list`, `projectbrain_delete`, `projectbrain_delete_all`, `projectbrain_reinforce`, `projectbrain_stats`, `projectbrain_ingest`, `projectbrain_register_mcp`, `projectbrain_register_external_mcp` |
 | **Graphify & Hybrid KB** | `projectbrain_hardware_status`, `projectbrain_sync_graphify`, `projectbrain_query_graphify` (`query\|trace\|impact\|callers\|callees\|node\|god_nodes\|community`), `projectbrain_local_graphify_diff`, `projectbrain_hybrid_query`, `projectbrain_promote_branch_graph`, `projectbrain_diff_project_versions`, `projectbrain_query_codegraph` |
+| **Multi-Source Hub & Auto-Bootstrap** | `projectbrain_get_agent_setup_playbook`, `projectbrain_discover_workspace_sources`, `projectbrain_bootstrap_project_hub`, `projectbrain_register_source`, `projectbrain_list_sources`, `projectbrain_link_sources`, `projectbrain_auto_link_sources`, `projectbrain_cross_source_impact`, `projectbrain_bind_shared_doc` |
 | **Multimodal Docs & Unified KB** | `projectbrain_upload_document`, `projectbrain_push_processed_document`, `projectbrain_list_document_versions`, `projectbrain_diff_document_versions`, `projectbrain_build_complete_kb`, `projectbrain_trace_code_and_docs`, `projectbrain_kb_coverage_report`, `projectbrain_generate_project_docs` |
 | **v3.0 Plugin & Testing Layer 1** | `projectbrain_list_plugins`, `projectbrain_toggle_plugin`, `projectbrain_v3_ingest_etl`, `projectbrain_v3_script_cache_lookup`, `projectbrain_v3_script_cache_store`, `projectbrain_v3_index_artifact`, `projectbrain_v3_query_evidence_window`, `projectbrain_v3_plan_test_dag`, `projectbrain_v3_oracle_context`, `projectbrain_v3_rca_triage` |
 | **Document / OCR / Migration Extensions** | `pdf_convert_to_markdown`, `docx_extract_text`, `excel_list_sheets`, `excel_convert_to_markdown`, `pptx_to_markdown`, `img2md_extract_folder`, `ocr_engine_status`, `ocr_image_to_markdown`, `ocr_pdf_to_markdown`, `migration_translate_code_comments`, `migration_recommend_refactor`, `migration_batch_scan_logic`, `migration_plan_execution_phases` |
@@ -353,8 +354,18 @@ async def my_ext_ping(message: str) -> str:
     return f"pong: {message}"
 ```
 
+## Multi-Source Project Hub & Zero-Touch Agent Setup
+
+ProjectBrain supports **Multi-Source Project Hubs** (`1 Project = 1 Project DB` with `pb_root` as the `__shared__` Hub and isolated `pb_src_*` schemas per sub-source using the `project_id@source_id:branch` coordinate). External AI agents (Claude Code, Cursor, Antigravity, Codex, Windsurf) can auto-discover repositories, bootstrap the hub, ingest shared specs, and detect cross-source contract drift without manual UI setup:
+
+- **Zero-Touch Auto-Bootstrap Tools:** `projectbrain_get_agent_setup_playbook` (or resource `projectbrain://guides/agent-multi-source-setup`), `projectbrain_discover_workspace_sources`, `projectbrain_bootstrap_project_hub` (REST equivalents: `POST /master/hub/discover`, `POST /master/hub/bootstrap`).
+- **Sub-Source Lifecycle & Cross-Source Contracts:** `projectbrain_register_source`, `projectbrain_list_sources`, `projectbrain_link_sources`, `projectbrain_auto_link_sources`, `projectbrain_cross_source_impact`, `projectbrain_bind_shared_doc`, plus `/app/workspace/sources` in the Web UI.
+
+See the complete guide with copy-paste `AGENTS.md` / `CLAUDE.md` / `.cursorrules` templates in [Multi-Source Project Hub & Agent Auto-Setup Guide](docs/kb/HUONG_DAN_MULTI_SOURCE_VA_AGENT_AUTO_SETUP.md).
+
 ## Documentation
 
+- [Multi-Source Project Hub & Agent Auto-Setup Guide](docs/kb/HUONG_DAN_MULTI_SOURCE_VA_AGENT_AUTO_SETUP.md) — Zero-touch setup for external AI agents (`AGENTS.md` / `CLAUDE.md` / `.cursorrules`), `project_id@source_id:branch` isolation, `__shared__` docs, independent sub-source delta upgrades, and cross-source drift detection.
 - [Web UI & Multi-Tenant RBAC Guide](docs/kb/HUONG_DAN_WEB_UI_VA_PHAN_QUYEN_RBAC.md) — Dashboard workflows, project/branch isolation, and `admin` / `collaborator` / `reader` permissions.
 - [MCP, Branch Overlay, Document Versioning & Plugins Guide](docs/kb/HUONG_DAN_MCP_BRANCH_VERSION_VA_PLUGINS.md) — End-to-end MCP setup, multi-schema branch overlays, versioned document deltas, and plugin operations.
 - [Plugin Microkernel Architecture Guide](docs/kb/PLUGIN_ARCHITECTURE_GUIDE.md) — Complete 26-plugin catalog, Layer 1 architecture, custom plugin authoring, REST/FastMCP/CLI contracts, and configuration precedence.

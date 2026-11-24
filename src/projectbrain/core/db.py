@@ -13,9 +13,11 @@ from psycopg2.extras import RealDictCursor
 from .config import env
 from .tenant_manager import (
     _effective_root_branch,
+    get_current_source,
     get_current_tenant,
     is_multi_db_enabled,
     parse_tenant_from_user_id,
+    parse_tenant_spec,
     resolve_effective_master_url,
     tenant_manager,
 )
@@ -32,13 +34,21 @@ _MASTER_ONLY_TABLES = (
     "auth_settings",
     "master_projects",
     "master_branches",
+    "master_project_sources",
+    "master_source_branches",
+    "master_source_upgrades",
+    "master_shared_doc_bindings",
     "projects",
     "_migrations",
     "stats",
     "embed_logs",
 )
 
-_PROJECT_ROOT_TABLES = ("memory_branch_links",)
+_PROJECT_ROOT_TABLES = (
+    "memory_branch_links",
+    "cross_source_relations",
+    "cross_source_contract_artifacts",
+)
 
 _PROJECT_NO_BRANCH_TABLES = (
     "plugin_project_configs",
@@ -99,10 +109,13 @@ _LIMIT_OFFSET_TAIL_RE = re.compile(
 class _RouteDecision:
     mode: str  # "master" | "single" | "multi" | "project_wildcard" | "id_scan" | "fanout"
     targets: List[Tuple[str, str]] = field(default_factory=list)
+    source_id: Optional[str] = None
+    target_sources: Optional[List[Optional[str]]] = None
     project_id: Optional[str] = None
     branch_like: str = "%"
     lookup_ids: List[str] = field(default_factory=list)
     memory_hint: Optional[Tuple[str, str, str]] = None
+    memory_hint_source: Optional[str] = None
     primary_table: str = ""
     op: str = ""
 
@@ -535,6 +548,7 @@ class DB:
             return _RouteDecision(mode="master", primary_table=primary_table, op=op)
 
         active_tenant = get_current_tenant()
+        active_source = get_current_source()
         root_branch = _effective_root_branch()
 
         if op in ("CREATE", "ALTER", "DROP") and active_tenant is None:
@@ -546,6 +560,7 @@ class DB:
                 return _RouteDecision(
                     mode="single",
                     targets=[(proj, root_branch)],
+                    source_id="__default__",
                     primary_table=primary_table,
                     op=op,
                 )
@@ -554,12 +569,14 @@ class DB:
                     mode="project_wildcard",
                     project_id=proj,
                     branch_like="%",
+                    source_id=active_source,
                     primary_table=primary_table,
                     op=op,
                 )
             return _RouteDecision(
                 mode="single",
                 targets=[(proj, br)],
+                source_id=active_source,
                 primary_table=primary_table,
                 op=op,
             )
@@ -576,20 +593,38 @@ class DB:
             parsed = _parse_insert_col_values(sql, params)
             if parsed is not None:
                 tbl, col_vals = parsed
+                col_source = (
+                    str(col_vals["source_id"]).strip()
+                    if col_vals.get("source_id") is not None
+                    and str(col_vals["source_id"]).strip()
+                    else None
+                )
                 if "project_id" in col_vals:
                     raw_p = str(col_vals["project_id"] or "default").strip() or "default"
-                    proj, inferred_br = parse_tenant_from_user_id(
+                    proj, inf_src, inferred_br = parse_tenant_spec(
                         raw_p, default_branch=root_branch
                     )
-                    if tbl in _PROJECT_ROOT_TABLES or tbl in _PROJECT_NO_BRANCH_TABLES:
+                    if tbl in _PROJECT_ROOT_TABLES:
+                        return _RouteDecision(
+                            mode="single",
+                            targets=[(proj, root_branch)],
+                            source_id="__default__",
+                            primary_table=tbl,
+                            op=op,
+                        )
+                    if tbl in _PROJECT_NO_BRANCH_TABLES:
                         br = root_branch
                     elif "branch" in col_vals and col_vals["branch"] is not None:
                         br = str(col_vals["branch"]).strip() or root_branch
                     else:
                         br = inferred_br
+                    eff_src = inf_src if inf_src is not None else (
+                        col_source if col_source is not None else active_source
+                    )
                     return _RouteDecision(
                         mode="single",
                         targets=[(proj, br)],
+                        source_id=eff_src,
                         primary_table=tbl,
                         op=op,
                     )
@@ -597,6 +632,9 @@ class DB:
                     uid = col_vals["user_id"]
                     if tbl == "waypoints" and col_vals.get("src_id"):
                         src_hint = tenant_manager.lookup_memory_hint(
+                            str(col_vals["src_id"])
+                        )
+                        src_hint_source = tenant_manager.lookup_memory_source_hint(
                             str(col_vals["src_id"])
                         )
                         if src_hint and (
@@ -610,11 +648,15 @@ class DB:
                             return _RouteDecision(
                                 mode="single",
                                 targets=[src_hint],
+                                source_id=src_hint_source,
                                 primary_table=tbl,
                                 op=op,
                             )
-                    proj, br = parse_tenant_from_user_id(
+                    proj, inf_src, br = parse_tenant_spec(
                         None if uid is None else str(uid), default_branch=root_branch
+                    )
+                    eff_src = inf_src if inf_src is not None else (
+                        col_source if col_source is not None else active_source
                     )
                     hint = (
                         (str(col_vals["id"]), proj, br)
@@ -624,13 +666,16 @@ class DB:
                     return _RouteDecision(
                         mode="single",
                         targets=[(proj, br)],
+                        source_id=eff_src,
                         memory_hint=hint,
+                        memory_hint_source=eff_src,
                         primary_table=tbl,
                         op=op,
                     )
             return _RouteDecision(
                 mode="single",
                 targets=[("default", root_branch)],
+                source_id=active_source,
                 primary_table=primary_table,
                 op=op,
             )
@@ -638,7 +683,9 @@ class DB:
         # SELECT / UPDATE / DELETE parameter inspection
         placeholders = _find_placeholders(sql)
         explicit_targets: List[Tuple[str, str]] = []
+        explicit_target_sources: List[Optional[str]] = []
         found_project_id: Optional[str] = None
+        found_source_id: Optional[str] = None
         found_branch: Optional[str] = None
         found_ids: List[str] = []
 
@@ -649,16 +696,20 @@ class DB:
             val = params[idx]
 
             if re.search(r"\buser_id\s*=\s*$", prefix):
-                t = parse_tenant_from_user_id(
+                p_val, s_val, b_val = parse_tenant_spec(
                     None if val is None else str(val), default_branch=root_branch
                 )
+                t = (p_val, b_val)
                 if t not in explicit_targets:
                     explicit_targets.append(t)
+                    explicit_target_sources.append(s_val)
             elif re.search(r"\buser_id\s+like\s+$", prefix):
                 pat = "" if val is None else str(val)
                 if ":" in pat:
-                    p_part, b_part = pat.split(":", 1)
-                    p_clean = p_part.strip() or "default"
+                    left_part, b_part = pat.split(":", 1)
+                    p_clean, s_clean, _ = parse_tenant_spec(
+                        left_part, default_branch=root_branch
+                    )
                     if "%" in p_clean:
                         return _RouteDecision(
                             mode="fanout", primary_table=primary_table, op=op
@@ -668,36 +719,50 @@ class DB:
                             mode="project_wildcard",
                             project_id=p_clean,
                             branch_like=b_part or "%",
+                            source_id=s_clean if s_clean is not None else active_source,
                             primary_table=primary_table,
                             op=op,
                         )
                     t = (p_clean, b_part.strip() or root_branch)
                     if t not in explicit_targets:
                         explicit_targets.append(t)
+                        explicit_target_sources.append(s_clean)
                 else:
                     if "%" in pat:
                         return _RouteDecision(
                             mode="fanout", primary_table=primary_table, op=op
                         )
-                    t = parse_tenant_from_user_id(pat, default_branch=root_branch)
+                    p_val, s_val, b_val = parse_tenant_spec(
+                        pat, default_branch=root_branch
+                    )
+                    t = (p_val, b_val)
                     if t not in explicit_targets:
                         explicit_targets.append(t)
+                        explicit_target_sources.append(s_val)
             elif re.search(
                 r"\buser_id\s+in\s*\(\s*(?:(?:\?|%s)\s*,\s*)*$", prefix
             ):
-                t = parse_tenant_from_user_id(
+                p_val, s_val, b_val = parse_tenant_spec(
                     None if val is None else str(val), default_branch=root_branch
                 )
+                t = (p_val, b_val)
                 if t not in explicit_targets:
                     explicit_targets.append(t)
+                    explicit_target_sources.append(s_val)
             elif re.search(r"\bproject_id\s*=\s*$", prefix):
                 raw_p = "" if val is None else str(val).strip()
                 if raw_p:
-                    found_project_id, inf_b = parse_tenant_from_user_id(
+                    found_project_id, inf_s, inf_b = parse_tenant_spec(
                         raw_p, default_branch=root_branch
                     )
+                    if inf_s is not None and found_source_id is None:
+                        found_source_id = inf_s
                     if ":" in raw_p and found_branch is None:
                         found_branch = inf_b
+            elif re.search(r"\bsource_id\s*=\s*$", prefix):
+                raw_s = "" if val is None else str(val).strip()
+                if raw_s:
+                    found_source_id = raw_s
             elif re.search(r"\bbranch(?:_name)?\s*=\s*$", prefix):
                 raw_b = "" if val is None else str(val).strip()
                 if raw_b:
@@ -711,25 +776,51 @@ class DB:
                 return _RouteDecision(
                     mode="single",
                     targets=[(found_project_id, root_branch)],
+                    source_id="__default__",
                     primary_table=primary_table,
                     op=op,
                 )
-            return _RouteDecision(mode="fanout", primary_table=primary_table, op=op)
-
-        if explicit_targets:
-            mode = "single" if len(explicit_targets) == 1 else "multi"
             return _RouteDecision(
-                mode=mode,
-                targets=explicit_targets,
+                mode="fanout",
+                source_id="__default__",
                 primary_table=primary_table,
                 op=op,
             )
+
+        if explicit_targets:
+            if len(explicit_targets) == 1:
+                eff_s = (
+                    explicit_target_sources[0]
+                    if explicit_target_sources[0] is not None
+                    else (found_source_id if found_source_id is not None else active_source)
+                )
+                return _RouteDecision(
+                    mode="single",
+                    targets=explicit_targets,
+                    source_id=eff_s,
+                    primary_table=primary_table,
+                    op=op,
+                )
+            resolved_sources = [
+                s if s is not None else (found_source_id if found_source_id is not None else active_source)
+                for s in explicit_target_sources
+            ]
+            return _RouteDecision(
+                mode="multi",
+                targets=explicit_targets,
+                target_sources=resolved_sources,
+                primary_table=primary_table,
+                op=op,
+            )
+
+        eff_found_source = found_source_id if found_source_id is not None else active_source
 
         if found_project_id:
             if found_branch:
                 return _RouteDecision(
                     mode="single",
                     targets=[(found_project_id, found_branch)],
+                    source_id=eff_found_source,
                     primary_table=primary_table,
                     op=op,
                 )
@@ -738,6 +829,7 @@ class DB:
                 return _RouteDecision(
                     mode="single",
                     targets=[(found_project_id, lit_br.group(1) or root_branch)],
+                    source_id=eff_found_source,
                     primary_table=primary_table,
                     op=op,
                 )
@@ -745,6 +837,7 @@ class DB:
                 return _RouteDecision(
                     mode="single",
                     targets=[(found_project_id, root_branch)],
+                    source_id=eff_found_source,
                     primary_table=primary_table,
                     op=op,
                 )
@@ -752,23 +845,38 @@ class DB:
                 mode="project_wildcard",
                 project_id=found_project_id,
                 branch_like="%",
+                source_id=eff_found_source,
                 primary_table=primary_table,
                 op=op,
             )
 
         if found_ids:
             hinted_targets: List[Tuple[str, str]] = []
+            hinted_sources: List[Optional[str]] = []
             all_found = True
             for fid in found_ids:
                 h = tenant_manager.lookup_memory_hint(fid)
                 if h is None:
                     all_found = False
-                elif h not in hinted_targets:
-                    hinted_targets.append(h)
+                else:
+                    hs = tenant_manager.lookup_memory_source_hint(fid)
+                    if h not in hinted_targets:
+                        hinted_targets.append(h)
+                        hinted_sources.append(hs)
             if hinted_targets and all_found:
+                if len(hinted_targets) == 1:
+                    return _RouteDecision(
+                        mode="single",
+                        targets=hinted_targets,
+                        source_id=hinted_sources[0],
+                        lookup_ids=found_ids,
+                        primary_table=primary_table,
+                        op=op,
+                    )
                 return _RouteDecision(
-                    mode="single" if len(hinted_targets) == 1 else "multi",
+                    mode="multi",
                     targets=hinted_targets,
+                    target_sources=hinted_sources,
                     lookup_ids=found_ids,
                     primary_table=primary_table,
                     op=op,
@@ -776,11 +884,17 @@ class DB:
             return _RouteDecision(
                 mode="id_scan",
                 lookup_ids=found_ids,
+                source_id=active_source,
                 primary_table=primary_table,
                 op=op,
             )
 
-        return _RouteDecision(mode="fanout", primary_table=primary_table, op=op)
+        return _RouteDecision(
+            mode="fanout",
+            source_id=active_source,
+            primary_table=primary_table,
+            op=op,
+        )
 
     def _exec_on_conn(
         self, conn: Any, is_pg: bool, sql: str, params: tuple
@@ -819,28 +933,40 @@ class DB:
 
     def _collect_existing_targets(
         self,
-        branches: List[Tuple[str, str]],
+        branches: List[Any],
         include_master: bool = True,
-    ) -> List[Tuple[Optional[Tuple[str, str]], Any, bool]]:
-        targets: List[Tuple[Optional[Tuple[str, str]], Any, bool]] = []
+        source_id: Optional[str] = None,
+    ) -> List[Tuple[Optional[Tuple[str, str]], Optional[str], Any, bool]]:
+        targets: List[Tuple[Optional[Tuple[str, str]], Optional[str], Any, bool]] = []
         seen_conn_ids: set = set()
-        for proj, br in branches:
+        for item in branches:
+            if len(item) == 3:
+                proj, item_src, br = item
+                eff_src = item_src if item_src is not None else source_id
+            else:
+                proj, br = item
+                eff_src = source_id
             try:
-                t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(proj, br)
+                t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(
+                    proj, br, source_id=eff_src
+                )
                 cid = id(t_conn)
                 if cid not in seen_conn_ids:
                     seen_conn_ids.add(cid)
-                    targets.append(((proj, br), t_conn, t_is_pg))
+                    targets.append(((proj, br), eff_src, t_conn, t_is_pg))
             except Exception as exc:
                 logger.debug("Skipping tenant %s:%s during fanout: %s", proj, br, exc)
         if include_master and self.conn is not None and id(self.conn) not in seen_conn_ids:
-            targets.append((None, self.conn, self.is_postgres))
+            targets.append((None, None, self.conn, self.is_postgres))
         return targets
 
     def _resolve_wildcard_branches(
-        self, project_id: str, branch_like: str
+        self,
+        project_id: str,
+        branch_like: str,
+        source_id: Optional[str] = None,
     ) -> List[Tuple[str, str]]:
-        branches = tenant_manager.list_project_branches(project_id)
+        branches = tenant_manager.list_project_branches(project_id, source_id=source_id)
         if not branches:
             return []
         if not branch_like or branch_like == "%":
@@ -861,6 +987,7 @@ class DB:
         primary_table: str,
         lim_val: Optional[int],
         off_val: int,
+        target_sources: Optional[List[Optional[str]]] = None,
     ) -> List[Dict[str, Any]]:
         cleaned_sql = _strip_sql_comments(sql).strip()
 
@@ -900,11 +1027,20 @@ class DB:
         is_distinct = bool(re.match(r"^\s*select\s+distinct\b", cleaned_sql, re.IGNORECASE))
         seen_tuples: set = set()
 
-        for tenant_pair, rows in per_target_rows:
+        for idx, (tenant_pair, rows) in enumerate(per_target_rows):
+            t_src = (
+                target_sources[idx]
+                if target_sources is not None and idx < len(target_sources)
+                else None
+            )
             for r in rows:
                 if tenant_pair and primary_table == "memories" and r.get("id"):
+                    eff_r_src = t_src if t_src is not None else r.get("source_id")
                     tenant_manager.remember_memory_id(
-                        str(r["id"]), tenant_pair[0], tenant_pair[1]
+                        str(r["id"]),
+                        tenant_pair[0],
+                        tenant_pair[1],
+                        source_id=eff_r_src,
                     )
                 if use_id_dedup and r.get("id") is not None:
                     rid = str(r["id"])
@@ -948,30 +1084,45 @@ class DB:
         if route.mode in ("single", "multi"):
             last_res = None
             total_rc = 0
-            for proj, br in route.targets:
-                if route.op in ("SELECT", "UPDATE", "DELETE") and not tenant_manager.has_branch(proj, br):
+            for idx, (proj, br) in enumerate(route.targets):
+                t_src = (
+                    route.target_sources[idx]
+                    if route.target_sources is not None and idx < len(route.target_sources)
+                    else route.source_id
+                )
+                if route.op in ("SELECT", "UPDATE", "DELETE") and not tenant_manager.has_branch(
+                    proj, br, source_id=t_src
+                ):
                     res, rc = self._exec_on_conn(self.conn, self.is_postgres, sql, params)
                     last_res = res
                     total_rc += rc
                     continue
-                t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(proj, br)
+                t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(
+                    proj, br, source_id=t_src
+                )
                 res, rc = self._exec_on_conn(t_conn, t_is_pg, sql, params)
                 last_res = res
                 total_rc += rc
                 if route.memory_hint and rc >= 0:
                     mid, h_proj, h_br = route.memory_hint
-                    tenant_manager.remember_memory_id(mid, h_proj, h_br)
+                    tenant_manager.remember_memory_id(
+                        mid, h_proj, h_br, source_id=route.memory_hint_source
+                    )
             self._last_rowcount = total_rc
             return last_res
 
         if route.mode == "project_wildcard":
             branches = self._resolve_wildcard_branches(
-                route.project_id or "default", route.branch_like
+                route.project_id or "default",
+                route.branch_like,
+                source_id=route.source_id,
             )
-            targets = self._collect_existing_targets(branches, include_master=True)
+            targets = self._collect_existing_targets(
+                branches, include_master=True, source_id=route.source_id
+            )
             last_res = None
             total_rc = 0
-            for _, t_conn, t_is_pg in targets:
+            for _, _, t_conn, t_is_pg in targets:
                 res, rc = self._exec_on_conn(t_conn, t_is_pg, sql, params)
                 last_res = res
                 total_rc += rc
@@ -979,19 +1130,23 @@ class DB:
             return last_res
 
         if route.mode == "id_scan":
-            branches = tenant_manager.list_all_registered_branches()
+            branches = (
+                [(p, "__default__", b) for p, b in tenant_manager.list_all_registered_branches()]
+                if route.source_id == "__default__"
+                else tenant_manager.list_all_registered_branch_targets()
+            )
             targets = self._collect_existing_targets(branches, include_master=True)
             last_res = None
             total_rc = 0
             stop_on_hit = route.primary_table in ("memories", "temporal_facts", "temporal_edges")
-            for tenant_pair, t_conn, t_is_pg in targets:
+            for tenant_pair, t_src, t_conn, t_is_pg in targets:
                 res, rc = self._exec_on_conn(t_conn, t_is_pg, sql, params)
                 last_res = res
                 total_rc += rc
                 if rc > 0 and tenant_pair and route.lookup_ids:
                     for fid in route.lookup_ids:
                         tenant_manager.remember_memory_id(
-                            fid, tenant_pair[0], tenant_pair[1]
+                            fid, tenant_pair[0], tenant_pair[1], source_id=t_src
                         )
                     if stop_on_hit:
                         break
@@ -999,11 +1154,15 @@ class DB:
             return last_res
 
         # fanout
-        branches = tenant_manager.list_all_registered_branches()
+        branches = (
+            [(p, "__default__", b) for p, b in tenant_manager.list_all_registered_branches()]
+            if route.source_id == "__default__"
+            else tenant_manager.list_all_registered_branch_targets()
+        )
         targets = self._collect_existing_targets(branches, include_master=True)
         last_res = None
         total_rc = 0
-        for _, t_conn, t_is_pg in targets:
+        for _, _, t_conn, t_is_pg in targets:
             res, rc = self._exec_on_conn(t_conn, t_is_pg, sql, params)
             last_res = res
             total_rc += rc
@@ -1021,51 +1180,79 @@ class DB:
 
         if route.mode == "single":
             proj, br = route.targets[0]
-            if not tenant_manager.has_branch(proj, br):
+            if not tenant_manager.has_branch(proj, br, source_id=route.source_id):
                 rows = self._fetchall_on_conn(self.conn, self.is_postgres, sql, params)
                 self._last_rowcount = len(rows)
                 return rows
-            t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(proj, br)
+            t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(
+                proj, br, source_id=route.source_id
+            )
             rows = self._fetchall_on_conn(t_conn, t_is_pg, sql, params)
             if route.primary_table == "memories":
                 for r in rows:
                     if r.get("id"):
-                        tenant_manager.remember_memory_id(str(r["id"]), proj, br)
+                        tenant_manager.remember_memory_id(
+                            str(r["id"]), proj, br, source_id=route.source_id
+                        )
             self._last_rowcount = len(rows)
             return rows
 
         if route.mode == "multi":
             per_target_rows: List[Tuple[Optional[Tuple[str, str]], List[Dict[str, Any]]]] = []
+            per_target_sources: List[Optional[str]] = []
             eff_sql, eff_params, lim_val, off_val = _rewrite_fanout_limit_offset(sql, params)
-            for proj, br in route.targets:
-                if not tenant_manager.has_branch(proj, br):
+            for idx, (proj, br) in enumerate(route.targets):
+                t_src = (
+                    route.target_sources[idx]
+                    if route.target_sources is not None and idx < len(route.target_sources)
+                    else route.source_id
+                )
+                if not tenant_manager.has_branch(proj, br, source_id=t_src):
                     continue
-                t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(proj, br)
+                t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(
+                    proj, br, source_id=t_src
+                )
                 per_target_rows.append(
                     ((proj, br), self._fetchall_on_conn(t_conn, t_is_pg, eff_sql, eff_params))
                 )
+                per_target_sources.append(t_src)
             if not per_target_rows:
                 per_target_rows.append(
                     (None, self._fetchall_on_conn(self.conn, self.is_postgres, eff_sql, eff_params))
                 )
+                per_target_sources.append(None)
             merged = self._merge_fanout_rows(
-                sql, per_target_rows, route.primary_table, lim_val, off_val
+                sql,
+                per_target_rows,
+                route.primary_table,
+                lim_val,
+                off_val,
+                target_sources=per_target_sources,
             )
             self._last_rowcount = len(merged)
             return merged
 
         if route.mode == "project_wildcard":
             branches = self._resolve_wildcard_branches(
-                route.project_id or "default", route.branch_like
+                route.project_id or "default",
+                route.branch_like,
+                source_id=route.source_id,
             )
-            targets = self._collect_existing_targets(branches, include_master=True)
+            targets = self._collect_existing_targets(
+                branches, include_master=True, source_id=route.source_id
+            )
         else:
-            branches = tenant_manager.list_all_registered_branches()
+            branches = (
+                [(p, "__default__", b) for p, b in tenant_manager.list_all_registered_branches()]
+                if route.source_id == "__default__"
+                else tenant_manager.list_all_registered_branch_targets()
+            )
             targets = self._collect_existing_targets(branches, include_master=True)
 
         eff_sql, eff_params, lim_val, off_val = _rewrite_fanout_limit_offset(sql, params)
         per_target_rows = []
-        for tenant_pair, t_conn, t_is_pg in targets:
+        per_target_sources = []
+        for tenant_pair, t_src, t_conn, t_is_pg in targets:
             try:
                 rows = self._fetchall_on_conn(t_conn, t_is_pg, eff_sql, eff_params)
             except Exception as exc:
@@ -1077,12 +1264,18 @@ class DB:
             if route.mode == "id_scan" and rows and tenant_pair and route.lookup_ids:
                 for fid in route.lookup_ids:
                     tenant_manager.remember_memory_id(
-                        fid, tenant_pair[0], tenant_pair[1]
+                        fid, tenant_pair[0], tenant_pair[1], source_id=t_src
                     )
             per_target_rows.append((tenant_pair, rows))
+            per_target_sources.append(t_src)
 
         merged = self._merge_fanout_rows(
-            sql, per_target_rows, route.primary_table, lim_val, off_val
+            sql,
+            per_target_rows,
+            route.primary_table,
+            lim_val,
+            off_val,
+            target_sources=per_target_sources,
         )
         self._last_rowcount = len(merged)
         return merged
@@ -1098,27 +1291,35 @@ class DB:
 
         if route.mode == "single":
             proj, br = route.targets[0]
-            if not tenant_manager.has_branch(proj, br):
+            if not tenant_manager.has_branch(proj, br, source_id=route.source_id):
                 rows = self._fetchall_on_conn(self.conn, self.is_postgres, sql, params)
                 self._last_rowcount = 1 if rows else 0
                 return rows[0] if rows else None
-            t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(proj, br)
+            t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(
+                proj, br, source_id=route.source_id
+            )
             rows = self._fetchall_on_conn(t_conn, t_is_pg, sql, params)
             if rows and route.primary_table == "memories" and rows[0].get("id"):
-                tenant_manager.remember_memory_id(str(rows[0]["id"]), proj, br)
+                tenant_manager.remember_memory_id(
+                    str(rows[0]["id"]), proj, br, source_id=route.source_id
+                )
             self._last_rowcount = 1 if rows else 0
             return rows[0] if rows else None
 
         if route.mode == "id_scan":
-            branches = tenant_manager.list_all_registered_branches()
+            branches = (
+                [(p, "__default__", b) for p, b in tenant_manager.list_all_registered_branches()]
+                if route.source_id == "__default__"
+                else tenant_manager.list_all_registered_branch_targets()
+            )
             targets = self._collect_existing_targets(branches, include_master=True)
-            for tenant_pair, t_conn, t_is_pg in targets:
+            for tenant_pair, t_src, t_conn, t_is_pg in targets:
                 rows = self._fetchall_on_conn(t_conn, t_is_pg, sql, params)
                 if rows:
                     if tenant_pair and route.lookup_ids:
                         for fid in route.lookup_ids:
                             tenant_manager.remember_memory_id(
-                                fid, tenant_pair[0], tenant_pair[1]
+                                fid, tenant_pair[0], tenant_pair[1], source_id=t_src
                             )
                     self._last_rowcount = 1
                     return rows[0]
@@ -1449,6 +1650,8 @@ def ensure_doc_versioning_tables() -> None:
         "total_units INTEGER DEFAULT 0, reused_units INTEGER DEFAULT 0, "
         "new_units INTEGER DEFAULT 0, deleted_units INTEGER DEFAULT 0, "
         "status TEXT DEFAULT 'active', created_at BIGINT NOT NULL, "
+        "source_id TEXT DEFAULT '__default__', scope TEXT DEFAULT 'source', "
+        "doc_role TEXT DEFAULT 'general', "
         "UNIQUE(project_id, branch, doc_key, version))"
     )
     db.execute(
@@ -1456,8 +1659,22 @@ def ensure_doc_versioning_tables() -> None:
         "(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, branch TEXT NOT NULL, "
         "doc_key TEXT NOT NULL, version TEXT NOT NULL, unit_index INTEGER NOT NULL, "
         "unit_type TEXT NOT NULL, unit_title TEXT, unit_sha256 TEXT NOT NULL, "
-        "markdown_text TEXT NOT NULL, memory_ids_json TEXT DEFAULT '[]')"
+        "markdown_text TEXT NOT NULL, memory_ids_json TEXT DEFAULT '[]', "
+        "source_id TEXT DEFAULT '__default__', scope TEXT DEFAULT 'source', "
+        "doc_role TEXT DEFAULT 'general')"
     )
+    if is_multi_db_enabled() and get_current_tenant() is not None:
+        proj, br = get_current_tenant()  # type: ignore[misc]
+        t_conn, t_is_pg, _, _ = tenant_manager.get_tenant_connection(
+            proj, br, source_id=get_current_source()
+        )
+        tenant_manager._ensure_source_columns_on_conn(
+            t_conn, t_is_pg, tables=("document_versions", "document_units")
+        )
+    elif db.conn is not None:
+        tenant_manager._ensure_source_columns_on_conn(
+            db.conn, db.is_postgres, tables=("document_versions", "document_units")
+        )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_doc_units_lookup "
         "ON document_units(project_id, doc_key, unit_sha256)"

@@ -639,6 +639,130 @@ class CodeDocLinkerPlugin(KnowledgeLinkerPlugin):
         }
 
 
+class CrossSourceLinkerPlugin(KnowledgeLinkerPlugin):
+    """Wraps CrossSourceLinker for multi-source contract extraction, cross-linking, and drift detection."""
+
+    metadata = PluginMetadata(
+        plugin_id="linker.cross_source",
+        name="Cross-Source Contract Linker",
+        version="2.0.0",
+        category=PluginCategory.KNOWLEDGE_LINKER.value,
+        description="Extracts API, schema, event, infra, and shared-doc contracts across project sources, reconciles cross-source relations, and detects drift.",
+        priority=90,
+        capabilities=["cross_source_linking", "contract_extraction", "drift_detection"],
+    )
+
+    def link(
+        self,
+        project_id: str,
+        branch: str = "main",
+        graph_data: Optional[Any] = None,
+        chunks: Optional[List[Any]] = None,
+        version_tag: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        from projectbrain.core.tenant_manager import (
+            is_multi_db_enabled,
+            parse_tenant_spec,
+            tenant_manager,
+        )
+        from projectbrain.graphify_engine.cross_source_linker import CrossSourceLinker
+
+        ctx = context or {}
+        proj, parsed_src, parsed_br = parse_tenant_spec(
+            project_id, default_branch=branch or "main"
+        )
+        eff_branch = branch or parsed_br or "main"
+        source_id = ctx.get("source_id") or self.config.get("source_id") or parsed_src
+        workspace_map = ctx.get("workspace_map") or self.config.get("workspace_map")
+        ws_path = ctx.get("workspace_path") or self.config.get("workspace_path")
+
+        linker = CrossSourceLinker()
+        artifacts_extracted = 0
+
+        if workspace_map is not None:
+            res = linker.auto_link_project(
+                project_id=proj,
+                source_id=source_id,
+                branch=eff_branch,
+                workspace_map=workspace_map,
+            )
+            artifacts_extracted = int(res.get("artifacts_extracted", 0))
+        elif source_id:
+            raw_nodes: Optional[List[Dict[str, Any]]] = None
+            if graph_data is not None:
+                if hasattr(graph_data, "nodes"):
+                    raw_nodes = [_model_to_dict(n) for n in graph_data.nodes]
+                elif isinstance(graph_data, dict) and isinstance(graph_data.get("nodes"), list):
+                    raw_nodes = [_model_to_dict(n) for n in graph_data["nodes"]]
+
+            docs_arg: Optional[List[Dict[str, Any]]] = ctx.get("docs")
+            if docs_arg is None and source_id == "__shared__" and chunks:
+                docs_arg = [
+                    c if isinstance(c, dict) else _model_to_dict(c) for c in chunks
+                ]
+
+            arts = linker.extract_contract_artifacts(
+                project_id=proj,
+                source_id=str(source_id),
+                branch=eff_branch,
+                workspace_path=ws_path,
+                graph_nodes=raw_nodes,
+                docs=docs_arg,
+            )
+            artifacts_extracted = len(arts)
+            rec = linker.reconcile_relations(
+                project_id=proj,
+                target_source_id=str(source_id),
+                branch=eff_branch,
+            )
+            res = {
+                "status": "ok",
+                "project_id": proj,
+                "branch": eff_branch,
+                "source_id": str(source_id),
+                "artifacts_extracted": artifacts_extracted,
+                **rec,
+            }
+        else:
+            has_registered = False
+            try:
+                if not is_multi_db_enabled() or tenant_manager._project_exists_in_catalog(proj):
+                    has_registered = bool(tenant_manager.list_project_sources(proj))
+            except Exception:
+                has_registered = False
+
+            if has_registered:
+                res = linker.auto_link_project(
+                    project_id=proj,
+                    source_id=None,
+                    branch=eff_branch,
+                    workspace_map=None,
+                )
+                artifacts_extracted = int(res.get("artifacts_extracted", 0))
+            else:
+                res = {
+                    "relations_upserted": 0,
+                    "drifted_count": 0,
+                    "stale_count": 0,
+                    "relations": [],
+                }
+
+        return {
+            "plugin_id": self.metadata.plugin_id,
+            "project_id": proj,
+            "branch": eff_branch,
+            "version_tag": version_tag,
+            "artifacts_extracted": artifacts_extracted,
+            "relations_upserted": int(res.get("relations_upserted", 0)),
+            "drifted_count": int(res.get("drifted_count", 0)),
+            "stale_count": int(res.get("stale_count", 0)),
+            "relations": res.get("relations", []),
+            "edges": [],
+            "graph_delta": {"nodes": [], "edges": []},
+        }
+
+
 class MarkdownWikiExporterPlugin(DocExporterPlugin):
     """Wraps ProjectDocSynthesizer.synthesize_wiki."""
 
@@ -3228,6 +3352,7 @@ __all__ = [
     "MultimodalDocETLPlugin",
     "LocalAIOCRParserPlugin",
     "CodeDocLinkerPlugin",
+    "CrossSourceLinkerPlugin",
     "MarkdownWikiExporterPlugin",
     "DocxExporterPlugin",
     "XlsxExporterPlugin",

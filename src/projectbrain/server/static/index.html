@@ -197,6 +197,13 @@
                     <option value="default">default</option>
                 </select>
             </div>
+            <div id="sourceSelectorContainer" class="context-segment context-segment-divider">
+                <label for="currentSource"><i class="fa-solid fa-cubes-stacked" aria-hidden="true"></i> Source</label>
+                <select id="currentSource" class="project-select project-select-source">
+                    <option value="">All Sources (*)</option>
+                    <option value="__shared__">Shared Docs Hub (__shared__)</option>
+                </select>
+            </div>
             <div id="branchSelectorContainer" class="context-segment context-segment-divider">
                 <label for="currentBranch"><i class="fa-solid fa-code-branch" aria-hidden="true"></i> Branch</label>
                 <select id="currentBranch" class="project-select project-select-branch">
@@ -274,6 +281,10 @@
                     <a href="/app/workspace/projects" class="menu-link" id="btnTabProjectRegistry" data-tab="projectRegistryTab" data-route="/app/workspace/projects" data-domain="Workspace" data-route-link>
                         <i class="fa-solid fa-folder-tree" aria-hidden="true"></i>
                         <span class="nav-label">Projects &amp; Databases</span>
+                    </a>
+                    <a href="/app/workspace/sources" class="menu-link" data-tab="sourcesHubTab" id="btnTabSources" data-route="/app/workspace/sources" data-domain="Workspace" data-route-link>
+                        <i class="fa-solid fa-sitemap" aria-hidden="true"></i>
+                        <span class="nav-label">Sources &amp; Relations</span>
                     </a>
                     <a href="/app/workspace/memories" class="menu-link" id="btnTabMemories" data-tab="memoriesTab" data-route="/app/workspace/memories" data-domain="Workspace" data-route-link>
                         <i class="fa-solid fa-layer-group" aria-hidden="true"></i>
@@ -523,6 +534,26 @@
                         </div>
                         <div class="form-row">
                             <div class="form-group flex-1">
+                                <label for="docUploadScope">Document Scope</label>
+                                <select id="docUploadScope" name="scope">
+                                    <option value="source" selected>Sub-Source Scoped (source)</option>
+                                    <option value="project_shared">Shared Project Hub (project_shared)</option>
+                                </select>
+                            </div>
+                            <div class="form-group flex-1">
+                                <label for="docUploadRole">Document Role</label>
+                                <select id="docUploadRole" name="doc_role">
+                                    <option value="general" selected>General</option>
+                                    <option value="architecture">Architecture</option>
+                                    <option value="api_contract">API Contract</option>
+                                    <option value="prd">PRD</option>
+                                    <option value="adr">ADR</option>
+                                    <option value="runbook">Runbook</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group flex-1">
                                 <label for="docOcrEngine">OCR Engine</label>
                                 <select id="docOcrEngine">
                                     <option value="auto" selected>Auto (Best Available)</option>
@@ -606,6 +637,20 @@
                             <a href="/app/settings/ai" id="btnOpenAiSettingsSearch" class="btn btn-secondary btn-sm" data-route="/app/settings/ai" data-route-link>
                                 <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> AI Settings
                             </a>
+                        </div>
+                    </div>
+                    <div id="searchScopeControls" class="search-scope-controls">
+                        <div class="search-scope-toggle">
+                            <input type="checkbox" id="searchIncludeSharedDocs" name="include_shared_docs" checked>
+                            <label for="searchIncludeSharedDocs">Include Shared Project Docs (<code>__shared__</code>)</label>
+                        </div>
+                        <div class="search-scope-depth">
+                            <label for="searchRelationDepth">Cross-Source Hops</label>
+                            <select id="searchRelationDepth" name="relation_depth">
+                                <option value="0">0 (Target Only)</option>
+                                <option value="1" selected>1 (Direct Relations)</option>
+                                <option value="2">2 (2-Hop Relations)</option>
+                            </select>
                         </div>
                     </div>
                 </div>
@@ -848,6 +893,14 @@
                             </select>
                         </div>
                         <div class="form-group">
+                            <label for="cgRelationDepthSelect">Cross-Source Expansion</label>
+                            <select id="cgRelationDepthSelect" name="relation_depth">
+                                <option value="0" selected>Target Only (0)</option>
+                                <option value="1">+1-Hop Siblings &amp; Shared Docs</option>
+                                <option value="2">+2-Hop Cross-Source</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
                             <button type="button" id="btnLoadCodeGraph" class="btn btn-primary">
                                 <i class="fa-solid fa-rotate" aria-hidden="true"></i> Load Graph
                             </button>
@@ -864,6 +917,7 @@
                                 <span class="legend-chip"><span class="legend-dot legend-dot-function" aria-hidden="true"></span>Function</span>
                                 <span class="legend-chip"><span class="legend-dot legend-dot-file" aria-hidden="true"></span>File</span>
                                 <span class="legend-chip"><span class="legend-dot legend-dot-doc" aria-hidden="true"></span>Doc</span>
+                                <span class="legend-chip"><span class="legend-line-dashed" aria-hidden="true"></span>Cross-Source</span>
                             </div>
                         </div>
                         <div class="graph-hud-controls" role="toolbar" aria-label="Graph canvas controls">
@@ -897,6 +951,10 @@
                             <div class="detail-item">
                                 <span class="detail-label">Kind</span>
                                 <span id="ndKind" class="status-tag info"></span>
+                            </div>
+                            <div class="detail-item" id="ndSourceRow">
+                                <span class="detail-label">Source</span>
+                                <span id="ndSourceId" class="status-tag info"></span>
                             </div>
                             <div class="detail-item">
                                 <span class="detail-label">File Path</span>
@@ -1824,6 +1882,214 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Tab: Multi-Source Hub & Cross-Source Relations -->
+            <div class="tab-content" id="sourcesHubTab">
+                <div class="card-header-action">
+                    <div>
+                        <h2>Multi-Source Hub &amp; Cross-Source Relations</h2>
+                        <p class="description-text">Manage independent sub-source repositories, shared project documents (<code>__shared__</code>), and typed cross-source contract edges with drift detection.</p>
+                    </div>
+                    <div class="sources-hub-header-actions">
+                        <span id="sourcesHubProjectBadge" class="status-tag info code-font">Project: default</span>
+                        <button type="button" id="btnRefreshSourcesHub" class="btn btn-secondary">
+                            <i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh Hub
+                        </button>
+                    </div>
+                </div>
+
+                <div class="sources-hub-grid">
+                    <!-- Studio Card 1: Child Sub-Sources & Independent Lifecycle -->
+                    <section class="card sources-hub-card" aria-labelledby="sourcesHubCardSourcesHeading">
+                        <div class="card-header-action">
+                            <div>
+                                <h3 id="sourcesHubCardSourcesHeading"><i class="fa-solid fa-cubes-stacked" aria-hidden="true"></i> Child Sub-Sources &amp; Independent Lifecycle</h3>
+                                <p class="info-text">Each sub-source maintains its own version, sync generation, and isolated root schema inside the Project DB.</p>
+                            </div>
+                        </div>
+
+                        <form id="registerSourceForm" class="sources-inline-form" aria-labelledby="sourcesHubCardSourcesHeading">
+                            <div class="form-row">
+                                <div class="form-group flex-1">
+                                    <label for="regSourceId">Source ID</label>
+                                    <input type="text" id="regSourceId" name="source_id" class="code-font" required autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next" placeholder="e.g. backend-api">
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="regSourceDisplayName">Display Name</label>
+                                    <input type="text" id="regSourceDisplayName" name="display_name" enterkeyhint="next" placeholder="e.g. Backend API">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group flex-1">
+                                    <label for="regSourceType">Source Type</label>
+                                    <select id="regSourceType" name="source_type">
+                                        <option value="service" selected>Service</option>
+                                        <option value="backend">Backend</option>
+                                        <option value="frontend">Frontend</option>
+                                        <option value="library">Library</option>
+                                        <option value="mobile">Mobile</option>
+                                        <option value="infra">Infrastructure</option>
+                                        <option value="docs">Documentation</option>
+                                        <option value="worker">Worker</option>
+                                    </select>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="regSourceVersion">Initial Version</label>
+                                    <input type="text" id="regSourceVersion" name="current_version" class="code-font" value="1.0.0" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="done" placeholder="1.0.0">
+                                </div>
+                                <div class="form-group sources-form-submit">
+                                    <button type="submit" id="btnRegisterSourceSubmit" class="btn btn-primary">
+                                        <i class="fa-solid fa-plus" aria-hidden="true"></i> Register Source
+                                    </button>
+                                </div>
+                            </div>
+                        </form>
+
+                        <div id="sourcesHubList" class="sources-list-grid" aria-live="polite">
+                            <div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading sub-sources...</div>
+                        </div>
+                    </section>
+
+                    <!-- Studio Card 2: Shared Project Documents (__shared__) & Bindings -->
+                    <section class="card sources-hub-card" aria-labelledby="sourcesHubCardSharedHeading">
+                        <div class="card-header-action">
+                            <div>
+                                <h3 id="sourcesHubCardSharedHeading"><i class="fa-solid fa-book-open-reader" aria-hidden="true"></i> Shared Project Documents (<code>__shared__</code>) &amp; Bindings</h3>
+                                <p class="info-text">Bind project-wide PRDs, ADRs, and OpenAPI specs from <code>__shared__</code> to all sources (<code>*</code>) or specific sub-sources.</p>
+                            </div>
+                            <a href="/app/workspace/memories" class="btn btn-secondary btn-sm" data-route="/app/workspace/memories" data-route-link>
+                                <i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i> Upload Shared Doc
+                            </a>
+                        </div>
+
+                        <form id="bindSharedDocForm" class="sources-inline-form" aria-labelledby="sourcesHubCardSharedHeading">
+                            <div class="form-row">
+                                <div class="form-group flex-1">
+                                    <label for="bindSharedDocKey">Shared Document Key</label>
+                                    <input type="text" id="bindSharedDocKey" name="doc_key" class="code-font" required autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next" placeholder="e.g. architecture-prd.md">
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="bindSharedTargetSource">Target Source</label>
+                                    <select id="bindSharedTargetSource" name="target_source_id">
+                                        <option value="*">All Sub-Sources (*)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="bindSharedRole">Binding Role</label>
+                                    <select id="bindSharedRole" name="binding_role">
+                                        <option value="reference" selected>Reference</option>
+                                        <option value="architecture">Architecture</option>
+                                        <option value="api_contract">API Contract</option>
+                                        <option value="prd">PRD</option>
+                                        <option value="adr">ADR</option>
+                                        <option value="runbook">Runbook</option>
+                                        <option value="policy">Policy</option>
+                                    </select>
+                                </div>
+                                <div class="form-group sources-form-submit">
+                                    <button type="submit" id="btnBindSharedDoc" class="btn btn-primary">
+                                        <i class="fa-solid fa-link" aria-hidden="true"></i> Bind Document
+                                    </button>
+                                </div>
+                            </div>
+                        </form>
+
+                        <div id="sharedDocBindingsList" class="sources-list-grid" aria-live="polite">
+                            <div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading shared bindings...</div>
+                        </div>
+                    </section>
+
+                    <!-- Studio Card 3: Cross-Source Relationships & Drift Monitor -->
+                    <section class="card sources-hub-card" aria-labelledby="sourcesHubCardRelationsHeading">
+                        <div class="card-header-action">
+                            <div>
+                                <h3 id="sourcesHubCardRelationsHeading"><i class="fa-solid fa-diagram-project" aria-hidden="true"></i> Cross-Source Relationships &amp; Drift Monitor</h3>
+                                <p class="info-text">Track typed API, schema, event, and doc contracts across sub-sources, auto-link endpoints, and resolve drifted edges.</p>
+                            </div>
+                            <button type="button" id="btnRunAutoLinkSources" class="btn btn-secondary">
+                                <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Run Auto-Linker
+                            </button>
+                        </div>
+
+                        <form id="createRelationForm" class="sources-inline-form" aria-labelledby="sourcesHubCardRelationsHeading">
+                            <div class="form-row">
+                                <div class="form-group flex-1">
+                                    <label for="relSrcSource">Origin Source</label>
+                                    <select id="relSrcSource" name="src_source_id" required>
+                                        <option value="__default__">__default__</option>
+                                        <option value="__shared__">__shared__</option>
+                                    </select>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="relTypeSelect">Relation Type</label>
+                                    <select id="relTypeSelect" name="relation_type" required>
+                                        <option value="calls_api">calls_api</option>
+                                        <option value="shares_schema">shares_schema</option>
+                                        <option value="consumes_events">consumes_events</option>
+                                        <option value="publishes_events">publishes_events</option>
+                                        <option value="implements_spec">implements_spec</option>
+                                        <option value="shares_auth">shares_auth</option>
+                                        <option value="deploys">deploys</option>
+                                        <option value="documented_by">documented_by</option>
+                                    </select>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="relDstSource">Target Source</label>
+                                    <select id="relDstSource" name="dst_source_id" required>
+                                        <option value="__shared__">__shared__</option>
+                                        <option value="__default__">__default__</option>
+                                    </select>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="relContractKey">Contract Key</label>
+                                    <input type="text" id="relContractKey" name="contract_key" class="code-font" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="done" placeholder="e.g. POST /api/v1/orders">
+                                </div>
+                                <div class="form-group sources-form-submit">
+                                    <button type="submit" id="btnCreateRelationSubmit" class="btn btn-primary">
+                                        <i class="fa-solid fa-plus" aria-hidden="true"></i> Link Sources
+                                    </button>
+                                </div>
+                            </div>
+                        </form>
+
+                        <search class="relations-filter-bar" aria-label="Filter cross-source relations">
+                            <div class="form-group">
+                                <label for="relFilterStatus">Status</label>
+                                <select id="relFilterStatus" name="rel_status">
+                                    <option value="">All Statuses</option>
+                                    <option value="active">active</option>
+                                    <option value="drifted">drifted</option>
+                                    <option value="stale">stale</option>
+                                    <option value="pinned">pinned</option>
+                                    <option value="rejected">rejected</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="relFilterType">Type</label>
+                                <select id="relFilterType" name="rel_type">
+                                    <option value="">All Types</option>
+                                    <option value="calls_api">calls_api</option>
+                                    <option value="shares_schema">shares_schema</option>
+                                    <option value="consumes_events">consumes_events</option>
+                                    <option value="publishes_events">publishes_events</option>
+                                    <option value="implements_spec">implements_spec</option>
+                                    <option value="shares_auth">shares_auth</option>
+                                    <option value="deploys">deploys</option>
+                                    <option value="documented_by">documented_by</option>
+                                </select>
+                            </div>
+                            <div class="form-group flex-1">
+                                <label for="relFilterText">Filter Contract or Source</label>
+                                <input type="search" id="relFilterText" name="rel_q" placeholder="Filter by source ID, contract key, or edge ID...">
+                            </div>
+                        </search>
+
+                        <div id="crossSourceRelationsList" class="relations-list-wrap" aria-live="polite">
+                            <div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading cross-source relations...</div>
+                        </div>
+                    </section>
+                </div>
+            </div>
         </section>
     </main>
 
@@ -1903,6 +2169,44 @@
             <div class="dialog-actions">
                 <button type="button" class="btn btn-secondary" id="btnCancelBranchDialog" command="close" commandfor="newBranchSchemaDialog">Cancel</button>
                 <button type="submit" class="btn btn-primary" id="btnSubmitBranchDialog">Provision Branch Schema</button>
+            </div>
+        </form>
+    </dialog>
+
+    <dialog id="upgradeSourceDialog" aria-labelledby="upgradeSourceDialogTitle" class="wb-dialog">
+        <div class="dialog-header">
+            <h2 id="upgradeSourceDialogTitle">Upgrade Sub-Source Version</h2>
+            <form method="dialog">
+                <button type="submit" value="cancel" class="btn-icon-only" aria-label="Close dialog">
+                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                </button>
+            </form>
+        </div>
+        <p id="upgradeSourceDialogHint" class="dialog-body-text code-font"></p>
+        <form id="upgradeSourceForm" class="stack-form">
+            <input type="hidden" id="upgradeSourceTargetId">
+            <div class="form-group">
+                <label for="upgradeSourceToVersion">Target Version</label>
+                <input type="text" id="upgradeSourceToVersion" name="to_version" class="code-font" required autofocus autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="e.g. 1.1.0">
+            </div>
+            <div class="form-row">
+                <div class="form-group flex-1">
+                    <label for="upgradeSourceMode">Upgrade Mode</label>
+                    <select id="upgradeSourceMode" name="upgrade_mode">
+                        <option value="delta" selected>Delta (Incremental)</option>
+                        <option value="full">Full Re-index</option>
+                        <option value="patch">Patch</option>
+                        <option value="major">Major</option>
+                    </select>
+                </div>
+                <div class="form-group flex-1">
+                    <label for="upgradeSourceBranch">Branch</label>
+                    <input type="text" id="upgradeSourceBranch" name="branch_name" class="code-font" value="main" autocapitalize="none" autocorrect="off" spellcheck="false">
+                </div>
+            </div>
+            <div class="dialog-actions">
+                <button type="button" class="btn btn-secondary" id="btnCancelUpgradeSource" command="close" commandfor="upgradeSourceDialog">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="btnSubmitUpgradeSource">Record Upgrade</button>
             </div>
         </form>
     </dialog>

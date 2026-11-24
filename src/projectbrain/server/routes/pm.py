@@ -15,6 +15,7 @@ from ...ai.runtime_settings import (
     update_ai_settings,
 )
 from ...main import Memory
+from ...memory.hsg import resolve_cross_source_relations_summary
 from . import auth
 
 router = APIRouter(tags=["pm"])
@@ -27,6 +28,10 @@ class PMSearchRequest(BaseModel):
     user_id: Optional[str] = None
     limit: Optional[int] = 10
     author: Optional[str] = None
+    source_id: Optional[str] = None
+    include_shared_docs: bool = True
+    relation_depth: int = 1
+    relation_types: Optional[List[str]] = None
 
 
 class PMDocRequest(BaseModel):
@@ -34,6 +39,10 @@ class PMDocRequest(BaseModel):
     doc_type: str = "status_report"  # status_report, prd, user_story, roadmap
     user_id: Optional[str] = None
     author: Optional[str] = None
+    source_id: Optional[str] = None
+    include_shared_docs: bool = True
+    relation_depth: int = 1
+    relation_types: Optional[List[str]] = None
 
 
 class AISettingsUpdateRequest(BaseModel):
@@ -137,15 +146,38 @@ async def pm_search(req: PMSearchRequest):
             f"'{req.query}' on project '{req.user_id or 'all'}'"
         )
 
-        # 1. Search cognitive memories + Graphify code/doc symbols
-        mems = await mem.search(req.query, user_id=req.user_id, limit=req.limit or 10)
-        graph_nodes = lookup_project_graph_matches(req.query, req.user_id)
+        # 1. Search cognitive memories + Graphify code/doc symbols across source & related sources
+        mems = await mem.search(
+            req.query,
+            user_id=req.user_id,
+            limit=req.limit or 10,
+            source_id=req.source_id,
+            include_shared_docs=req.include_shared_docs,
+            relation_depth=req.relation_depth,
+            relation_types=req.relation_types,
+        )
+        graph_nodes = lookup_project_graph_matches(
+            req.query,
+            req.user_id,
+            source_id=req.source_id,
+            include_shared_docs=req.include_shared_docs,
+            relation_depth=req.relation_depth,
+            relation_types=req.relation_types,
+        )
+        cross_source_relations = resolve_cross_source_relations_summary(
+            req.user_id,
+            source_id=req.source_id,
+            relation_depth=req.relation_depth,
+            relation_types=req.relation_types,
+            include_shared_docs=req.include_shared_docs,
+        )
 
         if not mems and not graph_nodes:
             return {
                 "results": "No relevant memories or graph symbols found to answer the question.",
                 "source_memories": [],
                 "graph_matches": [],
+                "cross_source_relations": cross_source_relations,
                 "provider_used": "none",
                 "model_used": "none",
                 "provider_label": "No Matches",
@@ -153,11 +185,21 @@ async def pm_search(req: PMSearchRequest):
             }
 
         # 2. Synthesize via active AI provider or zero-key Local RAG
-        rag_res = await run_rag_chat(req.query, mems, graph_nodes)
+        rag_res = await run_rag_chat(
+            req.query,
+            mems,
+            graph_nodes,
+            source_id=req.source_id,
+            include_shared_docs=req.include_shared_docs,
+            relation_depth=req.relation_depth,
+            relation_types=req.relation_types,
+            cross_source_relations=cross_source_relations,
+        )
         return {
             "results": rag_res["answer"],
             "source_memories": mems,
             "graph_matches": graph_nodes,
+            "cross_source_relations": cross_source_relations,
             "provider_used": rag_res["provider_used"],
             "model_used": rag_res["model_used"],
             "provider_label": rag_res["provider_label"],
@@ -178,15 +220,49 @@ async def pm_generate_doc(req: PMDocRequest):
         )
 
         # 1. Search memories & graph symbols related to the prompt
-        mems = await mem.search(req.prompt, user_id=req.user_id, limit=20)
-        graph_nodes = lookup_project_graph_matches(req.prompt, req.user_id, limit=10)
+        mems = await mem.search(
+            req.prompt,
+            user_id=req.user_id,
+            limit=20,
+            source_id=req.source_id,
+            include_shared_docs=req.include_shared_docs,
+            relation_depth=req.relation_depth,
+            relation_types=req.relation_types,
+        )
+        graph_nodes = lookup_project_graph_matches(
+            req.prompt,
+            req.user_id,
+            limit=10,
+            source_id=req.source_id,
+            include_shared_docs=req.include_shared_docs,
+            relation_depth=req.relation_depth,
+            relation_types=req.relation_types,
+        )
+        cross_source_relations = resolve_cross_source_relations_summary(
+            req.user_id,
+            source_id=req.source_id,
+            relation_depth=req.relation_depth,
+            relation_types=req.relation_types,
+            include_shared_docs=req.include_shared_docs,
+        )
 
         # 2. Generate document via active AI provider or zero-key Local RAG
-        doc_res = await run_pm_doc_generation(req.prompt, req.doc_type, mems, graph_nodes)
+        doc_res = await run_pm_doc_generation(
+            req.prompt,
+            req.doc_type,
+            mems,
+            graph_nodes,
+            source_id=req.source_id,
+            include_shared_docs=req.include_shared_docs,
+            relation_depth=req.relation_depth,
+            relation_types=req.relation_types,
+            cross_source_relations=cross_source_relations,
+        )
         return {
             "document": doc_res["document"],
             "source_memories": mems,
             "graph_matches": graph_nodes,
+            "cross_source_relations": cross_source_relations,
             "provider_used": doc_res["provider_used"],
             "model_used": doc_res["model_used"],
             "provider_label": doc_res["provider_label"],

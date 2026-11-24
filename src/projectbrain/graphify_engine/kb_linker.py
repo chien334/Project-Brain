@@ -140,6 +140,9 @@ class KBCoverageReport(BaseModel):
     test_linked_pct: float = 0.0
     total_doc_chunks: int = 0
     cross_domain_edges: int = 0
+    cross_source_edges: int = 0
+    cross_source_drifted_count: int = 0
+    cross_source_drift_items: List[Dict[str, Any]] = Field(default_factory=list)
     orphan_docs: List[str] = Field(default_factory=list)
     undocumented_key_symbols: List[Dict[str, Any]] = Field(default_factory=list)
     drift_items: List[CodeDocDrift] = Field(default_factory=list)
@@ -2165,6 +2168,8 @@ class UnifiedKBBuilder:
             "total_chunks": len(all_chunks),
             "total_cross_edges": len(all_link_edges),
             "drift_count": len(drift_items),
+            "cross_source_edges": coverage_report.cross_source_edges,
+            "cross_source_drifted_count": coverage_report.cross_source_drifted_count,
             "coverage": coverage_report.model_dump(),
             "manifest_path": str(manifest_path),
         }
@@ -2421,6 +2426,39 @@ class UnifiedKBBuilder:
 
         orphan_docs = list(set([d.symbol_id for d in self.last_drift_items if d.drift_type == "removed_symbol_in_doc"]))
 
+        cross_source_edges = 0
+        cross_source_drifted_count = 0
+        cross_source_drift_items: List[Dict[str, Any]] = []
+        try:
+            from projectbrain.core.tenant_manager import tenant_manager
+
+            cs_rels = tenant_manager.list_cross_source_relations(project_id)
+            non_rejected = [r for r in cs_rels if r.get("status") != "rejected"]
+            cross_source_edges = len(non_rejected)
+            for r in non_rejected:
+                if r.get("status") == "drifted":
+                    c_meta = r.get("contract_metadata") or {}
+                    cross_source_drift_items.append(
+                        {
+                            "id": r.get("id"),
+                            "project_id": r.get("project_id"),
+                            "src_source_id": r.get("src_source_id"),
+                            "src_branch": r.get("src_branch"),
+                            "dst_source_id": r.get("dst_source_id"),
+                            "dst_branch": r.get("dst_branch"),
+                            "relation_type": r.get("relation_type"),
+                            "contract_key": r.get("contract_key"),
+                            "status": r.get("status"),
+                            "drift_reason": c_meta.get("drift_reason") or "Provider contract drifted",
+                            "src_file_path": r.get("src_file_path"),
+                            "dst_doc_key": r.get("dst_doc_key"),
+                            "updated_at": r.get("updated_at"),
+                        }
+                    )
+            cross_source_drifted_count = len(cross_source_drift_items)
+        except Exception as exc:
+            logger.debug("Cross-source coverage lookup skipped for %s: %s", project_id, exc)
+
         return KBCoverageReport(
             project_id=project_id,
             branch=branch,
@@ -2437,6 +2475,9 @@ class UnifiedKBBuilder:
             test_linked_pct=test_pct,
             total_doc_chunks=len(doc_nodes),
             cross_domain_edges=cross_domain_edges,
+            cross_source_edges=cross_source_edges,
+            cross_source_drifted_count=cross_source_drifted_count,
+            cross_source_drift_items=cross_source_drift_items,
             orphan_docs=orphan_docs,
             undocumented_key_symbols=undocumented_key_symbols[:20],
             drift_items=list(self.last_drift_items),

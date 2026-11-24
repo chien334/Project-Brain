@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from ..core.config import env
-from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth, graphify, kb, plugins_v3, master_topology
+from .routes import memory, health, sources, pm, mcp_registry, codegraph, auth, graphify, kb, plugins_v3, master_topology, project_sources
 
 logger = logging.getLogger("server")
 
@@ -22,6 +22,13 @@ _WRITE_TOOL_KEYWORDS = (
     "sync",
     "ingest",
     "register",
+    "register_source",
+    "link_sources",
+    "auto_link",
+    "bind_shared",
+    "link",
+    "bind",
+    "upgrade",
     "reinforce",
     "push",
     "promote",
@@ -45,6 +52,7 @@ _WRITE_TOOL_KEYWORDS = (
     "index",
     "triage",
     "toggle",
+    "bootstrap",
 )
 
 _EXPLICIT_WRITE_TOOLS = {
@@ -75,6 +83,7 @@ _READ_ONLY_POST_ROUTES = {
     "/v3/script-cache/lookup",
     "/v3/planner/test-dag",
     "/v3/oracle/context",
+    "/master/hub/discover",
 }
 
 _PROTECTED_REST_PREFIXES = (
@@ -614,6 +623,7 @@ def create_app() -> FastAPI:
     app.include_router(mcp_registry.router, prefix="/memory/mcp", tags=["mcp"])
     app.include_router(codegraph.router, prefix="/codegraph", tags=["codegraph"])
     app.include_router(auth.router, prefix="/auth", tags=["auth"])
+    app.include_router(project_sources.router)
     app.include_router(sources.router)
     app.include_router(graphify.router)
     app.include_router(master_topology.router)

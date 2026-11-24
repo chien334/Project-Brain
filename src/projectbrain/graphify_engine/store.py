@@ -52,6 +52,30 @@ __all__ = [
 ]
 
 
+def _normalize_graph_source_id(source_id: Optional[str]) -> Optional[str]:
+    """Return canonical non-empty source_id or None."""
+    if source_id is None:
+        return None
+    cleaned = str(source_id).strip()
+    return cleaned or None
+
+
+def _is_child_subsource(source_id: Optional[str]) -> bool:
+    """Return True when source_id targets an isolated child sub-source."""
+    cleaned = _normalize_graph_source_id(source_id)
+    return cleaned is not None and cleaned not in ("__default__", "__shared__")
+
+
+def _resolve_graph_scope(source_id: Optional[str], scope: Optional[str] = None) -> str:
+    """Derive canonical scope ('project_shared' or 'source') for a graph entity."""
+    if scope is not None and str(scope).strip():
+        if str(scope).strip() == "project_shared":
+            return "project_shared"
+    if _normalize_graph_source_id(source_id) == "__shared__":
+        return "project_shared"
+    return "source"
+
+
 def _parse_edge_metadata(raw: Any) -> Dict[str, Any]:
     if isinstance(raw, dict):
         return raw
@@ -79,6 +103,75 @@ def _extract_edge_metadata_dict(edge_or_meta: Any) -> Dict[str, Any]:
 
 def _serialize_edge_metadata(edge_or_meta: Any) -> str:
     return json.dumps(_extract_edge_metadata_dict(edge_or_meta))
+
+
+def _prepare_item_metadata_dict(
+    item: Any,
+    default_source_id: Optional[str] = None,
+    default_scope: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Extract metadata dict and preserve source_id & scope when present or non-default."""
+    meta = _extract_edge_metadata_dict(item)
+    item_src = (
+        item.get("source_id")
+        if isinstance(item, dict)
+        else getattr(item, "source_id", None)
+    )
+    item_scope = (
+        item.get("scope")
+        if isinstance(item, dict)
+        else getattr(item, "scope", None)
+    )
+    eff_src = (
+        _normalize_graph_source_id(item_src)
+        or _normalize_graph_source_id(meta.get("source_id"))
+        or _normalize_graph_source_id(default_source_id)
+    )
+    eff_scope = (
+        (str(item_scope).strip() or None if item_scope is not None else None)
+        or (str(meta.get("scope")).strip() if meta.get("scope") else None)
+        or (str(default_scope).strip() if default_scope else None)
+    )
+
+    if eff_src is not None and (
+        item_src is not None or "source_id" in meta or eff_src != "__default__"
+    ):
+        meta["source_id"] = eff_src
+        meta["scope"] = eff_scope or _resolve_graph_scope(eff_src)
+    elif eff_scope == "project_shared":
+        meta["source_id"] = eff_src or "__shared__"
+        meta["scope"] = "project_shared"
+    elif eff_scope is not None and (item_scope is not None or "scope" in meta):
+        meta["scope"] = eff_scope
+    return meta
+
+
+def _enrich_serialized_item(
+    row_dict: Dict[str, Any],
+    default_source_id: Optional[str] = None,
+    default_scope: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Normalize metadata and populate top-level source_id & scope fields."""
+    meta = _parse_edge_metadata(row_dict.get("metadata"))
+    row_dict["metadata"] = meta
+    eff_src = (
+        _normalize_graph_source_id(row_dict.get("source_id"))
+        or _normalize_graph_source_id(meta.get("source_id"))
+        or _normalize_graph_source_id(default_source_id)
+        or "__default__"
+    )
+    eff_scope = (
+        (str(row_dict.get("scope")).strip() if row_dict.get("scope") else None)
+        or (str(meta.get("scope")).strip() if meta.get("scope") else None)
+        or (str(default_scope).strip() if default_scope else None)
+        or _resolve_graph_scope(eff_src)
+    )
+    row_dict["source_id"] = eff_src
+    row_dict["scope"] = eff_scope
+    if eff_src != "__default__" or "source_id" in meta:
+        meta["source_id"] = eff_src
+        meta["scope"] = eff_scope
+    return row_dict
 
 
 def _dedup_nodes(nodes: List[GraphNode]) -> List[GraphNode]:
@@ -141,11 +234,37 @@ def sanitize_project_branch_schema_name(
 class GraphStore(ABC):
     """Abstract Base Class for ProjectBrain Graph Storage backends."""
 
-    def __init__(self, root_branch: str = "main", project_scoped_schemas: bool = False):
+    def __init__(
+        self,
+        root_branch: str = "main",
+        project_scoped_schemas: bool = False,
+        source_id: Optional[str] = None,
+        root_schema: Optional[str] = None,
+    ):
         self.root_branch = root_branch or "main"
         self.project_scoped_schemas = bool(project_scoped_schemas)
+        self.source_id: Optional[str] = _normalize_graph_source_id(source_id)
+        self.default_scope: str = _resolve_graph_scope(self.source_id)
+        if root_schema:
+            self.root_schema = str(root_schema).strip()
+        elif _is_child_subsource(self.source_id):
+            from ..core.tenant_manager import sanitize_source_schema_name
+
+            self.root_schema = sanitize_source_schema_name(
+                self.source_id, self.root_branch, self.root_branch
+            )
+        else:
+            self.root_schema = "pb_root" if self.project_scoped_schemas else "root"
 
     def _branch_schema_name(self, project_id: str, branch_name: str) -> str:
+        if self.is_root_branch(branch_name):
+            return self.root_schema
+        if _is_child_subsource(getattr(self, "source_id", None)):
+            from ..core.tenant_manager import sanitize_source_schema_name
+
+            return sanitize_source_schema_name(
+                self.source_id, branch_name, self.root_branch
+            )
         if getattr(self, "project_scoped_schemas", False):
             return sanitize_project_branch_schema_name(
                 branch_name, root_branch=self.root_branch
@@ -409,6 +528,8 @@ class GraphStore(ABC):
         deleted_files: Optional[List[str]] = None,
         author: str = "system",
         base_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
         """Apply full or partial graph delta into the target branch overlay schema."""
         pass
@@ -915,6 +1036,17 @@ class GraphStore(ABC):
             meta = parsed_meta_by_id[nid]
             sym_kind = sym_kind_by_id[nid]
             label = n.get("label", nid)
+            node_src = (
+                _normalize_graph_source_id(n.get("source_id"))
+                or _normalize_graph_source_id(meta.get("source_id"))
+                or _normalize_graph_source_id(getattr(self, "source_id", None))
+                or "__default__"
+            )
+            node_scope = (
+                (str(n.get("scope")).strip() if n.get("scope") else None)
+                or (str(meta.get("scope")).strip() if meta.get("scope") else None)
+                or _resolve_graph_scope(node_src)
+            )
             vis_nodes.append({
                 "id": nid,
                 "label": label,
@@ -931,6 +1063,8 @@ class GraphStore(ABC):
                 "signature": meta.get("signature"),
                 "docstring": meta.get("docstring") or meta.get("summary"),
                 "community": n.get("community"),
+                "source_id": node_src,
+                "scope": node_scope,
                 "metadata": meta,
             })
 
@@ -938,6 +1072,18 @@ class GraphStore(ABC):
         for e in raw_edges:
             if e["source"] in node_id_set and e["target"] in node_id_set:
                 rel = e.get("relation", "")
+                emeta = _parse_edge_metadata(e.get("metadata"))
+                edge_src = (
+                    _normalize_graph_source_id(e.get("source_id"))
+                    or _normalize_graph_source_id(emeta.get("source_id"))
+                    or _normalize_graph_source_id(getattr(self, "source_id", None))
+                    or "__default__"
+                )
+                edge_scope = (
+                    (str(e.get("scope")).strip() if e.get("scope") else None)
+                    or (str(emeta.get("scope")).strip() if emeta.get("scope") else None)
+                    or _resolve_graph_scope(edge_src)
+                )
                 vis_edges.append({
                     "id": f"{e['source']}->{e['target']}:{rel}",
                     "from": e["source"],
@@ -951,7 +1097,9 @@ class GraphStore(ABC):
                     "confidence": e.get("confidence", "EXTRACTED"),
                     "confidence_score": e.get("confidence_score", 1.0),
                     "weight": e.get("weight", 1.0),
-                    "metadata": _parse_edge_metadata(e.get("metadata")),
+                    "source_id": edge_src,
+                    "scope": edge_scope,
+                    "metadata": emeta,
                 })
 
         return {
@@ -978,8 +1126,15 @@ class SqliteOverlayGraphStore(GraphStore):
         conn: Optional[sqlite3.Connection] = None,
         root_branch: str = "main",
         project_scoped_schemas: bool = False,
+        source_id: Optional[str] = None,
+        root_schema: Optional[str] = None,
     ):
-        super().__init__(root_branch=root_branch, project_scoped_schemas=project_scoped_schemas)
+        super().__init__(
+            root_branch=root_branch,
+            project_scoped_schemas=project_scoped_schemas,
+            source_id=source_id,
+            root_schema=root_schema,
+        )
         if db_path is None:
             db_path = os.getenv("OM_DB_PATH") or os.getenv("PB_DB_PATH") or None
         self.db_path = db_path
@@ -1275,13 +1430,26 @@ class SqliteOverlayGraphStore(GraphStore):
         deleted_files: Optional[List[str]] = None,
         author: str = "system",
         base_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
         self.ensure_root_schema()
         conn = self.get_conn()
+        eff_source = _normalize_graph_source_id(source_id) or self.source_id
+        eff_upgrade_mode = (upgrade_mode or "delta").strip().lower() or "delta"
 
         if self.is_root_branch(branch_name):
+            eff_root_partial = False if eff_upgrade_mode == "full_replace" else partial
             # Direct application into root schema
-            return self._sync_to_root(project_id, delta, partial, synced_files, deleted_files)
+            return self._sync_to_root(
+                project_id,
+                delta,
+                eff_root_partial,
+                synced_files,
+                deleted_files,
+                source_id=eff_source,
+                upgrade_mode=eff_upgrade_mode,
+            )
 
         schema_name = self.ensure_branch_schema(project_id, branch_name, author, base_branch=base_branch)
         lineage = self.get_branch_lineage(project_id, branch_name)
@@ -1290,11 +1458,29 @@ class SqliteOverlayGraphStore(GraphStore):
         with conn:
             if not partial:
                 # Full sync on branch: compute delta relative to parent branch
-                return self._sync_branch_full(conn, project_id, branch_name, schema_name, delta, parent_branch=parent_branch)
+                return self._sync_branch_full(
+                    conn,
+                    project_id,
+                    branch_name,
+                    schema_name,
+                    delta,
+                    parent_branch=parent_branch,
+                    source_id=eff_source,
+                    upgrade_mode=eff_upgrade_mode,
+                )
             else:
                 # Partial sync on branch: scoped to synced_files & deleted_files
                 return self._sync_branch_partial(
-                    conn, project_id, branch_name, schema_name, delta, synced_files, deleted_files, parent_branch=parent_branch
+                    conn,
+                    project_id,
+                    branch_name,
+                    schema_name,
+                    delta,
+                    synced_files,
+                    deleted_files,
+                    parent_branch=parent_branch,
+                    source_id=eff_source,
+                    upgrade_mode=eff_upgrade_mode,
                 )
 
     def _sync_to_root(
@@ -1304,6 +1490,8 @@ class SqliteOverlayGraphStore(GraphStore):
         partial: bool,
         synced_files: Optional[List[str]],
         deleted_files: Optional[List[str]],
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
         conn = self.get_conn()
         nodes_upserted = 0
@@ -1312,6 +1500,8 @@ class SqliteOverlayGraphStore(GraphStore):
         edges_deleted = 0
         hyperedges_upserted = 0
         hyperedges_deleted = 0
+        eff_source = _normalize_graph_source_id(source_id) or self.source_id
+        eff_scope = _resolve_graph_scope(eff_source)
 
         with conn:
             if not partial:
@@ -1368,7 +1558,10 @@ class SqliteOverlayGraphStore(GraphStore):
 
             # Upsert nodes
             for n in _dedup_nodes(delta.nodes):
-                meta_json = json.dumps(n.metadata) if isinstance(n.metadata, dict) else str(n.metadata or "{}")
+                meta_dict = _prepare_item_metadata_dict(
+                    n, default_source_id=eff_source, default_scope=eff_scope
+                )
+                meta_json = json.dumps(meta_dict)
                 conn.execute(
                     """
                     INSERT INTO root_nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
@@ -1388,7 +1581,11 @@ class SqliteOverlayGraphStore(GraphStore):
 
             # Upsert edges
             for e in _dedup_edges(delta.edges):
-                edge_meta_json = _serialize_edge_metadata(e)
+                edge_meta_json = json.dumps(
+                    _prepare_item_metadata_dict(
+                        e, default_source_id=eff_source, default_scope=eff_scope
+                    )
+                )
                 conn.execute(
                     """
                     INSERT INTO root_edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
@@ -1428,7 +1625,7 @@ class SqliteOverlayGraphStore(GraphStore):
             "status": "synced",
             "project_id": project_id,
             "branch": self.root_branch,
-            "schema_name": "pb_root" if self.project_scoped_schemas else "root",
+            "schema_name": self.root_schema,
             "nodes_upserted": nodes_upserted,
             "nodes_deleted": nodes_deleted,
             "edges_upserted": edges_upserted,
@@ -1436,7 +1633,22 @@ class SqliteOverlayGraphStore(GraphStore):
             "hyperedges_upserted": hyperedges_upserted,
             "hyperedges_deleted": hyperedges_deleted,
             "partial": partial,
+            "upgrade_mode": upgrade_mode,
         }
+
+    @staticmethod
+    def _clear_branch_overlay(conn: sqlite3.Connection, schema_name: str, project_id: str) -> None:
+        """Clear all overlay tables for one branch inside this store."""
+        for tbl in (
+            "node_upserts",
+            "node_tombstones",
+            "edge_upserts",
+            "edge_tombstones",
+            "hyperedge_upserts",
+            "hyperedge_tombstones",
+            "synced_files",
+        ):
+            conn.execute(f"DELETE FROM {schema_name}_{tbl} WHERE project_id = ?", (project_id,))
 
     def _sync_branch_full(
         self,
@@ -1446,7 +1658,11 @@ class SqliteOverlayGraphStore(GraphStore):
         schema_name: str,
         delta: GraphDelta,
         parent_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
+        eff_source = _normalize_graph_source_id(source_id) or self.source_id
+        eff_scope = _resolve_graph_scope(eff_source)
         # Fetch baseline state (fast root path or resolved parent branch state)
         if parent_branch and not self.is_root_branch(parent_branch):
             parent_state = self.get_resolved_subgraph(project_id, parent_branch, limit=1_000_000)
@@ -1463,6 +1679,7 @@ class SqliteOverlayGraphStore(GraphStore):
                 (e["source"], e["target"], e["relation"]): dict(e)
                 for e in parent_state.get("edges", [])
             }
+            root_hyperedges = {h["id"]: dict(h) for h in parent_state.get("hyperedges", [])}
         else:
             root_nodes_rows = conn.execute("SELECT * FROM root_nodes WHERE project_id = ?", (project_id,)).fetchall()
             root_nodes = {r["id"]: dict(r) for r in root_nodes_rows}
@@ -1480,14 +1697,11 @@ class SqliteOverlayGraphStore(GraphStore):
                 rd["metadata"] = _parse_edge_metadata(rd.get("metadata"))
                 root_edges[(rd["source"], rd["target"], rd["relation"])] = rd
 
+            root_hyperedges_rows = conn.execute("SELECT * FROM root_hyperedges WHERE project_id = ?", (project_id,)).fetchall()
+            root_hyperedges = {r["id"]: dict(r) for r in root_hyperedges_rows}
+
         # Clear existing branch overlay
-        conn.execute(f"DELETE FROM {schema_name}_node_upserts WHERE project_id = ?", (project_id,))
-        conn.execute(f"DELETE FROM {schema_name}_node_tombstones WHERE project_id = ?", (project_id,))
-        conn.execute(f"DELETE FROM {schema_name}_edge_upserts WHERE project_id = ?", (project_id,))
-        conn.execute(f"DELETE FROM {schema_name}_edge_tombstones WHERE project_id = ?", (project_id,))
-        conn.execute(f"DELETE FROM {schema_name}_hyperedge_upserts WHERE project_id = ?", (project_id,))
-        conn.execute(f"DELETE FROM {schema_name}_hyperedge_tombstones WHERE project_id = ?", (project_id,))
-        conn.execute(f"DELETE FROM {schema_name}_synced_files WHERE project_id = ?", (project_id,))
+        self._clear_branch_overlay(conn, schema_name, project_id)
 
         nodes_upserted = 0
         nodes_tombstoned = 0
@@ -1497,7 +1711,9 @@ class SqliteOverlayGraphStore(GraphStore):
         delta_node_ids = set()
         for n in _dedup_nodes(delta.nodes):
             delta_node_ids.add(n.id)
-            meta_dict = n.metadata if isinstance(n.metadata, dict) else {}
+            meta_dict = _prepare_item_metadata_dict(
+                n, default_source_id=eff_source, default_scope=eff_scope
+            )
             meta_json = json.dumps(meta_dict)
 
             should_upsert = n.id not in root_nodes
@@ -1509,7 +1725,7 @@ class SqliteOverlayGraphStore(GraphStore):
                     or r["source_file"] != n.source_file
                     or (r["source_location"] or None) != (n.source_location or None)
                     or r["community"] != n.community
-                    or r["metadata"] != meta_dict
+                    or _parse_edge_metadata(r.get("metadata")) != meta_dict
                 )
             if should_upsert:
                 conn.execute(
@@ -1544,7 +1760,9 @@ class SqliteOverlayGraphStore(GraphStore):
         for e in _dedup_edges(delta.edges):
             ekey = (e.source, e.target, e.relation)
             delta_edge_keys.add(ekey)
-            edge_meta_dict = _extract_edge_metadata_dict(e)
+            edge_meta_dict = _prepare_item_metadata_dict(
+                e, default_source_id=eff_source, default_scope=eff_scope
+            )
             edge_meta_json = json.dumps(edge_meta_dict)
 
             should_upsert = ekey not in root_edges
@@ -1589,7 +1807,9 @@ class SqliteOverlayGraphStore(GraphStore):
             conn.execute(f"DELETE FROM {schema_name}_hyperedge_upserts WHERE project_id = ? AND id = ?", (project_id, htid))
             conn.execute(f"INSERT OR IGNORE INTO {schema_name}_hyperedge_tombstones (project_id, id) VALUES (?, ?)", (project_id, htid))
 
+        delta_hyper_ids: Set[str] = set()
         for h in _dedup_hyperedges(delta.hyperedges):
+            delta_hyper_ids.add(h.id)
             conn.execute(f"DELETE FROM {schema_name}_hyperedge_tombstones WHERE project_id = ? AND id = ?", (project_id, h.id))
             nodes_val = json.dumps(h.nodes) if not isinstance(h.nodes, str) else h.nodes
             conn.execute(
@@ -1607,6 +1827,14 @@ class SqliteOverlayGraphStore(GraphStore):
                 """,
                 (h.id, project_id, h.label, nodes_val, h.relation, h.confidence, h.confidence_score, h.source_file),
             )
+
+        if upgrade_mode == "full_replace":
+            for rhid in root_hyperedges:
+                if rhid not in delta_hyper_ids:
+                    conn.execute(
+                        f"INSERT OR IGNORE INTO {schema_name}_hyperedge_tombstones (project_id, id) VALUES (?, ?)",
+                        (project_id, rhid),
+                    )
 
         # Synced files record
         for sf in delta.synced_files:
@@ -1628,6 +1856,7 @@ class SqliteOverlayGraphStore(GraphStore):
             "edges_upserted": edges_upserted,
             "edges_tombstoned": edges_tombstoned,
             "partial": False,
+            "upgrade_mode": upgrade_mode,
         }
 
     def _sync_branch_partial(
@@ -1640,7 +1869,13 @@ class SqliteOverlayGraphStore(GraphStore):
         synced_files: Optional[List[str]],
         deleted_files: Optional[List[str]],
         parent_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
+        eff_source = _normalize_graph_source_id(source_id) or self.source_id
+        eff_scope = _resolve_graph_scope(eff_source)
+        if upgrade_mode == "full_replace":
+            self._clear_branch_overlay(conn, schema_name, project_id)
         synced_file_set: Set[str] = set(synced_files or [
             sf["file_path"] if isinstance(sf, dict) else sf for sf in delta.synced_files
         ])
@@ -1751,7 +1986,9 @@ class SqliteOverlayGraphStore(GraphStore):
                     conn.execute(f"DELETE FROM {schema_name}_node_tombstones WHERE project_id = ? AND id = ?", (project_id, rid))
 
             for n in delta_file_nodes:
-                meta_dict = n.metadata if isinstance(n.metadata, dict) else {}
+                meta_dict = _prepare_item_metadata_dict(
+                    n, default_source_id=eff_source, default_scope=eff_scope
+                )
                 meta_json = json.dumps(meta_dict)
                 conn.execute(f"DELETE FROM {schema_name}_node_tombstones WHERE project_id = ? AND id = ?", (project_id, n.id))
 
@@ -1763,7 +2000,7 @@ class SqliteOverlayGraphStore(GraphStore):
                         or r["file_type"] != n.file_type
                         or (r["source_location"] or None) != (n.source_location or None)
                         or r["community"] != n.community
-                        or r["metadata"] != meta_dict
+                        or _parse_edge_metadata(r.get("metadata")) != meta_dict
                     )
                 if should_upsert:
                     conn.execute(
@@ -1803,7 +2040,9 @@ class SqliteOverlayGraphStore(GraphStore):
 
             for e in delta_file_edges:
                 ekey = (e.source, e.target, e.relation)
-                edge_meta_dict = _extract_edge_metadata_dict(e)
+                edge_meta_dict = _prepare_item_metadata_dict(
+                    e, default_source_id=eff_source, default_scope=eff_scope
+                )
                 edge_meta_json = json.dumps(edge_meta_dict)
                 conn.execute(
                     f"DELETE FROM {schema_name}_edge_tombstones WHERE project_id = ? AND source = ? AND target = ? AND relation = ?",
@@ -1893,6 +2132,7 @@ class SqliteOverlayGraphStore(GraphStore):
             "edges_upserted": edges_upserted,
             "edges_tombstoned": edges_tombstoned,
             "partial": True,
+            "upgrade_mode": upgrade_mode,
         }
 
     def _get_branch_overlay(self, project_id: str, branch_name: str) -> Dict[str, Any]:
@@ -2410,20 +2650,22 @@ class SqliteOverlayGraphStore(GraphStore):
 
         nodes: List[Dict[str, Any]] = []
         for r in nodes_rows:
-            d = dict(r)
-            if isinstance(d.get("metadata"), str):
-                try:
-                    d["metadata"] = json.loads(d["metadata"])
-                except Exception:
-                    pass
+            d = _enrich_serialized_item(
+                dict(r),
+                default_source_id=self.source_id,
+                default_scope=self.default_scope,
+            )
             nodes.append(d)
 
         node_id_set = {n["id"] for n in nodes}
         edges: List[Dict[str, Any]] = []
         for r in edges_rows:
             if r["source"] in node_id_set and r["target"] in node_id_set:
-                d = dict(r)
-                d["metadata"] = _parse_edge_metadata(d.get("metadata"))
+                d = _enrich_serialized_item(
+                    dict(r),
+                    default_source_id=self.source_id,
+                    default_scope=self.default_scope,
+                )
                 edges.append(d)
 
         hyperedges: List[Dict[str, Any]] = []
@@ -2510,7 +2752,7 @@ class SqliteOverlayGraphStore(GraphStore):
         branches: List[Dict[str, Any]] = [
             {
                 "branch_name": self.root_branch,
-                "schema_name": "pb_root" if self.project_scoped_schemas else "root",
+                "schema_name": self.root_schema,
                 "is_root": True,
             }
         ]
@@ -2557,11 +2799,25 @@ class PostgresSchemaGraphStore(GraphStore):
         conn: Optional[Any] = None,
         root_branch: str = "main",
         project_scoped_schemas: bool = False,
+        source_id: Optional[str] = None,
+        root_schema: Optional[str] = None,
     ):
-        super().__init__(root_branch=root_branch, project_scoped_schemas=project_scoped_schemas)
+        super().__init__(
+            root_branch=root_branch,
+            project_scoped_schemas=project_scoped_schemas,
+            source_id=source_id,
+            root_schema=root_schema or (None if _is_child_subsource(source_id) else "pb_root"),
+        )
         self.connection_url = connection_url
         self._external_conn = conn
         self._conn = conn
+
+    def _root_schema_sql(self) -> psql.Composable:
+        if self.root_schema == "pb_root":
+            return psql.SQL("pb_root")
+        if not re.match(r"^[a-z_][a-z0-9_]{0,62}$", self.root_schema):
+            raise ValueError(f"Invalid root_schema identifier '{self.root_schema}'")
+        return psql.Identifier(self.root_schema)
 
     @property
     def conn(self) -> Optional[Any]:
@@ -2597,10 +2853,11 @@ class PostgresSchemaGraphStore(GraphStore):
     # DDL Generation helpers for testing and verification
     def generate_root_schema_ddl(self, as_string: bool = False) -> List[Any]:
         """Generate parameterized psycopg2.sql statements for canonical root schema."""
+        rs = self._root_schema_sql()
         statements = [
-            psql.SQL("CREATE SCHEMA IF NOT EXISTS pb_root;"),
+            psql.SQL("CREATE SCHEMA IF NOT EXISTS {rs};").format(rs=rs),
             psql.SQL("""
-            CREATE TABLE IF NOT EXISTS pb_root.nodes (
+            CREATE TABLE IF NOT EXISTS {rs}.nodes (
                 id VARCHAR(255) NOT NULL,
                 project_id VARCHAR(100) NOT NULL,
                 label VARCHAR(255) NOT NULL,
@@ -2608,16 +2865,16 @@ class PostgresSchemaGraphStore(GraphStore):
                 source_file TEXT NOT NULL,
                 source_location TEXT,
                 community INT,
-                metadata JSONB DEFAULT '{}'::jsonb,
+                metadata JSONB DEFAULT '{{}}'::jsonb,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (project_id, id)
             );
-            """),
-            psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_nodes_proj ON pb_root.nodes(project_id);"),
-            psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_nodes_file ON pb_root.nodes(project_id, source_file);"),
+            """).format(rs=rs),
+            psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_nodes_proj ON {rs}.nodes(project_id);").format(rs=rs),
+            psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_nodes_file ON {rs}.nodes(project_id, source_file);").format(rs=rs),
             psql.SQL("""
-            CREATE TABLE IF NOT EXISTS pb_root.edges (
+            CREATE TABLE IF NOT EXISTS {rs}.edges (
                 project_id VARCHAR(100) NOT NULL,
                 source VARCHAR(255) NOT NULL,
                 target VARCHAR(255) NOT NULL,
@@ -2627,16 +2884,16 @@ class PostgresSchemaGraphStore(GraphStore):
                 source_file TEXT,
                 source_location TEXT,
                 weight FLOAT DEFAULT 1.0,
-                metadata JSONB DEFAULT '{}'::jsonb,
+                metadata JSONB DEFAULT '{{}}'::jsonb,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (project_id, source, target, relation)
             );
-            """),
-            psql.SQL("ALTER TABLE pb_root.edges ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;"),
-            psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_edges_src ON pb_root.edges(project_id, source);"),
-            psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_edges_tgt ON pb_root.edges(project_id, target);"),
+            """).format(rs=rs),
+            psql.SQL("ALTER TABLE {rs}.edges ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{{}}'::jsonb;").format(rs=rs),
+            psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_edges_src ON {rs}.edges(project_id, source);").format(rs=rs),
+            psql.SQL("CREATE INDEX IF NOT EXISTS idx_pb_root_edges_tgt ON {rs}.edges(project_id, target);").format(rs=rs),
             psql.SQL("""
-            CREATE TABLE IF NOT EXISTS pb_root.hyperedges (
+            CREATE TABLE IF NOT EXISTS {rs}.hyperedges (
                 id VARCHAR(255) NOT NULL,
                 project_id VARCHAR(100) NOT NULL,
                 label VARCHAR(255) NOT NULL,
@@ -2648,9 +2905,9 @@ class PostgresSchemaGraphStore(GraphStore):
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (project_id, id)
             );
-            """),
+            """).format(rs=rs),
             psql.SQL("""
-            CREATE TABLE IF NOT EXISTS pb_root.graph_branches (
+            CREATE TABLE IF NOT EXISTS {rs}.graph_branches (
                 project_id VARCHAR(100) NOT NULL,
                 branch_name VARCHAR(255) NOT NULL,
                 schema_name VARCHAR(63) NOT NULL,
@@ -2660,7 +2917,7 @@ class PostgresSchemaGraphStore(GraphStore):
                 updated_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (project_id, branch_name)
             );
-            """),
+            """).format(rs=rs),
         ]
         return statements
 
@@ -2668,6 +2925,7 @@ class PostgresSchemaGraphStore(GraphStore):
         """Generate psycopg2.sql statements for an isolated branch schema and resolved views."""
         schema_name = self._branch_schema_name(project_id, branch_name)
         schema_id = psql.Identifier(schema_name)
+        rs = self._root_schema_sql()
         proj_lit = psql.Literal(project_id)
 
         statements = [
@@ -2757,18 +3015,18 @@ class PostgresSchemaGraphStore(GraphStore):
             CREATE OR REPLACE VIEW {schema}.v_resolved_nodes AS
             SELECT * FROM {schema}.node_upserts
             UNION ALL
-            SELECT r.* FROM pb_root.nodes r
+            SELECT r.* FROM {rs}.nodes r
             WHERE r.project_id = {proj}
               AND (r.project_id, r.id) NOT IN (SELECT project_id, id FROM {schema}.node_tombstones)
               AND (r.project_id, r.id) NOT IN (SELECT project_id, id FROM {schema}.node_upserts);
-            """).format(schema=schema_id, proj=proj_lit),
+            """).format(schema=schema_id, rs=rs, proj=proj_lit),
             psql.SQL("""
             CREATE OR REPLACE VIEW {schema}.v_resolved_edges AS
             SELECT project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata, created_at
             FROM {schema}.edge_upserts
             UNION ALL
             SELECT r.project_id, r.source, r.target, r.relation, r.confidence, r.confidence_score, r.source_file, r.source_location, r.weight, r.metadata, r.created_at
-            FROM pb_root.edges r
+            FROM {rs}.edges r
             WHERE r.project_id = {proj}
               AND (r.project_id, r.source, r.target, r.relation) NOT IN (
                   SELECT project_id, source, target, relation FROM {schema}.edge_tombstones
@@ -2776,16 +3034,16 @@ class PostgresSchemaGraphStore(GraphStore):
               AND (r.project_id, r.source, r.target, r.relation) NOT IN (
                   SELECT project_id, source, target, relation FROM {schema}.edge_upserts
               );
-            """).format(schema=schema_id, proj=proj_lit),
+            """).format(schema=schema_id, rs=rs, proj=proj_lit),
             psql.SQL("""
             CREATE OR REPLACE VIEW {schema}.v_resolved_hyperedges AS
             SELECT * FROM {schema}.hyperedge_upserts
             UNION ALL
-            SELECT r.* FROM pb_root.hyperedges r
+            SELECT r.* FROM {rs}.hyperedges r
             WHERE r.project_id = {proj}
               AND (r.project_id, r.id) NOT IN (SELECT project_id, id FROM {schema}.hyperedge_tombstones)
               AND (r.project_id, r.id) NOT IN (SELECT project_id, id FROM {schema}.hyperedge_upserts);
-            """).format(schema=schema_id, proj=proj_lit),
+            """).format(schema=schema_id, rs=rs, proj=proj_lit),
         ]
         return statements
 
@@ -2799,11 +3057,12 @@ class PostgresSchemaGraphStore(GraphStore):
         if self.is_root_branch(branch_name):
             return [self.root_branch]
         conn = self.get_conn()
+        rs = self._root_schema_sql()
         parent_map: Dict[str, str] = {}
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT branch_name, base_branch FROM pb_root.graph_branches WHERE project_id = %s",
+                    psql.SQL("SELECT branch_name, base_branch FROM {rs}.graph_branches WHERE project_id = %s").format(rs=rs),
                     (project_id,),
                 )
                 for r in cur.fetchall():
@@ -2823,11 +3082,12 @@ class PostgresSchemaGraphStore(GraphStore):
         self.ensure_root_schema()
         schema_name = self._branch_schema_name(project_id, branch_name)
         conn = self.get_conn()
+        rs = self._root_schema_sql()
 
         existing_parents: Dict[str, str] = {}
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT branch_name, base_branch FROM pb_root.graph_branches WHERE project_id = %s",
+                psql.SQL("SELECT branch_name, base_branch FROM {rs}.graph_branches WHERE project_id = %s").format(rs=rs),
                 (project_id,),
             )
             for r in cur.fetchall():
@@ -2843,14 +3103,14 @@ class PostgresSchemaGraphStore(GraphStore):
         with conn.cursor() as cur:
             # Register branch
             cur.execute(
-                """
-                INSERT INTO pb_root.graph_branches (project_id, branch_name, schema_name, base_branch, author, updated_at)
+                psql.SQL("""
+                INSERT INTO {rs}.graph_branches (project_id, branch_name, schema_name, base_branch, author, updated_at)
                 VALUES (%s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (project_id, branch_name) DO UPDATE SET
                     schema_name = EXCLUDED.schema_name,
                     base_branch = EXCLUDED.base_branch,
                     updated_at = NOW()
-                """,
+                """).format(rs=rs),
                 (project_id, branch_name, schema_name, resolved_base, author),
             )
 
@@ -2870,21 +3130,55 @@ class PostgresSchemaGraphStore(GraphStore):
         deleted_files: Optional[List[str]] = None,
         author: str = "system",
         base_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
         self.ensure_root_schema()
         conn = self.get_conn()
+        eff_source = _normalize_graph_source_id(source_id) or self.source_id
+        eff_upgrade_mode = (upgrade_mode or "delta").strip().lower() or "delta"
 
         if self.is_root_branch(branch_name):
-            return self._sync_to_root_pg(conn, project_id, delta, partial, synced_files, deleted_files)
+            eff_root_partial = False if eff_upgrade_mode == "full_replace" else partial
+            return self._sync_to_root_pg(
+                conn,
+                project_id,
+                delta,
+                eff_root_partial,
+                synced_files,
+                deleted_files,
+                source_id=eff_source,
+                upgrade_mode=eff_upgrade_mode,
+            )
 
         schema_name = self.ensure_branch_schema(project_id, branch_name, author, base_branch=base_branch)
         lineage = self.get_branch_lineage(project_id, branch_name)
         parent_branch = lineage[-2] if len(lineage) >= 2 else self.root_branch
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             if not partial:
-                return self._sync_branch_full_pg(cur, project_id, branch_name, schema_name, delta, parent_branch=parent_branch)
+                return self._sync_branch_full_pg(
+                    cur,
+                    project_id,
+                    branch_name,
+                    schema_name,
+                    delta,
+                    parent_branch=parent_branch,
+                    source_id=eff_source,
+                    upgrade_mode=eff_upgrade_mode,
+                )
             else:
-                return self._sync_branch_partial_pg(cur, project_id, branch_name, schema_name, delta, synced_files, deleted_files, parent_branch=parent_branch)
+                return self._sync_branch_partial_pg(
+                    cur,
+                    project_id,
+                    branch_name,
+                    schema_name,
+                    delta,
+                    synced_files,
+                    deleted_files,
+                    parent_branch=parent_branch,
+                    source_id=eff_source,
+                    upgrade_mode=eff_upgrade_mode,
+                )
 
     def _sync_to_root_pg(
         self,
@@ -2894,7 +3188,12 @@ class PostgresSchemaGraphStore(GraphStore):
         partial: bool,
         synced_files: Optional[List[str]],
         deleted_files: Optional[List[str]],
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
+        rs = self._root_schema_sql()
+        eff_source = _normalize_graph_source_id(source_id) or self.source_id
+        eff_scope = _resolve_graph_scope(eff_source)
         nodes_upserted = 0
         nodes_deleted = 0
         edges_upserted = 0
@@ -2902,19 +3201,19 @@ class PostgresSchemaGraphStore(GraphStore):
 
         with conn.cursor() as cur:
             if not partial:
-                cur.execute("DELETE FROM pb_root.nodes WHERE project_id = %s", (project_id,))
-                cur.execute("DELETE FROM pb_root.edges WHERE project_id = %s", (project_id,))
-                cur.execute("DELETE FROM pb_root.hyperedges WHERE project_id = %s", (project_id,))
+                cur.execute(psql.SQL("DELETE FROM {rs}.nodes WHERE project_id = %s").format(rs=rs), (project_id,))
+                cur.execute(psql.SQL("DELETE FROM {rs}.edges WHERE project_id = %s").format(rs=rs), (project_id,))
+                cur.execute(psql.SQL("DELETE FROM {rs}.hyperedges WHERE project_id = %s").format(rs=rs), (project_id,))
             else:
                 del_files = deleted_files or []
                 if del_files:
                     cur.execute(
-                        "DELETE FROM pb_root.nodes WHERE project_id = %s AND source_file = ANY(%s)",
+                        psql.SQL("DELETE FROM {rs}.nodes WHERE project_id = %s AND source_file = ANY(%s)").format(rs=rs),
                         (project_id, del_files),
                     )
                     nodes_deleted += cur.rowcount
                     cur.execute(
-                        "DELETE FROM pb_root.edges WHERE project_id = %s AND source_file = ANY(%s)",
+                        psql.SQL("DELETE FROM {rs}.edges WHERE project_id = %s AND source_file = ANY(%s)").format(rs=rs),
                         (project_id, del_files),
                     )
                     edges_deleted += cur.rowcount
@@ -2924,33 +3223,38 @@ class PostgresSchemaGraphStore(GraphStore):
                 ]
                 if sync_files:
                     cur.execute(
-                        "DELETE FROM pb_root.nodes WHERE project_id = %s AND source_file = ANY(%s)",
+                        psql.SQL("DELETE FROM {rs}.nodes WHERE project_id = %s AND source_file = ANY(%s)").format(rs=rs),
                         (project_id, sync_files),
                     )
                     cur.execute(
-                        "DELETE FROM pb_root.edges WHERE project_id = %s AND source_file = ANY(%s)",
+                        psql.SQL("DELETE FROM {rs}.edges WHERE project_id = %s AND source_file = ANY(%s)").format(rs=rs),
                         (project_id, sync_files),
                     )
 
                 if delta.node_tombstones:
                     cur.execute(
-                        "DELETE FROM pb_root.nodes WHERE project_id = %s AND id = ANY(%s)",
+                        psql.SQL("DELETE FROM {rs}.nodes WHERE project_id = %s AND id = ANY(%s)").format(rs=rs),
                         (project_id, delta.node_tombstones),
                     )
                     nodes_deleted += cur.rowcount
 
                 for et in delta.edge_tombstones:
                     cur.execute(
-                        "DELETE FROM pb_root.edges WHERE project_id = %s AND source = %s AND target = %s AND relation = %s",
+                        psql.SQL("DELETE FROM {rs}.edges WHERE project_id = %s AND source = %s AND target = %s AND relation = %s").format(rs=rs),
                         (project_id, et["source"], et["target"], et["relation"]),
                     )
                     edges_deleted += cur.rowcount
 
             # Upsert nodes
             for n in _dedup_nodes(delta.nodes):
+                meta_json = json.dumps(
+                    _prepare_item_metadata_dict(
+                        n, default_source_id=eff_source, default_scope=eff_scope
+                    )
+                )
                 cur.execute(
-                    """
-                    INSERT INTO pb_root.nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                    psql.SQL("""
+                    INSERT INTO {rs}.nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (project_id, id) DO UPDATE SET
                         label = EXCLUDED.label,
@@ -2960,17 +3264,21 @@ class PostgresSchemaGraphStore(GraphStore):
                         community = EXCLUDED.community,
                         metadata = EXCLUDED.metadata,
                         updated_at = NOW()
-                    """,
-                    (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, json.dumps(n.metadata or {})),
+                    """).format(rs=rs),
+                    (n.id, project_id, n.label, n.file_type, n.source_file, n.source_location, n.community, meta_json),
                 )
                 nodes_upserted += 1
 
             # Upsert edges
             for e in _dedup_edges(delta.edges):
-                edge_meta_json = _serialize_edge_metadata(e)
+                edge_meta_json = json.dumps(
+                    _prepare_item_metadata_dict(
+                        e, default_source_id=eff_source, default_scope=eff_scope
+                    )
+                )
                 cur.execute(
-                    """
-                    INSERT INTO pb_root.edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                    psql.SQL("""
+                    INSERT INTO {rs}.edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
                         confidence = EXCLUDED.confidence,
@@ -2979,15 +3287,15 @@ class PostgresSchemaGraphStore(GraphStore):
                         source_location = EXCLUDED.source_location,
                         weight = EXCLUDED.weight,
                         metadata = EXCLUDED.metadata
-                    """,
+                    """).format(rs=rs),
                     (project_id, e.source, e.target, e.relation, e.confidence, e.confidence_score, e.source_file, e.source_location, e.weight, edge_meta_json),
                 )
                 edges_upserted += 1
 
             for h in _dedup_hyperedges(delta.hyperedges):
                 cur.execute(
-                    """
-                    INSERT INTO pb_root.hyperedges (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
+                    psql.SQL("""
+                    INSERT INTO {rs}.hyperedges (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (project_id, id) DO UPDATE SET
                         label = EXCLUDED.label,
@@ -2996,7 +3304,7 @@ class PostgresSchemaGraphStore(GraphStore):
                         confidence = EXCLUDED.confidence,
                         confidence_score = EXCLUDED.confidence_score,
                         source_file = EXCLUDED.source_file
-                    """,
+                    """).format(rs=rs),
                     (h.id, project_id, h.label, h.nodes, h.relation, h.confidence, h.confidence_score, h.source_file),
                 )
 
@@ -3004,13 +3312,33 @@ class PostgresSchemaGraphStore(GraphStore):
             "status": "synced",
             "project_id": project_id,
             "branch": self.root_branch,
-            "schema_name": "pb_root",
+            "schema_name": self.root_schema,
             "nodes_upserted": nodes_upserted,
             "nodes_deleted": nodes_deleted,
             "edges_upserted": edges_upserted,
             "edges_deleted": edges_deleted,
             "partial": partial,
+            "upgrade_mode": upgrade_mode,
         }
+
+    @staticmethod
+    def _clear_branch_overlay_pg(cur: Any, schema_id: psql.Composable, project_id: str) -> None:
+        """Clear all PostgreSQL overlay tables for one branch inside this store."""
+        for tbl in (
+            "node_upserts",
+            "node_tombstones",
+            "edge_upserts",
+            "edge_tombstones",
+            "hyperedge_upserts",
+            "hyperedge_tombstones",
+            "synced_files",
+        ):
+            cur.execute(
+                psql.SQL("DELETE FROM {schema}.{table} WHERE project_id = %s;").format(
+                    schema=schema_id, table=psql.Identifier(tbl)
+                ),
+                (project_id,),
+            )
 
     def _sync_branch_full_pg(
         self,
@@ -3020,27 +3348,35 @@ class PostgresSchemaGraphStore(GraphStore):
         schema_name: str,
         delta: GraphDelta,
         parent_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
         schema_id = psql.Identifier(schema_name)
+        rs = self._root_schema_sql()
+        eff_source = _normalize_graph_source_id(source_id) or self.source_id
+        eff_scope = _resolve_graph_scope(eff_source)
 
         # Clear overlay
-        for tbl in ["node_upserts", "node_tombstones", "edge_upserts", "edge_tombstones", "hyperedge_upserts", "hyperedge_tombstones", "synced_files"]:
-            cur.execute(psql.SQL("DELETE FROM {schema}.{table} WHERE project_id = %s;").format(schema=schema_id, table=psql.Identifier(tbl)), (project_id,))
+        self._clear_branch_overlay_pg(cur, schema_id, project_id)
 
         if parent_branch and not self.is_root_branch(parent_branch):
             parent_state = self.get_resolved_subgraph(project_id, parent_branch, limit=1_000_000)
             root_nodes = {n["id"]: dict(n) for n in parent_state.get("nodes", [])}
             root_edges = {(e["source"], e["target"], e["relation"]): dict(e) for e in parent_state.get("edges", [])}
+            root_hyperedges = {h["id"]: dict(h) for h in parent_state.get("hyperedges", [])}
         else:
-            cur.execute("SELECT * FROM pb_root.nodes WHERE project_id = %s", (project_id,))
+            cur.execute(psql.SQL("SELECT * FROM {rs}.nodes WHERE project_id = %s").format(rs=rs), (project_id,))
             root_nodes = {r["id"]: dict(r) for r in cur.fetchall()}
 
-            cur.execute("SELECT * FROM pb_root.edges WHERE project_id = %s", (project_id,))
+            cur.execute(psql.SQL("SELECT * FROM {rs}.edges WHERE project_id = %s").format(rs=rs), (project_id,))
             root_edges = {}
             for row in cur.fetchall():
                 rd = dict(row)
                 rd["metadata"] = _parse_edge_metadata(rd.get("metadata"))
                 root_edges[(rd["source"], rd["target"], rd["relation"])] = rd
+
+            cur.execute(psql.SQL("SELECT * FROM {rs}.hyperedges WHERE project_id = %s").format(rs=rs), (project_id,))
+            root_hyperedges = {r["id"]: dict(r) for r in cur.fetchall()}
 
         nodes_upserted = 0
         nodes_tombstoned = 0
@@ -3050,7 +3386,10 @@ class PostgresSchemaGraphStore(GraphStore):
         delta_node_ids = set()
         for n in _dedup_nodes(delta.nodes):
             delta_node_ids.add(n.id)
-            meta_json = json.dumps(n.metadata or {})
+            meta_dict = _prepare_item_metadata_dict(
+                n, default_source_id=eff_source, default_scope=eff_scope
+            )
+            meta_json = json.dumps(meta_dict)
             should_upsert = n.id not in root_nodes
             if not should_upsert:
                 r = root_nodes[n.id]
@@ -3060,7 +3399,7 @@ class PostgresSchemaGraphStore(GraphStore):
                     or r["source_file"] != n.source_file
                     or (r["source_location"] or None) != (n.source_location or None)
                     or r["community"] != n.community
-                    or r["metadata"] != (n.metadata or {})
+                    or _parse_edge_metadata(r.get("metadata")) != meta_dict
                 )
             if should_upsert:
                 cur.execute(
@@ -3093,7 +3432,9 @@ class PostgresSchemaGraphStore(GraphStore):
         for e in _dedup_edges(delta.edges):
             ekey = (e.source, e.target, e.relation)
             delta_edge_keys.add(ekey)
-            edge_meta_dict = _extract_edge_metadata_dict(e)
+            edge_meta_dict = _prepare_item_metadata_dict(
+                e, default_source_id=eff_source, default_scope=eff_scope
+            )
             edge_meta_json = json.dumps(edge_meta_dict)
             should_upsert = ekey not in root_edges
             if not should_upsert:
@@ -3136,7 +3477,9 @@ class PostgresSchemaGraphStore(GraphStore):
             cur.execute(psql.SQL("DELETE FROM {schema}.hyperedge_upserts WHERE project_id = %s AND id = %s;").format(schema=schema_id), (project_id, htid))
             cur.execute(psql.SQL("INSERT INTO {schema}.hyperedge_tombstones (project_id, id) VALUES (%s, %s) ON CONFLICT DO NOTHING;").format(schema=schema_id), (project_id, htid))
 
+        delta_hyper_ids: Set[str] = set()
         for h in _dedup_hyperedges(delta.hyperedges):
+            delta_hyper_ids.add(h.id)
             cur.execute(psql.SQL("DELETE FROM {schema}.hyperedge_tombstones WHERE project_id = %s AND id = %s;").format(schema=schema_id), (project_id, h.id))
             nodes_list = h.nodes if isinstance(h.nodes, list) else json.loads(h.nodes)
             cur.execute(
@@ -3153,6 +3496,14 @@ class PostgresSchemaGraphStore(GraphStore):
                 """).format(schema=schema_id),
                 (h.id, project_id, h.label, nodes_list, h.relation, h.confidence, h.confidence_score, h.source_file),
             )
+
+        if upgrade_mode == "full_replace":
+            for rhid in root_hyperedges:
+                if rhid not in delta_hyper_ids:
+                    cur.execute(
+                        psql.SQL("INSERT INTO {schema}.hyperedge_tombstones (project_id, id) VALUES (%s, %s) ON CONFLICT DO NOTHING;").format(schema=schema_id),
+                        (project_id, rhid),
+                    )
 
         for sf in delta.synced_files:
             fp = sf.get("file_path") if isinstance(sf, dict) else str(sf)
@@ -3177,6 +3528,7 @@ class PostgresSchemaGraphStore(GraphStore):
             "edges_upserted": edges_upserted,
             "edges_tombstoned": edges_tombstoned,
             "partial": False,
+            "upgrade_mode": upgrade_mode,
         }
 
     def _sync_branch_partial_pg(
@@ -3189,8 +3541,15 @@ class PostgresSchemaGraphStore(GraphStore):
         synced_files: Optional[List[str]],
         deleted_files: Optional[List[str]],
         parent_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
         schema_id = psql.Identifier(schema_name)
+        rs = self._root_schema_sql()
+        eff_source = _normalize_graph_source_id(source_id) or self.source_id
+        eff_scope = _resolve_graph_scope(eff_source)
+        if upgrade_mode == "full_replace":
+            self._clear_branch_overlay_pg(cur, schema_id, project_id)
         synced_file_set: Set[str] = set(synced_files or [
             sf["file_path"] if isinstance(sf, dict) else sf for sf in delta.synced_files
         ])
@@ -3225,7 +3584,7 @@ class PostgresSchemaGraphStore(GraphStore):
             if use_parent_state:
                 base_del_nodes = list(parent_nodes_by_file.get(fpath, {}).values())
             else:
-                cur.execute("SELECT id FROM pb_root.nodes WHERE project_id = %s AND source_file = %s", (project_id, fpath))
+                cur.execute(psql.SQL("SELECT id FROM {rs}.nodes WHERE project_id = %s AND source_file = %s").format(rs=rs), (project_id, fpath))
                 base_del_nodes = cur.fetchall()
             for r in base_del_nodes:
                 cur.execute(
@@ -3237,7 +3596,7 @@ class PostgresSchemaGraphStore(GraphStore):
             if use_parent_state:
                 base_del_edges = list(parent_edges_by_file.get(fpath, {}).values())
             else:
-                cur.execute("SELECT source, target, relation FROM pb_root.edges WHERE project_id = %s AND source_file = %s", (project_id, fpath))
+                cur.execute(psql.SQL("SELECT source, target, relation FROM {rs}.edges WHERE project_id = %s AND source_file = %s").format(rs=rs), (project_id, fpath))
                 base_del_edges = cur.fetchall()
             for r in base_del_edges:
                 cur.execute(
@@ -3256,10 +3615,10 @@ class PostgresSchemaGraphStore(GraphStore):
                 root_nodes = parent_nodes_by_file.get(fpath, {})
                 root_edges = parent_edges_by_file.get(fpath, {})
             else:
-                cur.execute("SELECT * FROM pb_root.nodes WHERE project_id = %s AND source_file = %s", (project_id, fpath))
+                cur.execute(psql.SQL("SELECT * FROM {rs}.nodes WHERE project_id = %s AND source_file = %s").format(rs=rs), (project_id, fpath))
                 root_nodes = {r["id"]: dict(r) for r in cur.fetchall()}
 
-                cur.execute("SELECT * FROM pb_root.edges WHERE project_id = %s AND source_file = %s", (project_id, fpath))
+                cur.execute(psql.SQL("SELECT * FROM {rs}.edges WHERE project_id = %s AND source_file = %s").format(rs=rs), (project_id, fpath))
                 root_edges = {}
                 for row in cur.fetchall():
                     rd = dict(row)
@@ -3280,7 +3639,10 @@ class PostgresSchemaGraphStore(GraphStore):
                     cur.execute(psql.SQL("DELETE FROM {schema}.node_tombstones WHERE project_id = %s AND id = %s;").format(schema=schema_id), (project_id, rid))
 
             for n in delta_file_nodes:
-                meta_json = json.dumps(n.metadata or {})
+                meta_dict = _prepare_item_metadata_dict(
+                    n, default_source_id=eff_source, default_scope=eff_scope
+                )
+                meta_json = json.dumps(meta_dict)
                 cur.execute(psql.SQL("DELETE FROM {schema}.node_tombstones WHERE project_id = %s AND id = %s;").format(schema=schema_id), (project_id, n.id))
 
                 should_upsert = n.id not in root_nodes
@@ -3291,7 +3653,7 @@ class PostgresSchemaGraphStore(GraphStore):
                         or r["file_type"] != n.file_type
                         or (r["source_location"] or None) != (n.source_location or None)
                         or r["community"] != n.community
-                        or r["metadata"] != (n.metadata or {})
+                        or _parse_edge_metadata(r.get("metadata")) != meta_dict
                     )
                 if should_upsert:
                     cur.execute(
@@ -3330,7 +3692,9 @@ class PostgresSchemaGraphStore(GraphStore):
 
             for e in delta_file_edges:
                 ekey = (e.source, e.target, e.relation)
-                edge_meta_dict = _extract_edge_metadata_dict(e)
+                edge_meta_dict = _prepare_item_metadata_dict(
+                    e, default_source_id=eff_source, default_scope=eff_scope
+                )
                 edge_meta_json = json.dumps(edge_meta_dict)
                 cur.execute(
                     psql.SQL("DELETE FROM {schema}.edge_tombstones WHERE project_id = %s AND source = %s AND target = %s AND relation = %s;").format(schema=schema_id),
@@ -3421,6 +3785,7 @@ class PostgresSchemaGraphStore(GraphStore):
             "edges_upserted": edges_upserted,
             "edges_tombstoned": edges_tombstoned,
             "partial": True,
+            "upgrade_mode": upgrade_mode,
         }
 
     def _get_branch_overlay(self, project_id: str, branch_name: str) -> Dict[str, Any]:
@@ -3496,8 +3861,9 @@ class PostgresSchemaGraphStore(GraphStore):
         if not node_ids:
             return {}
         conn = self.get_conn()
+        rs = self._root_schema_sql()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM pb_root.nodes WHERE project_id = %s AND id = ANY(%s)", (project_id, node_ids))
+            cur.execute(psql.SQL("SELECT * FROM {rs}.nodes WHERE project_id = %s AND id = ANY(%s)").format(rs=rs), (project_id, node_ids))
             return {r["id"]: dict(r) for r in cur.fetchall()}
 
     def _get_root_edges_by_keys(
@@ -3506,11 +3872,12 @@ class PostgresSchemaGraphStore(GraphStore):
         if not edge_keys:
             return {}
         conn = self.get_conn()
+        rs = self._root_schema_sql()
         res = {}
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             for s, t, rel in edge_keys:
                 cur.execute(
-                    "SELECT * FROM pb_root.edges WHERE project_id = %s AND source = %s AND target = %s AND relation = %s",
+                    psql.SQL("SELECT * FROM {rs}.edges WHERE project_id = %s AND source = %s AND target = %s AND relation = %s").format(rs=rs),
                     (project_id, s, t, rel),
                 )
                 r = cur.fetchone()
@@ -3627,6 +3994,7 @@ class PostgresSchemaGraphStore(GraphStore):
         overlay = self._get_branch_overlay(project_id, branch_name)
         schema_name = overlay["schema_name"]
         schema_id = psql.Identifier(schema_name)
+        rs = self._root_schema_sql()
         conn = self.get_conn()
         is_autocommit = getattr(conn, "autocommit", False)
 
@@ -3639,15 +4007,15 @@ class PostgresSchemaGraphStore(GraphStore):
                     # 1. Apply node tombstones
                     if overlay["node_tombstones"]:
                         cur.execute(
-                            "DELETE FROM pb_root.nodes WHERE project_id = %s AND id = ANY(%s)",
+                            psql.SQL("DELETE FROM {rs}.nodes WHERE project_id = %s AND id = ANY(%s)").format(rs=rs),
                             (project_id, list(overlay["node_tombstones"])),
                         )
 
                     # 2. Apply node upserts
                     for nid, n in overlay["node_upserts"].items():
                         cur.execute(
-                            """
-                            INSERT INTO pb_root.nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
+                            psql.SQL("""
+                            INSERT INTO {rs}.nodes (id, project_id, label, file_type, source_file, source_location, community, metadata, updated_at)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                             ON CONFLICT (project_id, id) DO UPDATE SET
                                 label = EXCLUDED.label,
@@ -3657,14 +4025,14 @@ class PostgresSchemaGraphStore(GraphStore):
                                 community = EXCLUDED.community,
                                 metadata = EXCLUDED.metadata,
                                 updated_at = NOW()
-                            """,
+                            """).format(rs=rs),
                             (n["id"], project_id, n["label"], n["file_type"], n["source_file"], n.get("source_location"), n.get("community"), json.dumps(n.get("metadata", {}))),
                         )
 
                     # 3. Apply edge tombstones
                     for s, t, rel in overlay["edge_tombstones"]:
                         cur.execute(
-                            "DELETE FROM pb_root.edges WHERE project_id = %s AND source = %s AND target = %s AND relation = %s",
+                            psql.SQL("DELETE FROM {rs}.edges WHERE project_id = %s AND source = %s AND target = %s AND relation = %s").format(rs=rs),
                             (project_id, s, t, rel),
                         )
 
@@ -3672,8 +4040,8 @@ class PostgresSchemaGraphStore(GraphStore):
                     for ekey, e in overlay["edge_upserts"].items():
                         edge_meta_json = _serialize_edge_metadata(e.get("metadata"))
                         cur.execute(
-                            """
-                            INSERT INTO pb_root.edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
+                            psql.SQL("""
+                            INSERT INTO {rs}.edges (project_id, source, target, relation, confidence, confidence_score, source_file, source_location, weight, metadata)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
                                 confidence = EXCLUDED.confidence,
@@ -3682,14 +4050,14 @@ class PostgresSchemaGraphStore(GraphStore):
                                 source_location = EXCLUDED.source_location,
                                 weight = EXCLUDED.weight,
                                 metadata = EXCLUDED.metadata
-                            """,
+                            """).format(rs=rs),
                             (project_id, e["source"], e["target"], e["relation"], e["confidence"], e["confidence_score"], e.get("source_file"), e.get("source_location"), e["weight"], edge_meta_json),
                         )
 
                     # 4b. Apply hyperedge tombstones
                     if overlay.get("hyperedge_tombstones"):
                         cur.execute(
-                            "DELETE FROM pb_root.hyperedges WHERE project_id = %s AND id = ANY(%s)",
+                            psql.SQL("DELETE FROM {rs}.hyperedges WHERE project_id = %s AND id = ANY(%s)").format(rs=rs),
                             (project_id, list(overlay["hyperedge_tombstones"])),
                         )
 
@@ -3697,8 +4065,8 @@ class PostgresSchemaGraphStore(GraphStore):
                     for hid, h in overlay.get("hyperedge_upserts", {}).items():
                         nodes_list = h["nodes"] if isinstance(h["nodes"], list) else json.loads(h["nodes"])
                         cur.execute(
-                            """
-                            INSERT INTO pb_root.hyperedges (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
+                            psql.SQL("""
+                            INSERT INTO {rs}.hyperedges (id, project_id, label, nodes, relation, confidence, confidence_score, source_file)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT (project_id, id) DO UPDATE SET
                                 label = EXCLUDED.label,
@@ -3707,7 +4075,7 @@ class PostgresSchemaGraphStore(GraphStore):
                                 confidence = EXCLUDED.confidence,
                                 confidence_score = EXCLUDED.confidence_score,
                                 source_file = EXCLUDED.source_file
-                            """,
+                            """).format(rs=rs),
                             (h["id"], project_id, h["label"], nodes_list, h["relation"], h["confidence"], h["confidence_score"], h.get("source_file")),
                         )
 
@@ -3715,9 +4083,9 @@ class PostgresSchemaGraphStore(GraphStore):
                     cur.execute(psql.SQL("DROP SCHEMA IF EXISTS {schema} CASCADE;").format(schema=schema_id))
 
                     # 6. Delete branch registration & reparent children to root
-                    cur.execute("DELETE FROM pb_root.graph_branches WHERE project_id = %s AND branch_name = %s", (project_id, branch_name))
+                    cur.execute(psql.SQL("DELETE FROM {rs}.graph_branches WHERE project_id = %s AND branch_name = %s").format(rs=rs), (project_id, branch_name))
                     cur.execute(
-                        "UPDATE pb_root.graph_branches SET base_branch = %s, updated_at = NOW() WHERE project_id = %s AND base_branch = %s",
+                        psql.SQL("UPDATE {rs}.graph_branches SET base_branch = %s, updated_at = NOW() WHERE project_id = %s AND base_branch = %s").format(rs=rs),
                         (self.root_branch, project_id, branch_name),
                     )
 
@@ -3835,9 +4203,9 @@ class PostgresSchemaGraphStore(GraphStore):
                         )
 
                     cur.execute(psql.SQL("DROP SCHEMA IF EXISTS {schema} CASCADE;").format(schema=schema_id))
-                    cur.execute("DELETE FROM pb_root.graph_branches WHERE project_id = %s AND branch_name = %s", (project_id, branch_name))
+                    cur.execute(psql.SQL("DELETE FROM {rs}.graph_branches WHERE project_id = %s AND branch_name = %s").format(rs=rs), (project_id, branch_name))
                     cur.execute(
-                        "UPDATE pb_root.graph_branches SET base_branch = %s, updated_at = NOW() WHERE project_id = %s AND base_branch = %s AND branch_name != %s",
+                        psql.SQL("UPDATE {rs}.graph_branches SET base_branch = %s, updated_at = NOW() WHERE project_id = %s AND base_branch = %s AND branch_name != %s").format(rs=rs),
                         (effective_target, project_id, branch_name, effective_target),
                     )
 
@@ -3883,19 +4251,20 @@ class PostgresSchemaGraphStore(GraphStore):
                     project_id, branch_name, lineage, files=files, limit=limit
                 )
         conn = self.get_conn()
+        rs = self._root_schema_sql()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             if self.is_root_branch(branch_name):
                 if files:
                     cur.execute(
-                        "SELECT * FROM pb_root.nodes WHERE project_id = %s AND source_file = ANY(%s) LIMIT %s",
+                        psql.SQL("SELECT * FROM {rs}.nodes WHERE project_id = %s AND source_file = ANY(%s) LIMIT %s").format(rs=rs),
                         (project_id, files, limit),
                     )
                 else:
-                    cur.execute("SELECT * FROM pb_root.nodes WHERE project_id = %s LIMIT %s", (project_id, limit))
+                    cur.execute(psql.SQL("SELECT * FROM {rs}.nodes WHERE project_id = %s LIMIT %s").format(rs=rs), (project_id, limit))
                 nodes_rows = cur.fetchall()
-                cur.execute("SELECT * FROM pb_root.edges WHERE project_id = %s", (project_id,))
+                cur.execute(psql.SQL("SELECT * FROM {rs}.edges WHERE project_id = %s").format(rs=rs), (project_id,))
                 edges_rows = cur.fetchall()
-                cur.execute("SELECT * FROM pb_root.hyperedges WHERE project_id = %s", (project_id,))
+                cur.execute(psql.SQL("SELECT * FROM {rs}.hyperedges WHERE project_id = %s").format(rs=rs), (project_id,))
                 hyperedges_rows = cur.fetchall()
             else:
                 schema_name = self._branch_schema_name(project_id, branch_name)
@@ -3919,13 +4288,23 @@ class PostgresSchemaGraphStore(GraphStore):
                 except psycopg2.Error:
                     return self.get_resolved_subgraph(project_id, self.root_branch, files=files, limit=limit)
 
-        nodes = [dict(r) for r in nodes_rows]
+        nodes = [
+            _enrich_serialized_item(
+                dict(r),
+                default_source_id=self.source_id,
+                default_scope=self.default_scope,
+            )
+            for r in nodes_rows
+        ]
         node_id_set = {n["id"] for n in nodes}
         edges: List[Dict[str, Any]] = []
         for r in edges_rows:
             if r["source"] in node_id_set and r["target"] in node_id_set:
-                d = dict(r)
-                d["metadata"] = _parse_edge_metadata(d.get("metadata"))
+                d = _enrich_serialized_item(
+                    dict(r),
+                    default_source_id=self.source_id,
+                    default_scope=self.default_scope,
+                )
                 edges.append(d)
         hyperedges = [dict(r) for r in hyperedges_rows]
 
@@ -3956,23 +4335,27 @@ class PostgresSchemaGraphStore(GraphStore):
 
     def list_projects(self) -> List[str]:
         conn = self.get_conn()
+        rs = self._root_schema_sql()
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT project_id FROM pb_root.nodes UNION SELECT DISTINCT project_id FROM pb_root.graph_branches")
+            cur.execute(
+                psql.SQL("SELECT DISTINCT project_id FROM {rs}.nodes UNION SELECT DISTINCT project_id FROM {rs}.graph_branches").format(rs=rs)
+            )
             rows = cur.fetchall()
             return sorted([r[0] for r in rows if r[0]])
 
     def delete_project(self, project_id: str) -> bool:
         conn = self.get_conn()
+        rs = self._root_schema_sql()
         branches = self.list_branches(project_id)
         for b in branches:
             if not b.get("is_root"):
                 self.delete_branch(project_id, b["branch_name"])
 
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM pb_root.nodes WHERE project_id = %s", (project_id,))
-            cur.execute("DELETE FROM pb_root.edges WHERE project_id = %s", (project_id,))
-            cur.execute("DELETE FROM pb_root.hyperedges WHERE project_id = %s", (project_id,))
-            cur.execute("DELETE FROM pb_root.graph_branches WHERE project_id = %s", (project_id,))
+            cur.execute(psql.SQL("DELETE FROM {rs}.nodes WHERE project_id = %s").format(rs=rs), (project_id,))
+            cur.execute(psql.SQL("DELETE FROM {rs}.edges WHERE project_id = %s").format(rs=rs), (project_id,))
+            cur.execute(psql.SQL("DELETE FROM {rs}.hyperedges WHERE project_id = %s").format(rs=rs), (project_id,))
+            cur.execute(psql.SQL("DELETE FROM {rs}.graph_branches WHERE project_id = %s").format(rs=rs), (project_id,))
         return True
 
     def delete_branch(self, project_id: str, branch_name: str) -> bool:
@@ -3980,18 +4363,20 @@ class PostgresSchemaGraphStore(GraphStore):
             return False
         schema_name = self._branch_schema_name(project_id, branch_name)
         schema_id = psql.Identifier(schema_name)
+        rs = self._root_schema_sql()
         conn = self.get_conn()
         with conn.cursor() as cur:
             cur.execute(psql.SQL("DROP SCHEMA IF EXISTS {schema} CASCADE;").format(schema=schema_id))
-            cur.execute("DELETE FROM pb_root.graph_branches WHERE project_id = %s AND branch_name = %s", (project_id, branch_name))
+            cur.execute(psql.SQL("DELETE FROM {rs}.graph_branches WHERE project_id = %s AND branch_name = %s").format(rs=rs), (project_id, branch_name))
         return True
 
     def list_branches(self, project_id: str) -> List[Dict[str, Any]]:
         conn = self.get_conn()
+        rs = self._root_schema_sql()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM pb_root.graph_branches WHERE project_id = %s ORDER BY branch_name", (project_id,))
+            cur.execute(psql.SQL("SELECT * FROM {rs}.graph_branches WHERE project_id = %s ORDER BY branch_name").format(rs=rs), (project_id,))
             rows = cur.fetchall()
-            branches = [{"branch_name": self.root_branch, "schema_name": "pb_root", "is_root": True}]
+            branches = [{"branch_name": self.root_branch, "schema_name": self.root_schema, "is_root": True}]
             for r in rows:
                 if r["branch_name"] != self.root_branch:
                     branches.append({
@@ -4025,11 +4410,11 @@ class PostgresSchemaGraphStore(GraphStore):
 
 
 class MultiProjectGraphStore(GraphStore):
-    """Routes each project_id to its dedicated physical Project DB via tenant_manager.
+    """Routes each (project_id, source_id) to its dedicated physical Project DB & source schema via tenant_manager.
 
-    - PostgreSQL: dedicated DB `pb_proj_*` with `pb_root` and `pb_br_*` schemas.
-    - SQLite: dedicated file `<master_dir>/pb_projects/pb_proj_*/graph.sqlite`.
-    Keeps `master_projects` and `master_branches` in Master DB synchronized.
+    - PostgreSQL: dedicated DB `pb_proj_*` with `pb_root` / `pb_br_*` for default/shared and `pb_src_*` for sub-sources.
+    - SQLite: dedicated `<master_dir>/pb_projects/pb_proj_*/graph.sqlite` for default/shared and `sources/{src_slug}_{h6}/graph.sqlite` for sub-sources.
+    Keeps `master_projects`, `master_branches`, `master_project_sources`, and `master_source_branches` in Master DB synchronized.
     """
 
     def __init__(
@@ -4037,12 +4422,18 @@ class MultiProjectGraphStore(GraphStore):
         master_db_path: Optional[str] = None,
         connection_url: Optional[str] = None,
         root_branch: str = "main",
+        default_source_id: Optional[str] = None,
     ):
-        super().__init__(root_branch=root_branch, project_scoped_schemas=True)
+        super().__init__(
+            root_branch=root_branch,
+            project_scoped_schemas=True,
+            source_id=default_source_id,
+        )
         self.master_db_path = master_db_path
         self.connection_url = connection_url
-        self._stores: Dict[str, GraphStore] = {}
-        self._store_targets: Dict[str, Tuple[bool, str, str]] = {}
+        self._default_source_id: Optional[str] = _normalize_graph_source_id(default_source_id)
+        self._stores: Dict[Tuple[str, str], GraphStore] = {}
+        self._store_targets: Dict[Tuple[str, str], Tuple[bool, str, str, str, str]] = {}
         self._lock = threading.RLock()
 
     def _ensure_master_binding(self) -> None:
@@ -4055,24 +4446,62 @@ class MultiProjectGraphStore(GraphStore):
         tenant_manager.ensure_master_catalog()
 
     def _normalize_project_id(self, project_id: str) -> str:
-        from ..core.tenant_manager import parse_tenant_from_user_id
+        from ..core.tenant_manager import parse_tenant_spec
 
-        return parse_tenant_from_user_id(project_id, default_branch=self.root_branch)[0]
+        return parse_tenant_spec(project_id, default_branch=self.root_branch)[0]
 
-    def _get_project_store(self, project_id: str) -> Tuple[GraphStore, Dict[str, Any]]:
+    def _parse_project_and_source(
+        self, project_id: str, source_id: Optional[str] = None
+    ) -> Tuple[str, str, Optional[str]]:
+        from ..core.tenant_manager import get_current_source, parse_tenant_spec
+
+        explicit_src = _normalize_graph_source_id(source_id)
+        fallback_src = (
+            explicit_src
+            if source_id is not None
+            else (
+                _normalize_graph_source_id(get_current_source())
+                or self._default_source_id
+            )
+        )
+        proj, parsed_src, _ = parse_tenant_spec(
+            project_id,
+            default_branch=self.root_branch,
+            default_source=fallback_src,
+        )
+        if explicit_src is not None and "@" not in str(project_id or ""):
+            parsed_src = explicit_src
+        eff_src = _normalize_graph_source_id(parsed_src) or "__default__"
+        return proj, eff_src, parsed_src
+
+    def _resolve_store_for_project(
+        self, project_id: str, source_id: Optional[str] = None
+    ) -> Tuple[GraphStore, Dict[str, Any]]:
         from ..core.tenant_manager import tenant_manager
 
         with self._lock:
             self._ensure_master_binding()
-            proj = self._normalize_project_id(project_id)
-            target = tenant_manager.get_project_graph_target(proj)
+            proj, eff_src, parsed_src = self._parse_project_and_source(
+                project_id, source_id=source_id
+            )
+            tenant_manager.ensure_project_database(proj)
+            target = tenant_manager.get_project_graph_target(proj, source_id=parsed_src)
+            delegate_root = self.root_branch
+            if _is_child_subsource(eff_src):
+                src_rec = tenant_manager.get_project_source(proj, eff_src)
+                if src_rec and src_rec.get("root_branch"):
+                    delegate_root = str(src_rec["root_branch"]).strip() or self.root_branch
+            root_schema = str(target.get("root_schema") or "pb_root")
             target_key = (
                 bool(target["is_postgres"]),
                 str(target.get("dsn") or target.get("sqlite_path") or ":memory:"),
                 str(target["db_name"]),
+                root_schema,
+                delegate_root,
             )
-            cached = self._stores.get(proj)
-            if cached is not None and self._store_targets.get(proj) == target_key:
+            cache_key = (proj, eff_src)
+            cached = self._stores.get(cache_key)
+            if cached is not None and self._store_targets.get(cache_key) == target_key:
                 return cached, target
             if cached is not None:
                 try:
@@ -4082,18 +4511,27 @@ class MultiProjectGraphStore(GraphStore):
             if target["is_postgres"]:
                 delegate: GraphStore = PostgresSchemaGraphStore(
                     connection_url=target["dsn"],
-                    root_branch=self.root_branch,
+                    root_branch=delegate_root,
                     project_scoped_schemas=True,
+                    source_id=eff_src,
+                    root_schema=root_schema,
                 )
             else:
                 delegate = SqliteOverlayGraphStore(
                     db_path=target["sqlite_path"] or ":memory:",
-                    root_branch=self.root_branch,
+                    root_branch=delegate_root,
                     project_scoped_schemas=True,
+                    source_id=eff_src,
+                    root_schema=root_schema,
                 )
-            self._stores[proj] = delegate
-            self._store_targets[proj] = target_key
+            self._stores[cache_key] = delegate
+            self._store_targets[cache_key] = target_key
             return delegate, target
+
+    def _get_project_store(
+        self, project_id: str, source_id: Optional[str] = None
+    ) -> Tuple[GraphStore, Dict[str, Any]]:
+        return self._resolve_store_for_project(project_id, source_id=source_id)
 
     def close(self) -> None:
         with self._lock:
@@ -4112,10 +4550,14 @@ class MultiProjectGraphStore(GraphStore):
                 st.ensure_root_schema()
 
     def get_branch_lineage(
-        self, project_id: str, branch_name: str, max_depth: int = 8
+        self,
+        project_id: str,
+        branch_name: str,
+        max_depth: int = 8,
+        source_id: Optional[str] = None,
     ) -> List[str]:
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
+        proj, _, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, _ = self._resolve_store_for_project(project_id, source_id=source_id)
         return delegate.get_branch_lineage(proj, branch_name, max_depth=max_depth)
 
     def ensure_branch_schema(
@@ -4124,17 +4566,49 @@ class MultiProjectGraphStore(GraphStore):
         branch_name: str,
         author: str = "system",
         base_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
     ) -> str:
         from ..core.tenant_manager import tenant_manager
 
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
-        if self.is_root_branch(branch_name):
+        with self._lock:
+            self._ensure_master_binding()
+            proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+            tenant_manager.ensure_project_database(proj)
+            if _is_child_subsource(eff_src) and tenant_manager.get_project_source(proj, eff_src) is None:
+                tenant_manager.register_project_source(
+                    proj, eff_src, root_branch=self.root_branch
+                )
+            delegate, _ = self._resolve_store_for_project(proj, source_id=eff_src)
+
+        if _is_child_subsource(eff_src):
+            if delegate.is_root_branch(branch_name):
+                delegate.ensure_root_schema()
+                eff_base = delegate.root_branch
+            else:
+                delegate.ensure_branch_schema(
+                    proj, branch_name, author=author, base_branch=base_branch
+                )
+                if base_branch and base_branch.strip() and base_branch.strip() != branch_name.strip():
+                    eff_base = base_branch.strip()
+                else:
+                    lineage = delegate.get_branch_lineage(proj, branch_name)
+                    eff_base = lineage[-2] if len(lineage) >= 2 else delegate.root_branch
+            info = tenant_manager.ensure_source_branch_schema(
+                proj,
+                eff_src,
+                branch_name,
+                base_branch=eff_base,
+                author=author or "system",
+                has_graph=True,
+            )
+            return str(info["schema_name"])
+
+        if delegate.is_root_branch(branch_name):
             delegate.ensure_root_schema()
             info = tenant_manager.ensure_branch_schema(
                 proj,
-                self.root_branch,
-                base_branch=self.root_branch,
+                delegate.root_branch,
+                base_branch=delegate.root_branch,
                 author=author or "system",
                 has_graph=True,
                 record_lineage=False,
@@ -4150,7 +4624,7 @@ class MultiProjectGraphStore(GraphStore):
         tenant_manager.ensure_branch_schema(
             proj,
             branch_name,
-            base_branch=base_branch or self.root_branch,
+            base_branch=base_branch or delegate.root_branch,
             author=author or "system",
             has_graph=True,
             record_lineage=has_explicit_base,
@@ -4168,11 +4642,22 @@ class MultiProjectGraphStore(GraphStore):
         deleted_files: Optional[List[str]] = None,
         author: str = "system",
         base_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
+        upgrade_mode: str = "delta",
     ) -> Dict[str, Any]:
         from ..core.tenant_manager import tenant_manager
 
-        proj = self._normalize_project_id(project_id)
-        delegate, target = self._get_project_store(proj)
+        eff_upgrade_mode = (upgrade_mode or "delta").strip().lower() or "delta"
+        with self._lock:
+            self._ensure_master_binding()
+            proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+            tenant_manager.ensure_project_database(proj)
+            if _is_child_subsource(eff_src) and tenant_manager.get_project_source(proj, eff_src) is None:
+                tenant_manager.register_project_source(
+                    proj, eff_src, root_branch=self.root_branch
+                )
+            delegate, target = self._resolve_store_for_project(proj, source_id=eff_src)
+
         res = delegate.sync_branch_delta(
             proj,
             branch_name,
@@ -4182,24 +4667,45 @@ class MultiProjectGraphStore(GraphStore):
             deleted_files=deleted_files,
             author=author,
             base_branch=base_branch,
+            source_id=eff_src,
+            upgrade_mode=eff_upgrade_mode,
         )
-        has_explicit_base = bool(
-            base_branch and base_branch.strip() and base_branch.strip() != branch_name.strip()
-        )
-        branch_info = tenant_manager.ensure_branch_schema(
-            proj,
-            branch_name,
-            base_branch=base_branch or self.root_branch,
-            author=author or "system",
-            has_graph=True,
-            record_lineage=has_explicit_base,
-            preserve_existing_base=not has_explicit_base,
-        )
-        res["db_name"] = target["db_name"]
-        if self.is_root_branch(branch_name):
+        if _is_child_subsource(eff_src):
+            if base_branch and base_branch.strip() and base_branch.strip() != branch_name.strip():
+                eff_base = base_branch.strip()
+            else:
+                lineage = delegate.get_branch_lineage(proj, branch_name)
+                eff_base = lineage[-2] if len(lineage) >= 2 else delegate.root_branch
+            branch_info = tenant_manager.ensure_source_branch_schema(
+                proj,
+                eff_src,
+                branch_name,
+                base_branch=eff_base,
+                author=author or "system",
+                has_graph=True,
+            )
             res["schema_name"] = branch_info["schema_name"]
         else:
-            res.setdefault("schema_name", branch_info["schema_name"])
+            has_explicit_base = bool(
+                base_branch and base_branch.strip() and base_branch.strip() != branch_name.strip()
+            )
+            branch_info = tenant_manager.ensure_branch_schema(
+                proj,
+                branch_name,
+                base_branch=base_branch or delegate.root_branch,
+                author=author or "system",
+                has_graph=True,
+                record_lineage=has_explicit_base,
+                preserve_existing_base=not has_explicit_base,
+            )
+            if delegate.is_root_branch(branch_name):
+                res["schema_name"] = branch_info["schema_name"]
+            else:
+                res.setdefault("schema_name", branch_info["schema_name"])
+        res["db_name"] = target["db_name"]
+        res["source_id"] = eff_src
+        res["scope"] = _resolve_graph_scope(eff_src)
+        res["upgrade_mode"] = eff_upgrade_mode
         return res
 
     sync_delta = sync_branch_delta
@@ -4210,9 +4716,10 @@ class MultiProjectGraphStore(GraphStore):
         branch_name: str,
         file_filter: Optional[str] = None,
         community: Optional[int] = None,
+        source_id: Optional[str] = None,
     ) -> BranchDiffResult:
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, _ = self._resolve_store_for_project(proj, source_id=eff_src)
         return delegate.diff_branch_vs_root(
             proj, branch_name, file_filter=file_filter, community=community
         )
@@ -4224,9 +4731,10 @@ class MultiProjectGraphStore(GraphStore):
         target_branch: str,
         file_filter: Optional[str] = None,
         community: Optional[int] = None,
+        source_id: Optional[str] = None,
     ) -> BranchDiffResult:
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, _ = self._resolve_store_for_project(proj, source_id=eff_src)
         return delegate.diff_branches(
             proj, base_branch, target_branch, file_filter=file_filter, community=community
         )
@@ -4236,35 +4744,57 @@ class MultiProjectGraphStore(GraphStore):
         project_id: str,
         branch_name: str,
         target_branch: Optional[str] = None,
+        source_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         from ..core.tenant_manager import tenant_manager
 
-        proj = self._normalize_project_id(project_id)
-        delegate, target = self._get_project_store(proj)
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, target = self._resolve_store_for_project(proj, source_id=eff_src)
         res = delegate.promote_branch_to_root(
             proj, branch_name, target_branch=target_branch
         )
-        if res.get("status") == "promoted" and not self.is_root_branch(branch_name):
-            effective_target = str(res.get("target_branch") or self.root_branch)
-            tenant_manager.ensure_branch_schema(
-                proj,
-                effective_target,
-                base_branch=self.root_branch,
-                has_graph=True,
-                record_lineage=False,
-                preserve_existing_base=True,
-            )
-            now_ms = int(time.time() * 1000)
-            tenant_manager._master_execute(
-                "UPDATE master_branches SET base_branch = ?, updated_at = ? "
-                "WHERE project_id = ? AND base_branch = ? AND branch_name != ?",
-                (effective_target, now_ms, proj, branch_name, effective_target),
-            )
-            try:
-                tenant_manager.drop_branch_schema(proj, branch_name)
-            except Exception as exc:
-                logger.debug("Master branch drop warning on promote %s:%s (%s)", proj, branch_name, exc)
+        if res.get("status") == "promoted" and not delegate.is_root_branch(branch_name):
+            effective_target = str(res.get("target_branch") or delegate.root_branch)
+            if _is_child_subsource(eff_src):
+                tenant_manager.ensure_source_branch_schema(
+                    proj,
+                    eff_src,
+                    effective_target,
+                    base_branch=delegate.root_branch,
+                    has_graph=True,
+                )
+                now_ms = int(time.time() * 1000)
+                tenant_manager._master_execute(
+                    "UPDATE master_source_branches SET base_branch = ?, updated_at = ? "
+                    "WHERE project_id = ? AND source_id = ? AND base_branch = ? AND branch_name != ?",
+                    (effective_target, now_ms, proj, eff_src, branch_name, effective_target),
+                )
+                tenant_manager._master_execute(
+                    "DELETE FROM master_source_branches "
+                    "WHERE project_id = ? AND source_id = ? AND branch_name = ?",
+                    (proj, eff_src, branch_name),
+                )
+            else:
+                tenant_manager.ensure_branch_schema(
+                    proj,
+                    effective_target,
+                    base_branch=delegate.root_branch,
+                    has_graph=True,
+                    record_lineage=False,
+                    preserve_existing_base=True,
+                )
+                now_ms = int(time.time() * 1000)
+                tenant_manager._master_execute(
+                    "UPDATE master_branches SET base_branch = ?, updated_at = ? "
+                    "WHERE project_id = ? AND base_branch = ? AND branch_name != ?",
+                    (effective_target, now_ms, proj, branch_name, effective_target),
+                )
+                try:
+                    tenant_manager.drop_branch_schema(proj, branch_name)
+                except Exception as exc:
+                    logger.debug("Master branch drop warning on promote %s:%s (%s)", proj, branch_name, exc)
         res["db_name"] = target["db_name"]
+        res["source_id"] = eff_src
         return res
 
     def get_resolved_subgraph(
@@ -4273,16 +4803,25 @@ class MultiProjectGraphStore(GraphStore):
         branch_name: str,
         files: Optional[List[str]] = None,
         limit: int = 1000,
+        source_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
-        return delegate.get_resolved_subgraph(proj, branch_name, files=files, limit=limit)
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, _ = self._resolve_store_for_project(proj, source_id=eff_src)
+        sub = delegate.get_resolved_subgraph(proj, branch_name, files=files, limit=limit)
+        sub["source_id"] = eff_src
+        return sub
 
-    def get_stats(self, project_id: str, branch_name: str = "main") -> Dict[str, Any]:
-        proj = self._normalize_project_id(project_id)
-        delegate, target = self._get_project_store(proj)
+    def get_stats(
+        self,
+        project_id: str,
+        branch_name: str = "main",
+        source_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, target = self._resolve_store_for_project(proj, source_id=eff_src)
         stats = delegate.get_stats(proj, branch_name)
         stats["db_name"] = target["db_name"]
+        stats["source_id"] = eff_src
         return stats
 
     def list_projects(self) -> List[str]:
@@ -4294,7 +4833,7 @@ class MultiProjectGraphStore(GraphStore):
                 "SELECT project_id FROM master_projects WHERE status = 'active' ORDER BY project_id ASC"
             )
             projs = {str(r["project_id"]) for r in rows if r.get("project_id")}
-            projs |= set(self._stores.keys())
+            projs |= {k[0] for k in self._stores.keys()}
             return sorted(projs)
 
     def delete_project(self, project_id: str) -> bool:
@@ -4303,53 +4842,112 @@ class MultiProjectGraphStore(GraphStore):
         proj = self._normalize_project_id(project_id)
         with self._lock:
             self._ensure_master_binding()
-            cached = self._stores.pop(proj, None)
-            self._store_targets.pop(proj, None)
-            if cached is not None:
-                try:
-                    cached.delete_project(proj)
-                finally:
-                    cached.close()
+            matching_keys = [k for k in self._stores.keys() if k[0] == proj]
+            for key in matching_keys:
+                cached = self._stores.pop(key, None)
+                self._store_targets.pop(key, None)
+                if cached is not None:
+                    try:
+                        cached.delete_project(proj)
+                    finally:
+                        cached.close()
         tenant_manager.drop_project_database(proj)
         return True
 
-    def delete_branch(self, project_id: str, branch_name: str) -> bool:
+    def drop_source_graph(self, project_id: str, source_id: str) -> Dict[str, Any]:
+        """Close & evict cached store for `(project_id, source_id)` and drop sub-source storage."""
         from ..core.tenant_manager import tenant_manager
 
-        if self.is_root_branch(branch_name):
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        if not _is_child_subsource(eff_src):
+            raise ValueError(
+                "Cannot drop canonical root/shared scope; provide an explicit sub-source id"
+            )
+        cache_key = (proj, eff_src)
+        with self._lock:
+            self._ensure_master_binding()
+            cached = self._stores.pop(cache_key, None)
+            self._store_targets.pop(cache_key, None)
+            if cached is not None:
+                try:
+                    cached.close()
+                except Exception:
+                    pass
+        return tenant_manager.drop_project_source(proj, eff_src)
+
+    def delete_branch(
+        self,
+        project_id: str,
+        branch_name: str,
+        source_id: Optional[str] = None,
+    ) -> bool:
+        from ..core.tenant_manager import sanitize_source_schema_name, tenant_manager
+
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, target = self._resolve_store_for_project(proj, source_id=eff_src)
+        if delegate.is_root_branch(branch_name):
             return False
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
         ok = delegate.delete_branch(proj, branch_name)
+        if _is_child_subsource(eff_src):
+            try:
+                schema_name = sanitize_source_schema_name(
+                    eff_src, branch_name, delegate.root_branch
+                )
+                db_name = str(target["db_name"])
+                for cache_dict in (tenant_manager._sqlite_conns, tenant_manager._pg_conns):
+                    conn = cache_dict.pop((db_name, schema_name), None)
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                tenant_manager._provisioned_branches.discard((proj, schema_name))
+                tenant_manager._master_execute(
+                    "DELETE FROM master_source_branches WHERE project_id = ? AND source_id = ? AND branch_name = ?",
+                    (proj, eff_src, branch_name),
+                )
+            except Exception as exc:
+                logger.debug("Source branch cleanup warning on delete %s@%s:%s (%s)", proj, eff_src, branch_name, exc)
+            return ok
         try:
             tenant_manager.drop_branch_schema(proj, branch_name)
         except Exception as exc:
             logger.debug("Master branch drop warning on delete %s:%s (%s)", proj, branch_name, exc)
         return ok
 
-    def list_branches(self, project_id: str) -> List[Dict[str, Any]]:
+    def list_branches(
+        self, project_id: str, source_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         from ..core.tenant_manager import tenant_manager
 
-        proj = self._normalize_project_id(project_id)
-        delegate, target = self._get_project_store(proj)
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, target = self._resolve_store_for_project(proj, source_id=eff_src)
         branches = delegate.list_branches(proj)
-        mb_rows = tenant_manager._master_fetchall(
-            "SELECT * FROM master_branches WHERE project_id = ? ORDER BY is_root DESC, created_at ASC",
-            (proj,),
-        )
+        if _is_child_subsource(eff_src):
+            mb_rows = tenant_manager._master_fetchall(
+                "SELECT * FROM master_source_branches WHERE project_id = ? AND source_id = ? "
+                "ORDER BY is_root DESC, created_at ASC",
+                (proj, eff_src),
+            )
+        else:
+            mb_rows = tenant_manager._master_fetchall(
+                "SELECT * FROM master_branches WHERE project_id = ? ORDER BY is_root DESC, created_at ASC",
+                (proj,),
+            )
         mb_map = {str(r["branch_name"]): r for r in mb_rows if r.get("branch_name")}
         seen: Set[str] = set()
         for b in branches:
             bname = str(b.get("branch_name") or "")
             seen.add(bname)
             b["db_name"] = target["db_name"]
+            b["source_id"] = eff_src
             if bname in mb_map:
                 mb = mb_map[bname]
                 b.setdefault("base_branch", mb.get("base_branch"))
                 b["has_graph_schema"] = bool(mb.get("has_graph_schema", 1))
                 b["has_doc_schema"] = bool(mb.get("has_doc_schema", 1))
                 if b.get("is_root"):
-                    b["schema_name"] = mb.get("schema_name") or "pb_root"
+                    b["schema_name"] = mb.get("schema_name") or target.get("root_schema") or "pb_root"
         for bname, mb in mb_map.items():
             if bname not in seen:
                 branches.append(
@@ -4362,6 +4960,7 @@ class MultiProjectGraphStore(GraphStore):
                         "has_graph_schema": bool(mb.get("has_graph_schema", 1)),
                         "has_doc_schema": bool(mb.get("has_doc_schema", 1)),
                         "db_name": target["db_name"],
+                        "source_id": eff_src,
                     }
                 )
         return branches
@@ -4373,30 +4972,42 @@ class MultiProjectGraphStore(GraphStore):
         query: Optional[str] = None,
         kinds: Optional[str] = None,
         limit: int = 500,
+        source_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, _ = self._resolve_store_for_project(proj, source_id=eff_src)
         return delegate.to_legacy_visjs(
             proj, branch_name=branch_name, query=query, kinds=kinds, limit=limit
         )
 
-    def _get_branch_overlay(self, project_id: str, branch_name: str) -> Dict[str, Any]:
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
+    def _get_branch_overlay(
+        self,
+        project_id: str,
+        branch_name: str,
+        source_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, _ = self._resolve_store_for_project(proj, source_id=eff_src)
         return delegate._get_branch_overlay(proj, branch_name)
 
     def _get_root_nodes_by_ids(
-        self, project_id: str, node_ids: List[str]
+        self,
+        project_id: str,
+        node_ids: List[str],
+        source_id: Optional[str] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, _ = self._resolve_store_for_project(proj, source_id=eff_src)
         return delegate._get_root_nodes_by_ids(proj, node_ids)
 
     def _get_root_edges_by_keys(
-        self, project_id: str, edge_keys: List[Tuple[str, str, str]]
+        self,
+        project_id: str,
+        edge_keys: List[Tuple[str, str, str]],
+        source_id: Optional[str] = None,
     ) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-        proj = self._normalize_project_id(project_id)
-        delegate, _ = self._get_project_store(proj)
+        proj, eff_src, _ = self._parse_project_and_source(project_id, source_id=source_id)
+        delegate, _ = self._resolve_store_for_project(proj, source_id=eff_src)
         return delegate._get_root_edges_by_keys(proj, edge_keys)
 
 
@@ -4464,9 +5075,10 @@ def get_graph_store(
     root_branch: Optional[str] = None,
     project_id: Optional[str] = None,
     registry: Optional[Any] = None,
+    source_id: Optional[str] = None,
 ) -> GraphStore:
     """Factory creating configured GraphStore instance based on environment, PluginRegistry, or parameters."""
-    from ..core.tenant_manager import is_multi_db_enabled
+    from ..core.tenant_manager import is_multi_db_enabled, parse_tenant_spec
 
     caller_root_branch = root_branch
     if root_branch is None:
@@ -4478,6 +5090,17 @@ def get_graph_store(
             except Exception:
                 resolved_root = None
         root_branch = resolved_root or "main"
+
+    base_project_id: Optional[str] = None
+    parsed_source: Optional[str] = _normalize_graph_source_id(source_id)
+    if project_id is not None:
+        base_project_id, parsed_src_from_spec, _ = parse_tenant_spec(
+            project_id,
+            default_branch=root_branch,
+            default_source=parsed_source,
+        )
+        if parsed_source is None or "@" in str(project_id):
+            parsed_source = _normalize_graph_source_id(parsed_src_from_spec)
 
     caller_db_path = db_path
     caller_connection_url = connection_url
@@ -4514,7 +5137,7 @@ def get_graph_store(
 
     should_consult_registry = (
         registry is not None
-        or project_id is not None
+        or base_project_id is not None
         or has_active_default_reg
         or bool(env_graph_backend)
         or (
@@ -4538,17 +5161,17 @@ def get_graph_store(
                 preferred_id = _map_graph_backend_to_plugin_id(env_graph_backend)
             elif backend_val in ("postgres", "postgresql"):
                 has_project_override = False
-                if project_id and hasattr(active_reg, "_project_overrides"):
-                    has_project_override = bool(active_reg._project_overrides.get(project_id))
+                if base_project_id and hasattr(active_reg, "_project_overrides"):
+                    has_project_override = bool(active_reg._project_overrides.get(base_project_id))
                 if not has_project_override:
-                    top_candidates = active_reg.resolve_all("graph_backend", project_id=project_id)
+                    top_candidates = active_reg.resolve_all("graph_backend", project_id=base_project_id)
                     if not top_candidates or top_candidates[0].metadata.plugin_id == "graph.sqlite_overlay":
                         preferred_id = "graph.postgres_schema"
 
             plugin = active_reg.resolve(
                 "graph_backend",
                 preferred_id=preferred_id,
-                project_id=project_id,
+                project_id=base_project_id,
             )
 
             if preferred_id and preferred_id not in ("graph.sqlite_overlay", "graph.postgres_schema"):
@@ -4567,7 +5190,7 @@ def get_graph_store(
                     store_cfg.update(
                         active_reg.get_effective_config(
                             plugin.metadata.plugin_id,
-                            project_id=project_id,
+                            project_id=base_project_id,
                         )
                     )
                 if caller_db_path is not None:
@@ -4581,7 +5204,11 @@ def get_graph_store(
                 else:
                     store_cfg.setdefault("root_branch", root_branch)
 
-                return plugin.create_store(store_cfg)
+                created_store = plugin.create_store(store_cfg)
+                if not is_non_default_plugin and parsed_source is not None:
+                    created_store.source_id = parsed_source
+                    created_store.default_scope = _resolve_graph_scope(parsed_source)
+                return created_store
         except LookupError:
             if explicit_backend and explicit_backend.lower() not in ("sqlite", "postgres", "postgresql"):
                 raise
@@ -4593,15 +5220,18 @@ def get_graph_store(
             master_db_path=caller_db_path or db_path,
             connection_url=caller_connection_url,
             root_branch=root_branch,
+            default_source_id=parsed_source,
         )
 
     if backend_val in ("postgres", "postgresql"):
         return PostgresSchemaGraphStore(
             connection_url=connection_url,
             root_branch=root_branch,
+            source_id=parsed_source,
         )
     else:
         return SqliteOverlayGraphStore(
             db_path=db_path,
             root_branch=root_branch,
+            source_id=parsed_source,
         )

@@ -17,6 +17,7 @@ from projectbrain.server.routes import auth as auth_routes
 CANONICAL_APP_ROUTES = [
     "/app/overview",
     "/app/workspace/projects",
+    "/app/workspace/sources",
     "/app/workspace/memories",
     "/app/workspace/search?project=chien334/Project-Brain&branch=main&q=tenant",
     "/app/graph/explorer?project=chien334/Project-Brain&symbol=ProjectDatabaseManager",

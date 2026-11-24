@@ -13,6 +13,7 @@ shortest path tracing, blast-radius impact analysis, god node identification).
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -371,6 +372,7 @@ class HybridResolver:
         branch: str = "main",
         files: Optional[List[str]] = None,
         limit: int = 10000,
+        source_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Fetch server resolved subgraph either via HTTP or in-process GraphStore.
@@ -385,6 +387,8 @@ class HybridResolver:
             }
             if files:
                 params["files"] = ",".join(files)
+            if source_id is not None:
+                params["source_id"] = source_id
 
             headers: Dict[str, str] = {}
             if self.api_token:
@@ -396,9 +400,45 @@ class HybridResolver:
                 return resp.json()
 
         elif self.store is not None:
-            if hasattr(self.store, "get_resolved_subgraph"):
+            fn = getattr(self.store, "get_resolved_subgraph", None)
+            if fn is not None:
                 try:
-                    return self.store.get_resolved_subgraph(
+                    sig = inspect.signature(fn)
+                    params_map = sig.parameters
+                    accepts_var_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in params_map.values()
+                    )
+                    call_kwargs: Dict[str, Any] = {}
+                    if "project_id" in params_map or accepts_var_kw:
+                        call_kwargs["project_id"] = project_id
+                    if "branch_name" in params_map:
+                        call_kwargs["branch_name"] = branch
+                    elif "branch" in params_map or accepts_var_kw:
+                        call_kwargs["branch"] = branch
+                    if files is not None and ("files" in params_map or accepts_var_kw):
+                        call_kwargs["files"] = files
+                    elif "files" in params_map:
+                        call_kwargs["files"] = files
+                    if "limit" in params_map or accepts_var_kw:
+                        call_kwargs["limit"] = limit
+                    if source_id is not None and ("source_id" in params_map or accepts_var_kw):
+                        call_kwargs["source_id"] = source_id
+                    if call_kwargs:
+                        return fn(**call_kwargs)
+                except (ValueError, TypeError):
+                    pass
+
+                try:
+                    if source_id is not None:
+                        return fn(
+                            project_id=project_id,
+                            branch_name=branch,
+                            files=files,
+                            limit=limit,
+                            source_id=source_id,
+                        )
+                    return fn(
                         project_id=project_id,
                         branch_name=branch,
                         files=files,
@@ -406,22 +446,533 @@ class HybridResolver:
                     )
                 except TypeError:
                     try:
-                        return self.store.get_resolved_subgraph(
+                        return fn(
                             project_id=project_id,
                             branch=branch,
                             files=files,
                             limit=limit,
                         )
                     except TypeError:
-                        return self.store.get_resolved_subgraph(
-                            project_id,
-                            branch,
-                            files,
-                            limit,
-                        )
+                        return fn(project_id, branch, files, limit)
             return {"nodes": [], "edges": [], "hyperedges": []}
         else:
             return {"nodes": [], "edges": [], "hyperedges": []}
+
+    @staticmethod
+    def _parse_project_source_spec(
+        project_id: str,
+        branch: str = "main",
+        source_id: Optional[str] = None,
+    ) -> Tuple[str, str, Optional[str]]:
+        """Parse `proj@source:branch` specs cleanly with optional overrides."""
+        try:
+            from projectbrain.core.tenant_manager import parse_tenant_spec, get_current_source
+            proj, parsed_src, parsed_br = parse_tenant_spec(project_id, default_branch=branch)
+            raw_src = source_id if source_id is not None else (parsed_src or get_current_source())
+            eff_src = str(raw_src).strip() if raw_src is not None else None
+            if eff_src in ("", "__default__"):
+                eff_src = None
+            eff_br = (parsed_br or branch or "main").strip() or "main"
+            return proj, eff_br, eff_src
+        except Exception:
+            clean_proj = str(project_id or "default").strip() or "default"
+            clean_src = str(source_id).strip() if source_id is not None else None
+            if clean_src in ("", "__default__"):
+                clean_src = None
+            return clean_proj, (branch or "main"), clean_src
+
+    def _can_fetch_source_branch(
+        self,
+        base_proj: str,
+        branch: str,
+        target_source_id: str,
+    ) -> bool:
+        """Return True when secondary source/shared subgraph can be queried without provisioning phantoms."""
+        if self.remote_url:
+            return True
+        if self.store is None:
+            return False
+        fn = getattr(self.store, "get_resolved_subgraph", None)
+        if fn is None:
+            return False
+        try:
+            sig = inspect.signature(fn)
+            accepts_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            if "source_id" not in sig.parameters and not accepts_kw:
+                return False
+        except Exception:
+            return False
+
+        # MultiProjectGraphStore auto-provisions SQLite files unless we check has_branch first.
+        if hasattr(self.store, "_resolve_store_for_project"):
+            try:
+                from projectbrain.core.tenant_manager import tenant_manager
+                return bool(
+                    tenant_manager.has_branch(
+                        base_proj,
+                        branch,
+                        source_id=None if target_source_id == "__shared__" else target_source_id,
+                    )
+                )
+            except Exception:
+                return False
+        return True
+
+    @staticmethod
+    def _map_cross_source_confidence(raw_conf: Any, conf_score: float) -> str:
+        up = str(raw_conf or "").strip().upper()
+        if up in ("EXTRACTED", "INFERRED", "AMBIGUOUS"):
+            return up
+        if up in ("HIGH", "MANUAL", "PINNED", "EXACT"):
+            return "EXTRACTED"
+        if up in ("MEDIUM", "AUTO", "HEURISTIC"):
+            return "INFERRED"
+        if conf_score >= 0.8:
+            return "EXTRACTED"
+        if conf_score >= 0.5:
+            return "INFERRED"
+        return "AMBIGUOUS"
+
+    @staticmethod
+    def _match_relation_endpoint_nodes(
+        g: nx.DiGraph,
+        source_node_map: Dict[Tuple[str, str], str],
+        target_source: str,
+        explicit_node_id: Optional[str],
+        file_or_doc_hint: Optional[str],
+        contract_key: Optional[str],
+        *,
+        allow_fallback_anchor: bool = True,
+        root_branch: str = "main",
+    ) -> List[str]:
+        norm_target = str(target_source or "__default__").strip() or "__default__"
+        exp_id = str(explicit_node_id or "").strip()
+
+        if exp_id:
+            mapped = source_node_map.get((norm_target, exp_id))
+            if mapped and g.has_node(mapped):
+                return [mapped]
+            if norm_target == "__default__" and g.has_node(exp_id):
+                return [exp_id]
+
+        def _node_belongs_to_target(ndata: Dict[str, Any]) -> bool:
+            nsrc = str(ndata.get("source_id") or "").strip()
+            if norm_target == "__default__":
+                return nsrc in ("", "__default__")
+            return nsrc == norm_target
+
+        hint = _normalize_path(file_or_doc_hint).lower() if file_or_doc_hint else ""
+        hint_base = os.path.basename(hint) if hint else ""
+        ck_raw = str(contract_key or "").strip().lower()
+        ck_tokens = [
+            tok for tok in ck_raw.replace("/", " ").replace("_", " ").replace("-", " ").replace(":", " ").replace(".", " ").split()
+            if len(tok) >= 2
+        ]
+
+        scored: List[Tuple[float, str]] = []
+        target_candidates: List[str] = []
+        for nid, ndata in g.nodes(data=True):
+            if not _node_belongs_to_target(ndata):
+                continue
+            target_candidates.append(nid)
+            score = 0.0
+            src_file = _normalize_path(ndata.get("source_file")).lower()
+            src_base = os.path.basename(src_file) if src_file else ""
+            label = str(ndata.get("label") or "").lower()
+            nid_low = str(nid).lower()
+            meta_str = str(ndata.get("metadata") or "").lower()
+
+            if hint:
+                if src_file and (src_file == hint or src_file.endswith(hint) or hint.endswith(src_file)):
+                    score += 14.0
+                elif hint_base and (src_base == hint_base or hint_base in label or hint_base in nid_low or hint_base in meta_str):
+                    score += 8.0
+
+            if ck_raw and (ck_raw in label or ck_raw in nid_low or ck_raw in meta_str):
+                score += 12.0
+            for tok in ck_tokens:
+                if tok in label or tok in nid_low:
+                    score += 4.0
+                elif tok in src_file or tok in meta_str:
+                    score += 2.0
+
+            if score > 0:
+                scored.append((score, nid))
+
+        if scored:
+            scored.sort(key=lambda item: item[0], reverse=True)
+            best_score = scored[0][0]
+            return [nid for sc, nid in scored if sc >= max(4.0, best_score * 0.6)][:3]
+
+        if norm_target == "__shared__" and allow_fallback_anchor and (exp_id or file_or_doc_hint):
+            anchor_id = exp_id or f"shared_doc::{file_or_doc_hint}"
+            if not g.has_node(anchor_id):
+                g.add_node(
+                    anchor_id,
+                    id=anchor_id,
+                    project_id=g.graph.get("base_project_id", g.graph.get("project_id", "default")),
+                    label=str(file_or_doc_hint or exp_id),
+                    file_type="document",
+                    source_file=str(file_or_doc_hint or ""),
+                    source_id="__shared__",
+                    branch=root_branch,
+                    scope="project_shared",
+                    tier="root",
+                    metadata={"synthetic_shared_doc_anchor": True, "doc_key": file_or_doc_hint or exp_id},
+                )
+            source_node_map[("__shared__", anchor_id)] = anchor_id
+            return [anchor_id]
+
+        if allow_fallback_anchor and exp_id and g.has_node(exp_id):
+            return [exp_id]
+
+        if allow_fallback_anchor and hint and target_candidates:
+            # If hint matched nothing by path, fall back only when single-node or high-degree match isn't ambiguous
+            return []
+
+        return []
+
+    def _bridge_cross_source_graph(
+        self,
+        g: nx.DiGraph,
+        base_proj: str,
+        eff_branch: str,
+        eff_src: Optional[str],
+        *,
+        files: Optional[List[str]] = None,
+        include_shared_docs: bool = True,
+        expand_relations: bool = True,
+        relation_depth: int = 1,
+        relation_types: Optional[List[str]] = None,
+    ) -> None:
+        """Bridge primary graph across shared `pb_root` docs and related sibling sources."""
+        g.graph["base_project_id"] = base_proj
+        g.graph["source_id"] = eff_src
+        g.graph["cross_source_relations"] = []
+
+        root_branch = "main"
+        try:
+            from projectbrain.memory.hsg import (
+                _is_shared_doc_allowed_for_source,
+                _load_shared_binding_map,
+                _resolve_project_root_branch,
+                collect_cross_source_relations_bfs,
+            )
+            root_branch = _resolve_project_root_branch(base_proj)
+        except Exception:
+            _is_shared_doc_allowed_for_source = None
+            _load_shared_binding_map = None
+            collect_cross_source_relations_bfs = None
+
+        source_node_map: Dict[Tuple[str, str], str] = {}
+        primary_tag = eff_src or "__default__"
+        prim_scope = (
+            "project_shared"
+            if primary_tag == "__shared__"
+            else ("source" if eff_src is not None else "project")
+        )
+        for nid, ndata in g.nodes(data=True):
+            ndata.setdefault("source_id", primary_tag)
+            ndata.setdefault("branch", eff_branch)
+            ndata.setdefault("scope", prim_scope)
+            source_node_map[(str(ndata.get("source_id") or primary_tag), nid)] = nid
+
+        def _format_via_relation(rel: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "relation_type": rel.get("relation_type"),
+                "contract_key": rel.get("contract_key"),
+                "from_source": rel.get("src_source_id"),
+                "to_source": rel.get("dst_source_id"),
+                "status": rel.get("status"),
+            }
+
+        def _ingest_secondary_subgraph(
+            src_tag: str,
+            br_name: str,
+            sub_data: Dict[str, Any],
+            *,
+            scope_name: str,
+            allowed_check: Optional[Any] = None,
+            via_relation: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            raw_nodes = sub_data.get("nodes") or []
+            raw_edges = sub_data.get("edges") or []
+            accepted_local_ids: Set[str] = set()
+            is_sec_root = (
+                self.store.is_root_branch(br_name)
+                if (self.store is not None and hasattr(self.store, "is_root_branch"))
+                else (br_name == root_branch)
+            )
+            default_tier = "root" if is_sec_root else "branch"
+
+            for sn in raw_nodes:
+                raw_nid = str(sn.get("id") or "")
+                if not raw_nid:
+                    continue
+                if allowed_check is not None and not allowed_check(sn):
+                    continue
+                target_nid = source_node_map.get((src_tag, raw_nid))
+                if not target_nid:
+                    target_nid = raw_nid if not g.has_node(raw_nid) else f"{src_tag}::{raw_nid}"
+                    attrs = dict(sn)
+                    attrs["id"] = target_nid
+                    attrs["tier"] = attrs.get("tier") or default_tier
+                    attrs["source_id"] = src_tag
+                    attrs["branch"] = br_name
+                    attrs["scope"] = scope_name
+                    if via_relation is not None:
+                        via_copy = dict(via_relation)
+                        attrs["via_relation"] = via_copy
+                        existing_meta = attrs.get("metadata")
+                        meta_copy = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+                        meta_copy["via_relation"] = dict(via_copy)
+                        attrs["metadata"] = meta_copy
+                    g.add_node(target_nid, **attrs)
+                    source_node_map[(src_tag, raw_nid)] = target_nid
+                accepted_local_ids.add(raw_nid)
+
+            for se in raw_edges:
+                raw_u = str(se.get("source") or "")
+                raw_v = str(se.get("target") or "")
+                if not raw_u or not raw_v:
+                    continue
+                if allowed_check is not None and (
+                    raw_u not in accepted_local_ids or raw_v not in accepted_local_ids
+                ):
+                    continue
+                u = source_node_map.get((src_tag, raw_u), raw_u)
+                v = source_node_map.get((src_tag, raw_v), raw_v)
+                if not g.has_node(u) or not g.has_node(v):
+                    continue
+                if not g.has_edge(u, v):
+                    e_attrs = dict(se)
+                    e_attrs["source"] = u
+                    e_attrs["target"] = v
+                    e_attrs["tier"] = e_attrs.get("tier") or default_tier
+                    e_attrs["source_id"] = src_tag
+                    e_attrs["branch"] = br_name
+                    g.add_edge(u, v, **e_attrs)
+
+        # 1. Include shared project documents from pb_root when querying a specific sub-source
+        if include_shared_docs and eff_src is not None and eff_src != "__shared__":
+            if self._can_fetch_source_branch(base_proj, root_branch, "__shared__"):
+                try:
+                    shared_data = self._fetch_server_subgraph(
+                        base_proj,
+                        branch=root_branch,
+                        files=files,
+                        limit=5000,
+                        source_id="__shared__",
+                    )
+                except Exception:
+                    shared_data = {"nodes": [], "edges": []}
+
+                binding_map = _load_shared_binding_map(base_proj) if _load_shared_binding_map else {}
+
+                def _shared_node_allowed(sn: Dict[str, Any]) -> bool:
+                    if not binding_map or not _is_shared_doc_allowed_for_source:
+                        return True
+                    meta = sn.get("metadata") if isinstance(sn.get("metadata"), dict) else {}
+                    doc_key = meta.get("doc_key") or sn.get("source_file") or sn.get("label") or sn.get("id")
+                    doc_ver = meta.get("doc_version")
+                    dk_str = str(doc_key).strip() if doc_key else ""
+                    if dk_str and dk_str not in binding_map:
+                        stem = os.path.basename(dk_str)
+                        if stem in binding_map:
+                            dk_str = stem
+                        else:
+                            return True
+                    return _is_shared_doc_allowed_for_source(dk_str or None, doc_ver, eff_src, binding_map)
+
+                _ingest_secondary_subgraph(
+                    "__shared__",
+                    root_branch,
+                    shared_data,
+                    scope_name="project_shared",
+                    allowed_check=_shared_node_allowed,
+                )
+
+        # 2. Expand connected sibling sources via cross_source_relations
+        if not expand_relations or int(relation_depth or 0) <= 0:
+            return
+        if collect_cross_source_relations_bfs is None:
+            return
+
+        bfs_info = collect_cross_source_relations_bfs(
+            base_proj,
+            source_id=eff_src,
+            branch=eff_branch,
+            relation_depth=int(relation_depth or 1),
+            relation_types=relation_types,
+            expand_relations=expand_relations,
+            include_shared_docs=include_shared_docs,
+        )
+        relations: List[Dict[str, Any]] = list(bfs_info.get("relations") or [])
+        g.graph["cross_source_relations"] = relations
+        if not relations:
+            return
+
+        sibling_edges_map: Dict[Tuple[str, str], List[Tuple[int, str, Dict[str, Any]]]] = (
+            bfs_info.get("sibling_edges") or {}
+        )
+        sibling_targets: Set[Tuple[str, str]] = set(sibling_edges_map.keys())
+        sibling_via_relation: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for target_key, candidates in sibling_edges_map.items():
+            if not candidates:
+                continue
+            _, _, best_rel = min(
+                candidates,
+                key=lambda item: (
+                    int(item[0]),
+                    -float(
+                        item[2].get("confidence_score")
+                        if item[2].get("confidence_score") is not None
+                        else 1.0
+                    ),
+                ),
+            )
+            sibling_via_relation[target_key] = _format_via_relation(best_rel)
+
+        if eff_src is None:
+            for rel in relations:
+                for src_k, br_k in (("src_source_id", "src_branch"), ("dst_source_id", "dst_branch")):
+                    s_val = str(rel.get(src_k) or "").strip()
+                    b_val = str(rel.get(br_k) or root_branch).strip() or root_branch
+                    if s_val and s_val not in ("__default__", "__shared__"):
+                        sibling_targets.add((s_val, b_val))
+                        sibling_via_relation.setdefault((s_val, b_val), _format_via_relation(rel))
+
+        for nbr_src, nbr_br in sorted(sibling_targets):
+            if nbr_src == eff_src and nbr_br == eff_branch:
+                continue
+            if self._can_fetch_source_branch(base_proj, nbr_br, nbr_src):
+                try:
+                    nbr_data = self._fetch_server_subgraph(
+                        base_proj,
+                        branch=nbr_br,
+                        files=None,
+                        limit=5000,
+                        source_id=nbr_src,
+                    )
+                except Exception:
+                    nbr_data = {"nodes": [], "edges": []}
+                _ingest_secondary_subgraph(
+                    nbr_src,
+                    nbr_br,
+                    nbr_data,
+                    scope_name="related_source" if eff_src is not None else "source",
+                    via_relation=sibling_via_relation.get((nbr_src, nbr_br)),
+                )
+
+        # 3. Inject synthetic CROSS_SOURCE bridge edges between matched frontier nodes
+        for rel in relations:
+            s_src = str(rel.get("src_source_id") or "__default__").strip() or "__default__"
+            d_src = str(rel.get("dst_source_id") or "__default__").strip() or "__default__"
+            s_br = str(rel.get("src_branch") or root_branch).strip() or root_branch
+            d_br = str(rel.get("dst_branch") or root_branch).strip() or root_branch
+            if not include_shared_docs and ("__shared__" in (s_src, d_src)):
+                continue
+
+            cmeta = rel.get("contract_metadata") if isinstance(rel.get("contract_metadata"), dict) else {}
+            src_hint = (
+                rel.get("src_file_path")
+                or cmeta.get("src_file_path")
+                or cmeta.get("consumer_file_path")
+            )
+            dst_hint = (
+                rel.get("dst_file_path")
+                or rel.get("dst_doc_key")
+                or cmeta.get("dst_file_path")
+                or cmeta.get("provider_file_path")
+                or cmeta.get("target_file_path")
+            )
+
+            src_matches = self._match_relation_endpoint_nodes(
+                g,
+                source_node_map,
+                s_src,
+                rel.get("src_node_id"),
+                src_hint,
+                rel.get("contract_key"),
+                allow_fallback_anchor=True,
+                root_branch=root_branch,
+            )
+            dst_matches = self._match_relation_endpoint_nodes(
+                g,
+                source_node_map,
+                d_src,
+                rel.get("dst_node_id"),
+                dst_hint,
+                rel.get("contract_key"),
+                allow_fallback_anchor=True,
+                root_branch=root_branch,
+            )
+            if not src_matches or not dst_matches:
+                continue
+
+            conf_score = float(
+                rel.get("confidence_score")
+                if rel.get("confidence_score") is not None
+                else 1.0
+            )
+            mapped_conf = self._map_cross_source_confidence(rel.get("confidence"), conf_score)
+            bridge_meta = {
+                "cross_source": True,
+                "relation_id": rel.get("id"),
+                "relation_type": rel.get("relation_type"),
+                "contract_key": rel.get("contract_key") or "",
+                "drift_status": rel.get("status") or "active",
+                "from_source": s_src,
+                "to_source": d_src,
+                "from_branch": s_br,
+                "to_branch": d_br,
+                "hop": rel.get("hop", 1),
+                "src_file_path": rel.get("src_file_path"),
+                "dst_file_path": rel.get("dst_file_path"),
+                "dst_doc_key": rel.get("dst_doc_key"),
+                "is_bidirectional": bool(rel.get("is_bidirectional")),
+            }
+
+            for u in src_matches:
+                for v in dst_matches:
+                    if u == v:
+                        continue
+                    if not g.has_edge(u, v):
+                        g.add_edge(
+                            u,
+                            v,
+                            project_id=base_proj,
+                            source=u,
+                            target=v,
+                            relation="CROSS_SOURCE",
+                            confidence=mapped_conf,
+                            confidence_score=conf_score,
+                            tier="cross_source",
+                            source_id=s_src,
+                            target_source_id=d_src,
+                            metadata=dict(bridge_meta),
+                        )
+                    if bool(rel.get("is_bidirectional")) and not g.has_edge(v, u):
+                        rev_meta = dict(bridge_meta)
+                        rev_meta["from_source"] = d_src
+                        rev_meta["to_source"] = s_src
+                        g.add_edge(
+                            v,
+                            u,
+                            project_id=base_proj,
+                            source=v,
+                            target=u,
+                            relation="CROSS_SOURCE",
+                            confidence=mapped_conf,
+                            confidence_score=conf_score,
+                            tier="cross_source",
+                            source_id=d_src,
+                            target_source_id=s_src,
+                            metadata=rev_meta,
+                        )
 
     # -----------------------------------------------------------------------
     # 3-Tier Resolution Engine
@@ -432,6 +983,11 @@ class HybridResolver:
         branch: str = "main",
         local_path: Optional[str] = None,
         files: Optional[List[str]] = None,
+        source_id: Optional[str] = None,
+        include_shared_docs: bool = True,
+        expand_relations: bool = True,
+        relation_depth: int = 1,
+        relation_types: Optional[List[str]] = None,
     ) -> nx.DiGraph:
         """
         Merge 3 tiers into a unified networkx.DiGraph with `tier` provenance attribute:
@@ -444,19 +1000,25 @@ class HybridResolver:
         - Stale-symbol pruning for locally edited files
         - Local node and edge attribute overrides with tier="local"
         """
+        base_proj, eff_branch, eff_src = self._parse_project_source_spec(
+            project_id, branch=branch, source_id=source_id
+        )
+
         g = nx.DiGraph()
-        g.graph["project_id"] = project_id
-        g.graph["branch"] = branch
+        g.graph["project_id"] = base_proj
+        g.graph["branch"] = eff_branch
+        g.graph["source_id"] = eff_src
 
         # 1. Load local Tier 1 graph
-        local_graph = self.load_local_graph(local_path=local_path, project_id=project_id)
+        local_graph = self.load_local_graph(local_path=local_path, project_id=base_proj)
 
         # 2. Fetch server subgraph (Tiers 2 & 3 resolved)
         server_data = self._fetch_server_subgraph(
-            project_id=project_id,
-            branch=branch,
+            project_id=base_proj,
+            branch=eff_branch,
             files=files,
             limit=10000,
+            source_id=eff_src,
         )
         server_nodes: List[Dict[str, Any]] = server_data.get("nodes", [])
         server_edges: List[Dict[str, Any]] = server_data.get("edges", [])
@@ -580,6 +1142,19 @@ class HybridResolver:
             g.graph["hyperedges"] = [_dump_model(h) for h in local_graph.hyperedges]
         else:
             g.graph["hyperedges"] = server_data.get("hyperedges", [])
+
+        # 6. Bridge across shared pb_root docs and connected sibling sub-sources
+        self._bridge_cross_source_graph(
+            g,
+            base_proj=base_proj,
+            eff_branch=eff_branch,
+            eff_src=eff_src,
+            files=files,
+            include_shared_docs=include_shared_docs,
+            expand_relations=expand_relations,
+            relation_depth=relation_depth,
+            relation_types=relation_types,
+        )
 
         return g
 
@@ -780,27 +1355,48 @@ class HybridResolver:
         mode: str = "bfs",
         min_confidence: str = "AMBIGUOUS",
         budget: int = 2500,
+        source_id: Optional[str] = None,
+        include_shared_docs: bool = True,
+        expand_relations: bool = True,
+        relation_depth: int = 1,
+        relation_types: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Query hybrid knowledge base using BFS or DFS traversal from keyword-matched seed nodes.
 
-        :param project_id: Project identifier.
+        :param project_id: Project identifier (or `proj@source` spec).
         :param query_text: Natural language query or symbol token.
         :param branch: Branch name.
         :param local_path: Optional path to local graph JSON.
         :param mode: "bfs" (breadth-first context) or "dfs" (deep chain tracing).
         :param min_confidence: "EXTRACTED" > "INFERRED" > "AMBIGUOUS".
         :param budget: Approximate token budget for context markdown formatting.
+        :param source_id: Optional project sub-source ID filter.
+        :param include_shared_docs: Include `pb_root` shared docs bound to `source_id`.
+        :param expand_relations: Follow `cross_source_relations` to connected sub-sources.
+        :param relation_depth: Hop depth for cross-source expansion (`0`..`3`).
+        :param relation_types: Optional filter of cross-source relation types.
         """
-        g = self.resolve_hybrid_graph(project_id, branch=branch, local_path=local_path)
+        g = self.resolve_hybrid_graph(
+            project_id,
+            branch=branch,
+            local_path=local_path,
+            source_id=source_id,
+            include_shared_docs=include_shared_docs,
+            expand_relations=expand_relations,
+            relation_depth=relation_depth,
+            relation_types=relation_types,
+        )
         if g.number_of_nodes() == 0:
             return {
                 "query": query_text,
                 "mode": mode,
+                "source_id": g.graph.get("source_id"),
                 "nodes": [],
                 "edges": [],
                 "communities": [],
                 "tier_breakdown": {"local": 0, "branch": 0, "root": 0},
+                "cross_source_relations": g.graph.get("cross_source_relations", []),
                 "context_markdown": "# Hybrid Knowledge Base Context\nNo entities found in knowledge base.",
             }
 
@@ -940,19 +1536,33 @@ class HybridResolver:
         char_budget = budget * 4
         current_chars = sum(len(line) + 1 for line in md_lines)
 
+        has_multi_src = bool(g.graph.get("source_id") or g.graph.get("cross_source_relations"))
         for nd in matched_node_dicts:
             nid = nd.get("id")
             lbl = nd.get("label", nid)
             tier = nd.get("tier", "root")
             ftype = nd.get("file_type", "code")
             loc = nd.get("source_location") or nd.get("source_file") or "unspecified"
-            line = f"- **{lbl}** (`{tier}`) [{ftype}] — `{loc}`"
+            src_badge = (
+                f" [src:{nd.get('source_id')}]"
+                if has_multi_src and nd.get("source_id")
+                else ""
+            )
+            line = f"- **{lbl}** (`{tier}`) [{ftype}]{src_badge} — `{loc}`"
 
             # Check relations
-            rels = [
-                f"{te['relation']} -> `{te['target']}` ({te.get('confidence', 'EXTRACTED')})"
-                for te in traversed_edges if te["source"] == nid
-            ]
+            rels = []
+            for te in traversed_edges:
+                if te["source"] == nid:
+                    emeta = te.get("metadata") if isinstance(te.get("metadata"), dict) else {}
+                    contract_suffix = (
+                        f" [contract: {emeta['contract_key']}]"
+                        if emeta.get("contract_key")
+                        else ""
+                    )
+                    rels.append(
+                        f"{te['relation']} -> `{te['target']}` ({te.get('confidence', 'EXTRACTED')}){contract_suffix}"
+                    )
             if rels:
                 line += "\n  - " + "\n  - ".join(rels[:4])
 
@@ -966,10 +1576,12 @@ class HybridResolver:
         return {
             "query": query_text,
             "mode": mode,
+            "source_id": g.graph.get("source_id"),
             "nodes": matched_node_dicts,
             "edges": traversed_edges,
             "communities": sorted(communities),
             "tier_breakdown": tier_counts,
+            "cross_source_relations": g.graph.get("cross_source_relations", []),
             "context_markdown": "\n".join(md_lines),
         }
 
@@ -983,14 +1595,29 @@ class HybridResolver:
         target_id: str,
         branch: str = "main",
         local_path: Optional[str] = None,
+        project_source_id: Optional[str] = None,
+        include_shared_docs: bool = True,
+        expand_relations: bool = True,
+        relation_depth: int = 1,
+        relation_types: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Find shortest path between source_id and target_id across hybrid tiers.
+        Find shortest path between source_id and target_id across hybrid tiers
+        and optional connected sub-sources.
 
         Falls back to undirected traversal across semantic/call links if no directed path exists.
         Returns ordered hop details with relation, confidence, and tier metadata.
         """
-        g = self.resolve_hybrid_graph(project_id, branch=branch, local_path=local_path)
+        g = self.resolve_hybrid_graph(
+            project_id,
+            branch=branch,
+            local_path=local_path,
+            source_id=project_source_id,
+            include_shared_docs=include_shared_docs,
+            expand_relations=expand_relations,
+            relation_depth=relation_depth,
+            relation_types=relation_types,
+        )
         if not g.has_node(source_id) or not g.has_node(target_id):
             return []
 
@@ -1031,6 +1658,9 @@ class HybridResolver:
                 "tier": edata.get("tier", "root"),
                 "source_label": g.nodes[u].get("label", u),
                 "target_label": g.nodes[v].get("label", v),
+                "source_id": g.nodes[u].get("source_id"),
+                "target_source_id": g.nodes[v].get("source_id"),
+                "metadata": edata.get("metadata", {}),
                 "direction": direction,
                 "directed_path": is_directed,
             })
@@ -1047,22 +1677,38 @@ class HybridResolver:
         max_hops: int = 3,
         branch: str = "main",
         local_path: Optional[str] = None,
+        source_id: Optional[str] = None,
+        include_shared_docs: bool = True,
+        expand_relations: bool = True,
+        relation_depth: int = 1,
+        relation_types: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Calculate blast radius ego-subgraph of a modified symbol up to max_hops.
 
         Returns upstream callers/dependents and downstream ego dependencies.
         """
-        g = self.resolve_hybrid_graph(project_id, branch=branch, local_path=local_path)
+        g = self.resolve_hybrid_graph(
+            project_id,
+            branch=branch,
+            local_path=local_path,
+            source_id=source_id,
+            include_shared_docs=include_shared_docs,
+            expand_relations=expand_relations,
+            relation_depth=relation_depth,
+            relation_types=relation_types,
+        )
         if not g.has_node(node_id):
             return {
                 "node_id": node_id,
                 "found": False,
                 "max_hops": max_hops,
+                "source_id": g.graph.get("source_id"),
                 "upstream_dependents": [],
                 "downstream_dependencies": [],
                 "affected_nodes_count": 0,
                 "tier_breakdown": {"local": 0, "branch": 0, "root": 0},
+                "cross_source_relations": g.graph.get("cross_source_relations", []),
             }
 
         # 1. Upstream BFS (predecessors / callers)
@@ -1078,6 +1724,7 @@ class HybridResolver:
                 if pred not in up_visited:
                     up_visited.add(pred)
                     edata = g.get_edge_data(pred, curr) or {}
+                    emeta = edata.get("metadata") if isinstance(edata.get("metadata"), dict) else {}
                     pdata = dict(g.nodes[pred])
                     upstream.append({
                         "node_id": pred,
@@ -1087,6 +1734,10 @@ class HybridResolver:
                         "source_file": pdata.get("source_file", ""),
                         "tier": pdata.get("tier", "root"),
                         "relation": edata.get("relation", "calls"),
+                        "source_id": pdata.get("source_id"),
+                        "scope": pdata.get("scope"),
+                        "cross_source": bool(emeta.get("cross_source")),
+                        "contract_key": emeta.get("contract_key"),
                     })
                     queue.append((pred, depth + 1))
 
@@ -1103,6 +1754,7 @@ class HybridResolver:
                 if succ not in down_visited:
                     down_visited.add(succ)
                     edata = g.get_edge_data(curr, succ) or {}
+                    emeta = edata.get("metadata") if isinstance(edata.get("metadata"), dict) else {}
                     sdata = dict(g.nodes[succ])
                     downstream.append({
                         "node_id": succ,
@@ -1112,6 +1764,10 @@ class HybridResolver:
                         "source_file": sdata.get("source_file", ""),
                         "tier": sdata.get("tier", "root"),
                         "relation": edata.get("relation", "calls"),
+                        "source_id": sdata.get("source_id"),
+                        "scope": sdata.get("scope"),
+                        "cross_source": bool(emeta.get("cross_source")),
+                        "contract_key": emeta.get("contract_key"),
                     })
                     queue.append((succ, depth + 1))
 
@@ -1125,10 +1781,12 @@ class HybridResolver:
             "node_id": node_id,
             "found": True,
             "max_hops": max_hops,
+            "source_id": g.graph.get("source_id"),
             "upstream_dependents": upstream,
             "downstream_dependencies": downstream,
             "affected_nodes_count": len(all_affected),
             "tier_breakdown": tier_counts,
+            "cross_source_relations": g.graph.get("cross_source_relations", []),
         }
 
     # -----------------------------------------------------------------------
