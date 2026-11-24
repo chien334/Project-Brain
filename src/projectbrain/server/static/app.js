@@ -247,8 +247,12 @@ document.addEventListener('DOMContentLoaded', () => {
     // =========================================================================
     const dashboardContainer = document.querySelector('.dashboard-container');
     const btnToggleSidebar = document.getElementById('btnToggleSidebar');
-    const activeViewDomain = document.getElementById('activeViewDomain');
-    const activeViewTitle = document.getElementById('activeViewTitle');
+    const breadcrumbDomainLink = document.getElementById('breadcrumbDomainLink');
+    const breadcrumbPageLink = document.getElementById('breadcrumbPageLink');
+    const activeRoutePathBadge = document.getElementById('activeRoutePathBadge');
+    const btnCopyRouteUrl = document.getElementById('btnCopyRouteUrl');
+    const domainSubnavBar = document.getElementById('domainSubnavBar');
+    const domainSubnavList = document.getElementById('domainSubnavList');
     const backendStatus = document.getElementById('backendStatus');
     const headerHardwareBadge = document.getElementById('headerHardwareBadge');
     const btnThemeToggle = document.getElementById('btnThemeToggle');
@@ -530,43 +534,30 @@ document.addEventListener('DOMContentLoaded', () => {
     const commandPaletteInput = document.getElementById('commandPaletteInput');
     const commandPaletteResults = document.getElementById('commandPaletteResults');
 
-    // AI & LLM Settings Dialog
+    // AI & LLM Settings Dialog & Dedicated Page (/app/settings/ai)
     const aiSettingsDialog = document.getElementById('aiSettingsDialog');
     const aiSettingsStatusBanner = document.getElementById('aiSettingsStatusBanner');
     const btnRefreshAiProbe = document.getElementById('btnRefreshAiProbe');
     const aiSettingsForm = document.getElementById('aiSettingsForm');
     const aiProviderSelect = document.getElementById('aiProviderSelect');
-    const aiEmbedSelect = document.getElementById('aiEmbedSelect');
-    const aiFallbackLocalRag = document.getElementById('aiFallbackLocalRag');
-    const aiGeminiKey = document.getElementById('aiGeminiKey');
-    const aiGeminiKeyHint = document.getElementById('aiGeminiKeyHint');
-    const aiClearGeminiKey = document.getElementById('aiClearGeminiKey');
-    const aiGeminiModel = document.getElementById('aiGeminiModel');
-    const aiGeminiBaseUrl = document.getElementById('aiGeminiBaseUrl');
-    const aiOpenaiKey = document.getElementById('aiOpenaiKey');
-    const aiOpenaiKeyHint = document.getElementById('aiOpenaiKeyHint');
-    const aiClearOpenaiKey = document.getElementById('aiClearOpenaiKey');
-    const aiOpenaiBaseUrl = document.getElementById('aiOpenaiBaseUrl');
-    const aiOpenaiModel = document.getElementById('aiOpenaiModel');
-    const aiOllamaUrl = document.getElementById('aiOllamaUrl');
-    const aiOllamaModel = document.getElementById('aiOllamaModel');
-    const aiOllamaVisionModel = document.getElementById('aiOllamaVisionModel');
     const ollamaModelSuggestions = document.getElementById('ollamaModelSuggestions');
-    const aiLocalAiBaseUrl = document.getElementById('aiLocalAiBaseUrl');
-    const aiLocalAiModel = document.getElementById('aiLocalAiModel');
-    const aiLocalAiKey = document.getElementById('aiLocalAiKey');
-    const aiLocalAiKeyHint = document.getElementById('aiLocalAiKeyHint');
-    const aiClearLocalAiKey = document.getElementById('aiClearLocalAiKey');
     const aiSettingsTestOutput = document.getElementById('aiSettingsTestOutput');
     const btnCancelAiSettings = document.getElementById('btnCancelAiSettings');
     const btnTestAiSettings = document.getElementById('btnTestAiSettings');
     const btnSaveAiSettings = document.getElementById('btnSaveAiSettings');
 
+    const aiPageStatusBanner = document.getElementById('aiPageStatusBanner');
+    const btnPageProbeAi = document.getElementById('btnPageProbeAi');
+    const aiPageForm = document.getElementById('aiPageForm');
+    const aiPageTestOutput = document.getElementById('aiPageTestOutput');
+    const btnPageTestAi = document.getElementById('btnPageTestAi');
+    const btnPageSaveAi = document.getElementById('btnPageSaveAi');
+
     const toastRegion = document.getElementById('toastRegion');
     const srAnnouncer = document.getElementById('srAnnouncer');
 
     // =========================================================================
-    // 3. Application State
+    // 3. Application State & Canonical Route Table (History API)
     // =========================================================================
     let activeUser = 'default';
     let projectGroups = {};
@@ -576,6 +567,8 @@ document.addEventListener('DOMContentLoaded', () => {
     let userRole = 'reader';
     let isInitialized = false;
     let listenersBound = false;
+    let allowRegistrationConfig = false;
+    let pendingNextUrl = '';
 
     let loadedMemories = [];
     let allPlugins = [];
@@ -589,6 +582,113 @@ document.addEventListener('DOMContentLoaded', () => {
     let cgResizeObserver = null;
     let cgResizeTimer = null;
     const pendingToasts = [];
+
+    const DOMAINS = {
+        workspace: { slug: 'workspace', label: 'Workspace', defaultPath: '/app/overview' },
+        graph: { slug: 'graph', label: 'Code & Knowledge', defaultPath: '/app/graph/explorer' },
+        platform: { slug: 'platform', label: 'Platform & QA', defaultPath: '/app/platform/plugins' },
+        settings: { slug: 'settings', label: 'Settings & IAM', defaultPath: '/app/settings/ai' }
+    };
+
+    const ROUTES = [
+        { path: '/app/overview', tabId: 'dashboardTab', title: 'Overview', icon: 'fa-gauge-high', domainSlug: 'workspace', domainLabel: 'Workspace' },
+        { path: '/app/workspace/projects', tabId: 'projectRegistryTab', title: 'Projects & Databases', icon: 'fa-folder-tree', domainSlug: 'workspace', domainLabel: 'Workspace' },
+        { path: '/app/workspace/memories', tabId: 'memoriesTab', title: 'Memories & Docs', icon: 'fa-layer-group', domainSlug: 'workspace', domainLabel: 'Workspace' },
+        { path: '/app/workspace/search', tabId: 'searchTab', title: 'Semantic Search', icon: 'fa-magnifying-glass', domainSlug: 'workspace', domainLabel: 'Workspace' },
+
+        { path: '/app/graph/explorer', tabId: 'codeGraphTab', title: 'Graph Explorer', icon: 'fa-circle-nodes', domainSlug: 'graph', domainLabel: 'Code & Knowledge' },
+        { path: '/app/graph/diff', tabId: 'compareTab', title: 'Branch Diff', icon: 'fa-code-compare', domainSlug: 'graph', domainLabel: 'Code & Knowledge' },
+        { path: '/app/kb', tabId: 'kbTab', title: 'Unified KB & Trace', icon: 'fa-book-atlas', domainSlug: 'graph', domainLabel: 'Code & Knowledge' },
+        { path: '/app/copilot', tabId: 'copilotTab', title: 'PM Copilot', icon: 'fa-file-pen', domainSlug: 'graph', domainLabel: 'Code & Knowledge' },
+
+        { path: '/app/platform/plugins', tabId: 'pluginsTab', title: 'Plugins & Hardware', icon: 'fa-cubes', domainSlug: 'platform', domainLabel: 'Platform & QA' },
+        { path: '/app/platform/qa', tabId: 'v3TestingTab', title: 'v3.0 QA Layer 1', icon: 'fa-vial-circle-check', domainSlug: 'platform', domainLabel: 'Platform & QA' },
+        { path: '/app/platform/mcp', tabId: 'mcpTab', title: 'MCP Clients', icon: 'fa-network-wired', domainSlug: 'platform', domainLabel: 'Platform & QA' },
+
+        { path: '/app/settings/ai', tabId: 'aiSettingsTab', title: 'AI & LLM Settings', icon: 'fa-wand-magic-sparkles', domainSlug: 'settings', domainLabel: 'Settings & IAM' },
+        { path: '/app/settings/profile', tabId: 'profileTab', title: 'My Profile & Keys', icon: 'fa-id-badge', domainSlug: 'settings', domainLabel: 'Settings & IAM' },
+        { path: '/app/settings/iam', tabId: 'authAdminTab', title: 'Identity & RBAC', icon: 'fa-user-shield', domainSlug: 'settings', domainLabel: 'Settings & IAM', adminOnly: true }
+    ];
+
+    const ROUTE_ALIASES = {
+        '/': '/app/overview',
+        '/app': '/app/overview',
+        '/app/workspace': '/app/overview',
+        '/app/projects': '/app/workspace/projects',
+        '/app/memories': '/app/workspace/memories',
+        '/app/search': '/app/workspace/search',
+        '/app/graph': '/app/graph/explorer',
+        '/app/diff': '/app/graph/diff',
+        '/app/platform': '/app/platform/plugins',
+        '/app/plugins': '/app/platform/plugins',
+        '/app/qa': '/app/platform/qa',
+        '/app/v3': '/app/platform/qa',
+        '/app/mcp': '/app/platform/mcp',
+        '/app/settings': '/app/settings/ai',
+        '/app/ai': '/app/settings/ai',
+        '/app/profile': '/app/settings/profile',
+        '/app/iam': '/app/settings/iam',
+        '/app/auth': '/app/settings/iam'
+    };
+
+    let activeRoutePath = '/app/overview';
+
+    function normalizePathname(rawPathname) {
+        let p = String(rawPathname || '/').trim() || '/';
+        if (p.length > 1 && p.endsWith('/')) {
+            p = p.replace(/\/+$/, '') || '/';
+        }
+        if (p === '/login' || p === '/register') return p;
+        if (p === '/dashboard') return '/app/overview';
+        if (p.startsWith('/dashboard/')) {
+            p = '/app/' + p.slice('/dashboard/'.length);
+        }
+        if (ROUTE_ALIASES[p]) {
+            p = ROUTE_ALIASES[p];
+        }
+        const matched = ROUTES.find(r => r.path === p);
+        return matched ? matched.path : '/app/overview';
+    }
+
+    function getRouteByPath(pathname) {
+        const norm = normalizePathname(pathname);
+        return ROUTES.find(r => r.path === norm) || ROUTES[0];
+    }
+
+    function getRouteByTabId(tabId) {
+        const resolvedId = tabId === 'authTab' ? 'authAdminTab' : tabId;
+        return ROUTES.find(r => r.tabId === resolvedId) || ROUTES[0];
+    }
+
+    function isSafeInternalAppUrl(candidate) {
+        if (!candidate || typeof candidate !== 'string') return false;
+        if (!candidate.startsWith('/') || candidate.startsWith('//')) return false;
+        try {
+            const parsed = new URL(candidate, window.location.origin);
+            if (parsed.origin !== window.location.origin) return false;
+            const norm = normalizePathname(parsed.pathname);
+            return norm.startsWith('/app/');
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // Seed workspace project/branch selection from initial URL query parameters if present
+    (function seedStorageFromInitialUrl() {
+        try {
+            const initParams = new URLSearchParams(window.location.search);
+            const urlProj = (initParams.get('project') || '').trim();
+            const urlBranch = (initParams.get('branch') || '').trim();
+            if (urlProj) {
+                localStorage.setItem('activeProject', urlProj);
+                if (urlBranch) {
+                    localStorage.setItem(`branch_${urlProj}`, urlBranch === 'all' ? '%' : urlBranch);
+                }
+            }
+        } catch (_) {
+            // Ignore malformed query string
+        }
+    })();
 
     // =========================================================================
     // 4. Accessible Popover Toasts, Screen Reader Announcer & Native Dialogs
@@ -1142,31 +1242,33 @@ document.addEventListener('DOMContentLoaded', () => {
     let paletteActiveIndex = 0;
 
     function getCommandPaletteItems() {
-        const viewCommands = Array.from(tabLinks)
-            .filter(link => !link.hidden && link.style.display !== 'none')
-            .map(link => {
-                const tabId = link.getAttribute('data-tab');
-                const domain = link.getAttribute('data-domain') || 'Workbench';
-                const labelEl = link.querySelector('.nav-label');
-                const title = labelEl ? labelEl.textContent.trim() : tabId;
-                return {
-                    id: `view:${tabId}`,
-                    title: `Go to ${title}`,
-                    subtitle: domain,
-                    keywords: `${title} ${domain} ${tabId}`.toLowerCase(),
-                    icon: 'fa-arrow-right',
-                    run: () => switchTab(tabId)
-                };
-            });
+        const viewCommands = ROUTES
+            .filter(route => !route.adminOnly || userRole === 'admin')
+            .map(route => ({
+                id: `view:${route.tabId}`,
+                title: `${route.title} — ${route.path}`,
+                subtitle: route.domainLabel,
+                keywords: `${route.title} ${route.domainLabel} ${route.path} ${route.tabId}`.toLowerCase(),
+                icon: route.icon || 'fa-arrow-right',
+                run: () => navigateTo(buildContextualHref(route.path))
+            }));
 
         const actionCommands = [
             {
-                id: 'action:ai-settings',
-                title: 'AI & LLM Provider Settings (Gemini / OpenAI / Ollama / Offline RAG)',
-                subtitle: 'AI Engine',
-                keywords: 'ai llm settings gemini openai ollama minimax local rag provider api key model',
+                id: 'action:ai-settings-modal',
+                title: 'Quick Modal: AI & LLM Provider Settings',
+                subtitle: '/app/settings/ai',
+                keywords: 'ai llm settings gemini openai ollama minimax local rag provider api key model modal',
                 icon: 'fa-sliders',
                 run: () => openAiSettingsModal()
+            },
+            {
+                id: 'action:copy-route',
+                title: 'Copy Shareable Route URL',
+                subtitle: 'Router',
+                keywords: 'copy url route share link deep link',
+                icon: 'fa-link',
+                run: () => copyActiveRouteUrl()
             },
             {
                 id: 'action:theme',
@@ -1179,7 +1281,7 @@ document.addEventListener('DOMContentLoaded', () => {
             {
                 id: 'action:refresh-hw',
                 title: 'Refresh Hardware & Local AI Telemetry',
-                subtitle: 'Plugins & Hardware',
+                subtitle: 'Platform & QA',
                 keywords: 'hardware gpu mps cuda ocr ollama refresh telemetry',
                 icon: 'fa-microchip',
                 run: async () => {
@@ -1349,7 +1451,33 @@ document.addEventListener('DOMContentLoaded', () => {
         if (loginError) loginError.style.display = 'flex';
     }
 
-    function switchAuthMode(tabEl) {
+    function getPendingNextFromUrl() {
+        const params = new URLSearchParams(window.location.search);
+        const rawNext = params.get('next') || pendingNextUrl || '';
+        if (isSafeInternalAppUrl(rawNext)) {
+            const parsed = new URL(rawNext, window.location.origin);
+            return normalizePathname(parsed.pathname) + parsed.search;
+        }
+        return '';
+    }
+
+    function buildAuthUrl(tabEl, nextOverride = undefined) {
+        const nextTarget = nextOverride !== undefined ? nextOverride : getPendingNextFromUrl();
+        const params = new URLSearchParams();
+        let authPath = '/login';
+        if (tabEl === tabAuthRegister && allowRegistrationConfig) {
+            authPath = '/register';
+        } else if (tabEl === tabAuthToken) {
+            params.set('mode', 'token');
+        }
+        if (nextTarget && nextTarget !== '/app/overview') {
+            params.set('next', nextTarget);
+        }
+        const qs = params.toString();
+        return qs ? `${authPath}?${qs}` : authPath;
+    }
+
+    function switchAuthMode(tabEl, { updateHistory = false, replaceHistory = false } = {}) {
         if (!tabEl || tabEl.hidden) return;
         clearLoginError();
         authModeTabs.forEach(t => {
@@ -1359,10 +1487,46 @@ document.addEventListener('DOMContentLoaded', () => {
             const pane = authModePanes[t.id];
             if (pane) pane.hidden = !isSelected;
         });
+
+        const isReg = tabEl === tabAuthRegister;
+        document.title = isReg
+            ? 'Create Account — ProjectBrain v3.0'
+            : 'Sign In — ProjectBrain v3.0';
+
+        if (updateHistory || replaceHistory) {
+            const targetUrl = buildAuthUrl(tabEl);
+            const currentFull = window.location.pathname + window.location.search;
+            if (targetUrl !== currentFull) {
+                if (replaceHistory) {
+                    window.history.replaceState({ auth: true }, '', targetUrl);
+                } else {
+                    window.history.pushState({ auth: true }, '', targetUrl);
+                }
+            }
+        }
+    }
+
+    function syncAuthScreenFromUrl({ replaceNormalized = true } = {}) {
+        const normPath = normalizePathname(window.location.pathname);
+        const params = new URLSearchParams(window.location.search);
+        if (normPath === '/register') {
+            if (allowRegistrationConfig && tabAuthRegister && !tabAuthRegister.hidden) {
+                switchAuthMode(tabAuthRegister, { replaceHistory: replaceNormalized });
+            } else {
+                switchAuthMode(tabAuthPassword, { replaceHistory: true });
+            }
+            return;
+        }
+        const mode = (params.get('mode') || '').toLowerCase();
+        if (mode === 'token' && tabAuthToken) {
+            switchAuthMode(tabAuthToken, { replaceHistory: replaceNormalized });
+        } else {
+            switchAuthMode(tabAuthPassword, { replaceHistory: replaceNormalized });
+        }
     }
 
     authModeTabs.forEach(tab => {
-        tab.addEventListener('click', () => switchAuthMode(tab));
+        tab.addEventListener('click', () => switchAuthMode(tab, { updateHistory: true }));
         tab.addEventListener('keydown', (e) => {
             const visibleTabs = authModeTabs.filter(t => !t.hidden);
             const idx = visibleTabs.indexOf(tab);
@@ -1375,7 +1539,7 @@ document.addEventListener('DOMContentLoaded', () => {
             else return;
             e.preventDefault();
             visibleTabs[nextIdx].focus();
-            switchAuthMode(visibleTabs[nextIdx]);
+            switchAuthMode(visibleTabs[nextIdx], { updateHistory: true });
         });
     });
 
@@ -1404,16 +1568,20 @@ document.addEventListener('DOMContentLoaded', () => {
     wirePasswordToggle('btnToggleAiGeminiKey', 'aiGeminiKey');
     wirePasswordToggle('btnToggleAiOpenaiKey', 'aiOpenaiKey');
     wirePasswordToggle('btnToggleAiLocalAiKey', 'aiLocalAiKey');
+    wirePasswordToggle('btnToggleAiPageGeminiKey', 'aiPageGeminiKey');
+    wirePasswordToggle('btnToggleAiPageOpenaiKey', 'aiPageOpenaiKey');
+    wirePasswordToggle('btnToggleAiPageLocalAiKey', 'aiPageLocalAiKey');
 
     async function loadAuthConfig() {
         try {
             const res = await fetch('/auth/config');
             if (!res.ok) return;
             const cfg = await res.json();
+            allowRegistrationConfig = Boolean(cfg.allow_registration);
             if (tabAuthRegister) {
-                tabAuthRegister.hidden = !cfg.allow_registration;
-                if (!cfg.allow_registration && tabAuthRegister.getAttribute('aria-selected') === 'true') {
-                    switchAuthMode(tabAuthPassword);
+                tabAuthRegister.hidden = !allowRegistrationConfig;
+                if (!allowRegistrationConfig && tabAuthRegister.getAttribute('aria-selected') === 'true') {
+                    switchAuthMode(tabAuthPassword, { replaceHistory: loginScreen?.style.display !== 'none' });
                 }
             }
         } catch (err) {
@@ -1423,11 +1591,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function checkAuth() {
         await loadAuthConfig();
+        const initialNormPath = normalizePathname(window.location.pathname);
+        if (initialNormPath === '/login' || initialNormPath === '/register') {
+            pendingNextUrl = getPendingNextFromUrl();
+            showLoginGate({ preserveAuthUrl: true });
+            return;
+        }
+
         try {
             const res = await fetch('/auth/verify');
             if (res.ok) {
                 const data = await res.json();
-                handleSuccessfulLogin(data, getStoredToken());
+                await handleSuccessfulLogin(data, getStoredToken(), { fromInitialVerify: true });
             } else {
                 setStoredToken('');
                 showLoginGate();
@@ -1438,11 +1613,26 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function showLoginGate() {
+    function showLoginGate({ preserveAuthUrl = false, pushHistory = false } = {}) {
         if (dashboardContainer) dashboardContainer.style.display = 'none';
         if (loginScreen) loginScreen.style.display = 'flex';
         if (userProfileWidget) userProfileWidget.style.display = 'none';
         if (securitySeedBanner) securitySeedBanner.hidden = true;
+
+        const normPath = normalizePathname(window.location.pathname);
+        if (!preserveAuthUrl && normPath.startsWith('/app/')) {
+            const requestedAppTarget = normPath + window.location.search;
+            pendingNextUrl = requestedAppTarget !== '/app/overview' ? requestedAppTarget : '';
+            const targetAuthUrl = buildAuthUrl(tabAuthPassword, pendingNextUrl);
+            if (pushHistory) {
+                window.history.pushState({ auth: true }, '', targetAuthUrl);
+            } else {
+                window.history.replaceState({ auth: true }, '', targetAuthUrl);
+            }
+            switchAuthMode(tabAuthPassword);
+        } else {
+            syncAuthScreenFromUrl({ replaceNormalized: !pushHistory });
+        }
     }
 
     function computeInitials(account) {
@@ -1460,7 +1650,7 @@ document.addEventListener('DOMContentLoaded', () => {
         securitySeedBanner.hidden = !needsHardening;
     }
 
-    function handleSuccessfulLogin(userData, tokenOverride = '') {
+    async function handleSuccessfulLogin(userData, tokenOverride = '', { fromInitialVerify = false } = {}) {
         const account = userData.account || {};
         currentAccount = account;
         userRole = (account.role || 'reader').toLowerCase();
@@ -1481,6 +1671,9 @@ document.addEventListener('DOMContentLoaded', () => {
             localStorage.setItem('currentUser', account.username || '');
         }
 
+        const resolvedNext = getPendingNextFromUrl();
+        pendingNextUrl = '';
+
         applyRoleRestrictions();
         updateSeedSecurityBanner(account);
 
@@ -1489,9 +1682,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
         updateLocalProjectConfig();
 
+        if (!fromInitialVerify) {
+            const targetDestination = resolvedNext || buildContextualHref('/app/overview');
+            window.history.replaceState({}, '', targetDestination);
+            try {
+                const destUrl = new URL(targetDestination, window.location.origin);
+                const urlProj = (destUrl.searchParams.get('project') || '').trim();
+                const urlBr = (destUrl.searchParams.get('branch') || '').trim();
+                if (urlProj) {
+                    localStorage.setItem('activeProject', urlProj);
+                    if (urlBr) localStorage.setItem(`branch_${urlProj}`, urlBr === 'all' ? '%' : urlBr);
+                }
+            } catch (_) {
+                // ignore
+            }
+        }
+
         if (!isInitialized) {
             isInitialized = true;
-            initWorkbench();
+            await initWorkbench();
+        } else {
+            await applyRouteFromLocation({ replaceHistory: true, skipTransition: true, autoRunQuery: true });
         }
     }
 
@@ -1530,9 +1741,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if (extMcpCard) extMcpCard.style.display = isAdmin ? 'block' : 'none';
         if (btnReloadPlugins) btnReloadPlugins.style.display = isAdmin ? 'inline-flex' : 'none';
 
-        const activeAuthTab = document.getElementById('authTab');
+        const activeAuthTab = document.getElementById('authAdminTab');
         if (!isAdmin && activeAuthTab && activeAuthTab.classList.contains('active')) {
-            switchTab('dashboardTab');
+            navigateTo('/app/overview', { replace: true });
+        } else if (isInitialized) {
+            renderDomainSubnav(getRouteByPath(activeRoutePath));
         }
     }
 
@@ -1664,18 +1877,19 @@ document.addEventListener('DOMContentLoaded', () => {
             currentAccount = null;
             userRole = 'reader';
             isInitialized = false;
+            pendingNextUrl = '';
             if (loginToken) loginToken.value = '';
             if (loginPassword) loginPassword.value = '';
-            switchTab('dashboardTab');
-            showLoginGate();
             await loadAuthConfig();
+            window.history.pushState({ auth: true }, '', '/login');
+            showLoginGate({ preserveAuthUrl: true });
             showToast('Signed out cleanly.', 'info', 2500);
         });
     }
 
     if (btnBannerSetPassword) {
         btnBannerSetPassword.addEventListener('click', () => {
-            switchTab('profileTab');
+            navigateTo(buildContextualHref('/app/settings/profile'));
             if (newPasswordInput) {
                 requestAnimationFrame(() => newPasswordInput.focus());
             }
@@ -1683,13 +1897,209 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // =========================================================================
-    // 9. Workspace Context, Project/Branch Helpers & Sidebar Navigation
+    // 9. Workspace Context, URL Router (History API), Breadcrumbs & Sub-Nav
     // =========================================================================
     function getProjectContext() {
         const baseProject = (currentProjectSelect?.value || '').trim() || 'default';
         const rawBranch = currentBranchSelect ? currentBranchSelect.value : '';
         const branch = (!rawBranch || rawBranch === '%') ? 'main' : rawBranch;
         return { baseProject, rawBranch, branch, scopedId: activeUser || 'default' };
+    }
+
+    function buildContextualSearchParams(targetPath, { includeViewState = false, baseSearch = '', extraParams = {} } = {}) {
+        const params = new URLSearchParams(baseSearch || '');
+        // Strip auth-only params on /app/... routes
+        params.delete('next');
+
+        const { baseProject, rawBranch } = getProjectContext();
+        if (!baseSearch) {
+            if (baseProject && baseProject !== 'default') {
+                params.set('project', baseProject);
+            } else {
+                params.delete('project');
+            }
+            if (rawBranch && rawBranch !== '%') {
+                params.set('branch', rawBranch);
+            } else {
+                params.delete('branch');
+            }
+        } else {
+            if (!params.has('project') && baseProject && baseProject !== 'default') {
+                params.set('project', baseProject);
+            }
+            if (!params.has('branch') && rawBranch && rawBranch !== '%') {
+                params.set('branch', rawBranch);
+            }
+        }
+
+        if (includeViewState) {
+            if (targetPath === '/app/workspace/search') {
+                const qVal = (searchQuery?.value || '').trim();
+                const modeEl = document.querySelector('input[name="searchMode"]:checked');
+                const modeVal = modeEl ? modeEl.value : 'rag';
+                if (qVal) params.set('q', qVal);
+                else params.delete('q');
+                if (qVal || modeVal === 'raw') params.set('mode', modeVal);
+                else params.delete('mode');
+            } else {
+                params.delete('q');
+                if (params.get('mode') === 'rag' || params.get('mode') === 'raw') {
+                    params.delete('mode');
+                }
+            }
+
+            if (targetPath === '/app/graph/explorer') {
+                const symVal = (cgSearchInput?.value || '').trim();
+                const kindsVal = cgKindSelect ? cgKindSelect.value : 'class,function,method,file';
+                if (symVal) params.set('symbol', symVal);
+                else params.delete('symbol');
+                if (kindsVal && kindsVal !== 'class,function,method,file') params.set('kinds', kindsVal);
+                else params.delete('kinds');
+            } else {
+                params.delete('symbol');
+                params.delete('kinds');
+            }
+
+            if (targetPath === '/app/graph/diff') {
+                const baseVal = (diffBaseProject?.value || '').trim();
+                const targetVal = (diffTargetProject?.value || '').trim();
+                if (baseVal) params.set('base', baseVal);
+                else params.delete('base');
+                if (targetVal) params.set('target', targetVal);
+                else params.delete('target');
+            } else {
+                params.delete('base');
+                params.delete('target');
+            }
+        }
+
+        Object.entries(extraParams || {}).forEach(([k, v]) => {
+            if (v === null || v === undefined || v === '') params.delete(k);
+            else params.set(k, String(v));
+        });
+
+        return params;
+    }
+
+    function buildContextualHref(routePath, opts = {}) {
+        const normPath = normalizePathname(routePath);
+        if (normPath === '/login' || normPath === '/register') return normPath;
+        const params = buildContextualSearchParams(normPath, opts);
+        const qs = params.toString();
+        return qs ? `${normPath}?${qs}` : normPath;
+    }
+
+    function updateDocumentTitleAndRouteBadge(route) {
+        const activeRoute = route || getRouteByPath(activeRoutePath);
+        const { baseProject } = getProjectContext();
+        if (loginScreen && loginScreen.style.display !== 'none') {
+            return;
+        }
+        document.title = `${activeRoute.title} · ${baseProject} — ProjectBrain v3.0`;
+        if (activeRoutePathBadge) {
+            const fullRel = window.location.pathname + window.location.search;
+            activeRoutePathBadge.textContent = fullRel;
+            activeRoutePathBadge.title = window.location.href;
+        }
+    }
+
+    function refreshAllRouteLinks() {
+        document.querySelectorAll('[data-route]').forEach(el => {
+            const baseRoute = el.getAttribute('data-route');
+            if (!baseRoute) return;
+            el.setAttribute('href', buildContextualHref(baseRoute));
+        });
+        updateDocumentTitleAndRouteBadge(getRouteByPath(activeRoutePath));
+    }
+
+    function renderDomainSubnav(activeRoute) {
+        if (!domainSubnavList || !activeRoute) return;
+        const siblings = ROUTES.filter(r =>
+            r.domainSlug === activeRoute.domainSlug && (!r.adminOnly || userRole === 'admin')
+        );
+        domainSubnavList.innerHTML = siblings.map(r => {
+            const isCurrent = r.path === activeRoute.path;
+            const href = buildContextualHref(r.path);
+            return `
+                <li>
+                    <a href="${escapeHTML(href)}" class="domain-subnav-link" data-route="${escapeHTML(r.path)}" data-route-link${isCurrent ? ' aria-current="page"' : ''}>
+                        <i class="fa-solid ${escapeHTML(r.icon)}" aria-hidden="true"></i>
+                        <span>${escapeHTML(r.title)}</span>
+                    </a>
+                </li>
+            `;
+        }).join('');
+        if (domainSubnavBar) {
+            domainSubnavBar.setAttribute('aria-label', `${activeRoute.domainLabel} routes`);
+        }
+    }
+
+    function updateBreadcrumbsForRoute(route) {
+        if (!route) return;
+        const domainMeta = DOMAINS[route.domainSlug] || DOMAINS.workspace;
+        if (breadcrumbDomainLink) {
+            breadcrumbDomainLink.textContent = route.domainLabel;
+            breadcrumbDomainLink.setAttribute('data-route', domainMeta.defaultPath);
+            breadcrumbDomainLink.setAttribute('href', buildContextualHref(domainMeta.defaultPath));
+        }
+        if (breadcrumbPageLink) {
+            breadcrumbPageLink.textContent = route.title;
+            breadcrumbPageLink.setAttribute('data-route', route.path);
+            breadcrumbPageLink.setAttribute('href', buildContextualHref(route.path));
+            breadcrumbPageLink.setAttribute('aria-current', 'page');
+        }
+    }
+
+    function focusActiveRouteHeading(tabEl) {
+        if (!tabEl) return;
+        const heading = tabEl.querySelector('h2');
+        if (!heading) return;
+        if (!heading.hasAttribute('tabindex')) {
+            heading.setAttribute('tabindex', '-1');
+        }
+        heading.focus({ preventScroll: true });
+    }
+
+    async function copyActiveRouteUrl() {
+        const shareUrl = window.location.href;
+        try {
+            await navigator.clipboard.writeText(shareUrl);
+            if (btnCopyRouteUrl) {
+                const icon = btnCopyRouteUrl.querySelector('i');
+                if (icon) {
+                    const prevClass = icon.className;
+                    icon.className = 'fa-solid fa-check';
+                    setTimeout(() => {
+                        icon.className = prevClass;
+                    }, 1600);
+                }
+            }
+            showToast('Shareable route URL copied to clipboard.', 'success', 2400);
+        } catch (err) {
+            showToast('Failed to copy URL: ' + err.message, 'error');
+        }
+    }
+
+    if (btnCopyRouteUrl) {
+        btnCopyRouteUrl.addEventListener('click', copyActiveRouteUrl);
+    }
+
+    function syncCurrentRouteUrl({ replace = true } = {}) {
+        if (loginScreen && loginScreen.style.display !== 'none') return;
+        const normPath = normalizePathname(activeRoutePath || window.location.pathname);
+        if (!normPath.startsWith('/app/')) return;
+        const params = buildContextualSearchParams(normPath, { includeViewState: true });
+        const qs = params.toString();
+        const nextUrl = qs ? `${normPath}?${qs}` : normPath;
+        const currentUrl = window.location.pathname + window.location.search;
+        if (nextUrl !== currentUrl) {
+            if (replace) {
+                window.history.replaceState({ route: normPath }, '', nextUrl);
+            } else {
+                window.history.pushState({ route: normPath }, '', nextUrl);
+            }
+        }
+        refreshAllRouteLinks();
     }
 
     function updateBranchDropdown(baseId) {
@@ -1779,45 +2189,199 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function switchTab(targetTabId) {
-        if (!targetTabId) return;
-        if (targetTabId === 'authTab' && userRole !== 'admin') {
-            showToast('Admin privileges required for Identity & RBAC Admin.', 'warning');
+    function applyQueryStateFromSearch(searchStr) {
+        const params = new URLSearchParams(searchStr || '');
+        const urlProj = (params.get('project') || '').trim();
+        const rawUrlBranch = (params.get('branch') || '').trim();
+        const urlBranch = rawUrlBranch === 'all' ? '%' : rawUrlBranch;
+
+        let contextChanged = false;
+        if (urlProj && currentProjectSelect) {
+            if (!Array.from(currentProjectSelect.options).some(o => o.value === urlProj)) {
+                const opt = document.createElement('option');
+                opt.value = urlProj;
+                opt.textContent = urlProj;
+                currentProjectSelect.appendChild(opt);
+            }
+            if (currentProjectSelect.value !== urlProj) {
+                currentProjectSelect.value = urlProj;
+                localStorage.setItem('activeProject', urlProj);
+                updateBranchDropdown(urlProj);
+                contextChanged = true;
+            }
+            if (urlBranch && currentBranchSelect) {
+                if (!Array.from(currentBranchSelect.options).some(o => o.value === urlBranch)) {
+                    if (branchSelectorContainer) branchSelectorContainer.style.display = 'flex';
+                    const optB = document.createElement('option');
+                    optB.value = urlBranch;
+                    optB.textContent = urlBranch;
+                    currentBranchSelect.appendChild(optB);
+                }
+                if (currentBranchSelect.value !== urlBranch) {
+                    currentBranchSelect.value = urlBranch;
+                    localStorage.setItem(`branch_${urlProj}`, urlBranch);
+                    contextChanged = true;
+                }
+            }
+        }
+
+        if (contextChanged) {
+            recalculateActiveUser();
+            syncActiveProjectOnServer();
+            if (cgProjectSelect) {
+                if (activeUser !== 'default' && !Array.from(cgProjectSelect.options).some(o => o.value === activeUser)) {
+                    const optCg = document.createElement('option');
+                    optCg.value = activeUser;
+                    optCg.textContent = activeUser;
+                    cgProjectSelect.appendChild(optCg);
+                }
+                cgProjectSelect.value = activeUser === 'default' ? '' : activeUser;
+            }
+        }
+
+        return {
+            params,
+            q: params.has('q') ? (params.get('q') || '') : null,
+            mode: params.get('mode') || null,
+            symbol: params.has('symbol') ? (params.get('symbol') || '') : null,
+            kinds: params.get('kinds') || null,
+            base: params.get('base') || null,
+            target: params.get('target') || null
+        };
+    }
+
+    function activateRoute(route, { skipTransition = false, skipFocus = false, queryContext = null, autoRunQuery = false } = {}) {
+        if (!route) return;
+        if (route.adminOnly && userRole !== 'admin') {
+            showToast('Admin privileges required for Identity & RBAC.', 'warning');
+            navigateTo(buildContextualHref('/app/overview'), { replace: true, skipTransition: true });
             return;
         }
 
+        const targetTabId = route.tabId;
         const targetContent = document.getElementById(targetTabId);
         if (!targetContent) return;
+
+        const prevActiveContent = Array.from(tabContents).find(c => c.classList.contains('active'));
+        const prevTabId = prevActiveContent ? prevActiveContent.id : '';
 
         if (targetTabId !== 'codeGraphTab' && graphLayout?.classList.contains('is-fullscreen')) {
             setGraphFullscreen(false);
         }
 
-        tabLinks.forEach(btn => btn.classList.remove('active'));
-        tabContents.forEach(content => content.classList.remove('active'));
+        activeRoutePath = route.path;
 
-        const matchingLink = Array.from(tabLinks).find(l => l.getAttribute('data-tab') === targetTabId);
-        if (matchingLink) {
-            matchingLink.classList.add('active');
-            const domain = matchingLink.getAttribute('data-domain') || 'Workbench';
-            const navLabel = matchingLink.querySelector('.nav-label');
-            if (activeViewDomain) activeViewDomain.textContent = domain;
-            if (activeViewTitle && navLabel) activeViewTitle.textContent = navLabel.textContent.trim();
+        const runDomSwitch = () => {
+            tabLinks.forEach(link => {
+                const isMatch = link.getAttribute('data-tab') === targetTabId;
+                link.classList.toggle('active', isMatch);
+                if (isMatch) {
+                    link.setAttribute('aria-current', 'page');
+                } else {
+                    link.removeAttribute('aria-current');
+                }
+            });
+            tabContents.forEach(content => {
+                content.classList.toggle('active', content === targetContent);
+            });
+            updateBreadcrumbsForRoute(route);
+            renderDomainSubnav(route);
+            refreshAllRouteLinks();
+        };
+
+        const involvesCodeGraph = targetTabId === 'codeGraphTab' || prevTabId === 'codeGraphTab';
+        const canAnimateTransition = (
+            !skipTransition &&
+            !involvesCodeGraph &&
+            prevTabId !== targetTabId &&
+            typeof document.startViewTransition === 'function' &&
+            !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
+            !hasOpenModalDialog()
+        );
+
+        if (canAnimateTransition) {
+            const vt = document.startViewTransition(runDomSwitch);
+            vt.finished.finally(() => {
+                if (!skipFocus) focusActiveRouteHeading(targetContent);
+            });
+        } else {
+            runDomSwitch();
+            if (!skipFocus) focusActiveRouteHeading(targetContent);
         }
-        targetContent.classList.add('active');
 
+        // Trigger data loaders and apply view-specific query parameters
         if (targetTabId === 'dashboardTab') {
             loadStats();
             loadPluginSummary();
             loadHardwareStatus();
+        } else if (targetTabId === 'projectRegistryTab') {
+            loadProjectsList();
         } else if (targetTabId === 'memoriesTab') {
             loadMemories();
             loadIngestedDocuments();
+        } else if (targetTabId === 'searchTab') {
+            if (queryContext) {
+                if (queryContext.mode === 'raw' || queryContext.mode === 'rag') {
+                    const radio = document.querySelector(`input[name="searchMode"][value="${queryContext.mode}"]`);
+                    if (radio) radio.checked = true;
+                }
+                if (queryContext.q !== null && searchQuery) {
+                    searchQuery.value = queryContext.q;
+                }
+                if (autoRunQuery && queryContext.q && queryContext.q.trim()) {
+                    performSearch({ skipUrlSync: true });
+                }
+            }
         } else if (targetTabId === 'codeGraphTab') {
-            loadProjects();
-            setTimeout(loadCodeGraph, 100);
+            if (cgProjectSelect) {
+                const desiredCg = activeUser === 'default' ? '' : activeUser;
+                if (desiredCg && !Array.from(cgProjectSelect.options).some(o => o.value === desiredCg)) {
+                    const opt = document.createElement('option');
+                    opt.value = desiredCg;
+                    opt.textContent = desiredCg;
+                    cgProjectSelect.appendChild(opt);
+                }
+                cgProjectSelect.value = desiredCg;
+            }
+            if (queryContext) {
+                if (queryContext.symbol !== null && cgSearchInput) {
+                    cgSearchInput.value = queryContext.symbol;
+                }
+                if (queryContext.kinds && cgKindSelect) {
+                    if (!Array.from(cgKindSelect.options).some(o => o.value === queryContext.kinds)) {
+                        const optK = document.createElement('option');
+                        optK.value = queryContext.kinds;
+                        optK.textContent = queryContext.kinds;
+                        cgKindSelect.appendChild(optK);
+                    }
+                    cgKindSelect.value = queryContext.kinds;
+                }
+            }
+            setTimeout(() => loadCodeGraph({ skipUrlSync: true }), 40);
         } else if (targetTabId === 'compareTab') {
-            loadProjects();
+            if (queryContext) {
+                if (queryContext.base && diffBaseProject) {
+                    if (!Array.from(diffBaseProject.options).some(o => o.value === queryContext.base)) {
+                        const optB = document.createElement('option');
+                        optB.value = queryContext.base;
+                        optB.textContent = queryContext.base;
+                        diffBaseProject.appendChild(optB);
+                    }
+                    diffBaseProject.value = queryContext.base;
+                }
+                if (queryContext.target && diffTargetProject) {
+                    if (!Array.from(diffTargetProject.options).some(o => o.value === queryContext.target)) {
+                        const optT = document.createElement('option');
+                        optT.value = queryContext.target;
+                        optT.textContent = queryContext.target;
+                        diffTargetProject.appendChild(optT);
+                    }
+                    diffTargetProject.value = queryContext.target;
+                }
+                if (autoRunQuery && queryContext.base && queryContext.target) {
+                    compareVersions({ skipUrlSync: true });
+                }
+            }
         } else if (targetTabId === 'kbTab') {
             loadKbCoverage();
         } else if (targetTabId === 'pluginsTab') {
@@ -1828,24 +2392,142 @@ document.addEventListener('DOMContentLoaded', () => {
                 loadMcpStatus();
             }
             updateLocalProjectConfig();
-        } else if (targetTabId === 'projectRegistryTab') {
-            loadProjectsList();
+        } else if (targetTabId === 'aiSettingsTab') {
+            loadAiSettings({ probeOllama: true });
         } else if (targetTabId === 'profileTab') {
             loadProfileView();
-        } else if (targetTabId === 'authTab') {
+        } else if (targetTabId === 'authAdminTab') {
             loadAuthAdminView();
         }
     }
 
-    function setupTabsAndSidebar() {
-        tabLinks.forEach(link => {
-            link.addEventListener('click', () => {
-                const targetTab = link.getAttribute('data-tab');
-                switchTab(targetTab);
-            });
-        });
+    function navigateTo(rawUrl, { replace = false, skipTransition = false, skipFocus = false, autoRunQuery = true } = {}) {
+        let parsed;
+        try {
+            parsed = new URL(rawUrl || '/app/overview', window.location.origin);
+        } catch (_) {
+            parsed = new URL('/app/overview', window.location.origin);
+        }
 
+        const normPath = normalizePathname(parsed.pathname);
+        if (normPath === '/login' || normPath === '/register') {
+            const nextFull = normPath + parsed.search;
+            if (nextFull !== window.location.pathname + window.location.search) {
+                if (replace) window.history.replaceState({ auth: true }, '', nextFull);
+                else window.history.pushState({ auth: true }, '', nextFull);
+            }
+            showLoginGate({ preserveAuthUrl: true });
+            return;
+        }
+
+        const route = getRouteByPath(normPath);
+        if (route.adminOnly && userRole !== 'admin') {
+            showToast('Admin privileges required for Identity & RBAC.', 'warning');
+            return;
+        }
+
+        const queryContext = applyQueryStateFromSearch(parsed.search);
+        const mergedParams = buildContextualSearchParams(route.path, { baseSearch: parsed.search });
+        const qs = mergedParams.toString();
+        const canonicalUrl = qs ? `${route.path}?${qs}` : route.path;
+        const currentUrl = window.location.pathname + window.location.search;
+
+        if (canonicalUrl !== currentUrl) {
+            if (replace) {
+                window.history.replaceState({ route: route.path }, '', canonicalUrl);
+            } else {
+                window.history.pushState({ route: route.path }, '', canonicalUrl);
+            }
+        }
+
+        activateRoute(route, { skipTransition, skipFocus, queryContext, autoRunQuery });
+    }
+
+    async function applyRouteFromLocation({ replaceHistory = true, skipTransition = false, skipFocus = false, autoRunQuery = true } = {}) {
+        const rawPath = window.location.pathname;
+        const rawSearch = window.location.search;
+        const normPath = normalizePathname(rawPath);
+
+        if (normPath === '/login' || normPath === '/register') {
+            showLoginGate({ preserveAuthUrl: true });
+            return;
+        }
+
+        if (!currentAccount) {
+            showLoginGate({ preserveAuthUrl: false });
+            return;
+        }
+
+        let route = getRouteByPath(normPath);
+        if (route.adminOnly && userRole !== 'admin') {
+            showToast('Admin privileges required for Identity & RBAC.', 'warning');
+            route = ROUTES[0];
+        }
+
+        const queryContext = applyQueryStateFromSearch(rawSearch);
+        const mergedParams = buildContextualSearchParams(route.path, { baseSearch: rawSearch });
+        const qs = mergedParams.toString();
+        const canonicalUrl = qs ? `${route.path}?${qs}` : route.path;
+
+        if (replaceHistory && canonicalUrl !== rawPath + rawSearch) {
+            window.history.replaceState({ route: route.path }, '', canonicalUrl);
+        }
+
+        if (loginScreen && loginScreen.style.display !== 'none') {
+            loginScreen.style.display = 'none';
+            if (dashboardContainer) dashboardContainer.style.display = 'grid';
+            if (userProfileWidget) userProfileWidget.style.display = 'flex';
+        }
+
+        activateRoute(route, { skipTransition, skipFocus, queryContext, autoRunQuery });
+    }
+
+    function switchTab(targetTabId, opts = {}) {
+        if (!targetTabId) return;
+        const route = getRouteByTabId(targetTabId);
+        navigateTo(buildContextualHref(route.path), opts);
+    }
+
+    // Intercept normal left-clicks on internal route links while preserving Cmd/Ctrl/Middle/Right-click Open in New Tab
+    document.addEventListener('click', (e) => {
+        if (e.defaultPrevented) return;
+        if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        const anchor = e.target.closest('a[href]');
+        if (!anchor) return;
+        if (anchor.target && anchor.target !== '_self') return;
+        if (anchor.hasAttribute('download')) return;
+
+        const rawHref = anchor.getAttribute('href') || '';
+        if (!rawHref.startsWith('/') || rawHref.startsWith('//')) return;
+
+        let url;
+        try {
+            url = new URL(rawHref, window.location.origin);
+        } catch (_) {
+            return;
+        }
+        const normPath = normalizePathname(url.pathname);
+        if (normPath.startsWith('/app/') || normPath === '/login' || normPath === '/register') {
+            e.preventDefault();
+            if (aiSettingsDialog?.open && anchor.id === 'btnOpenFullAiPage') {
+                aiSettingsDialog.close('navigate');
+            }
+            navigateTo(url.pathname + url.search);
+        }
+    });
+
+    window.addEventListener('popstate', () => {
+        applyRouteFromLocation({
+            replaceHistory: false,
+            skipTransition: false,
+            skipFocus: false,
+            autoRunQuery: true
+        });
+    });
+
+    function setupTabsAndSidebar() {
         document.querySelectorAll('[data-tab-jump]').forEach(btn => {
+            if (btn.tagName === 'A') return;
             btn.addEventListener('click', () => {
                 const targetTab = btn.getAttribute('data-tab-jump');
                 switchTab(targetTab);
@@ -1869,7 +2551,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // =========================================================================
     // 10. Workbench Initialization & Event Binding
     // =========================================================================
-    function initWorkbench() {
+    async function initWorkbench() {
         if (!listenersBound) {
             listenersBound = true;
             setupTabsAndSidebar();
@@ -1877,7 +2559,14 @@ document.addEventListener('DOMContentLoaded', () => {
             setupV3SubTabs();
         }
 
-        loadProjects();
+        await loadProjects();
+        await applyRouteFromLocation({
+            replaceHistory: true,
+            skipTransition: true,
+            skipFocus: true,
+            autoRunQuery: true
+        });
+
         loadStats();
         loadMemories();
         loadIngestedDocuments();
@@ -1888,12 +2577,7 @@ document.addEventListener('DOMContentLoaded', () => {
             loadMcpStatus();
         }
 
-        fetch('/memory/active-project', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ project_id: activeUser })
-        }).catch(err => console.error('Failed to sync initial active project:', err));
-
+        syncActiveProjectOnServer();
         updateLocalProjectConfig();
     }
 
@@ -1906,6 +2590,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function onWorkspaceContextChanged() {
+        syncCurrentRouteUrl({ replace: true });
         syncActiveProjectOnServer();
         loadStats();
         loadMemories();
@@ -1917,7 +2602,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const cgTab = document.getElementById('codeGraphTab');
         if (cgTab && cgTab.classList.contains('active')) {
-            loadCodeGraph();
+            loadCodeGraph({ skipUrlSync: true });
         }
         const pluginsTab = document.getElementById('pluginsTab');
         if (pluginsTab && pluginsTab.classList.contains('active')) {
@@ -1956,7 +2641,9 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
 
-        if (btnCompareVersions) btnCompareVersions.addEventListener('click', compareVersions);
+        if (btnCompareVersions) btnCompareVersions.addEventListener('click', () => compareVersions());
+        if (diffBaseProject) diffBaseProject.addEventListener('change', () => syncCurrentRouteUrl({ replace: true }));
+        if (diffTargetProject) diffTargetProject.addEventListener('change', () => syncCurrentRouteUrl({ replace: true }));
         if (btnSaveMemory) btnSaveMemory.addEventListener('click', saveMemory);
         if (btnUploadDoc) btnUploadDoc.addEventListener('click', uploadDocument);
         if (docUploadFile) docUploadFile.addEventListener('change', handleFileSelect);
@@ -1988,17 +2675,21 @@ document.addEventListener('DOMContentLoaded', () => {
             loadMemories();
             loadIngestedDocuments();
         });
-        if (btnSearch) btnSearch.addEventListener('click', performSearch);
+        if (btnSearch) btnSearch.addEventListener('click', () => performSearch());
+        document.querySelectorAll('input[name="searchMode"]').forEach(radio => {
+            radio.addEventListener('change', () => syncCurrentRouteUrl({ replace: true }));
+        });
         if (btnGenerateDoc) btnGenerateDoc.addEventListener('click', generateDoc);
         if (btnCopyDoc) btnCopyDoc.addEventListener('click', copyDocToClipboard);
         if (btnDeleteAll) btnDeleteAll.addEventListener('click', deleteAllMemories);
 
-        if (btnOpenAiSettingsSearch) btnOpenAiSettingsSearch.addEventListener('click', openAiSettingsModal);
-        if (btnOpenAiSettingsCopilot) btnOpenAiSettingsCopilot.addEventListener('click', openAiSettingsModal);
-        if (btnOpenAiSettingsOverview) btnOpenAiSettingsOverview.addEventListener('click', openAiSettingsModal);
+        // AI Settings Modal & Dedicated Page (/app/settings/ai)
         if (btnRefreshAiProbe) btnRefreshAiProbe.addEventListener('click', () => loadAiSettings({ probeOllama: true }));
-        if (btnTestAiSettings) btnTestAiSettings.addEventListener('click', testAiSettingsConnection);
-        if (aiSettingsForm) aiSettingsForm.addEventListener('submit', saveAiSettings);
+        if (btnPageProbeAi) btnPageProbeAi.addEventListener('click', () => loadAiSettings({ probeOllama: true }));
+        if (btnTestAiSettings) btnTestAiSettings.addEventListener('click', () => testAiSettingsConnection('ai'));
+        if (btnPageTestAi) btnPageTestAi.addEventListener('click', () => testAiSettingsConnection('aiPage'));
+        if (aiSettingsForm) aiSettingsForm.addEventListener('submit', (e) => saveAiSettings(e, 'ai'));
+        if (aiPageForm) aiPageForm.addEventListener('submit', (e) => saveAiSettings(e, 'aiPage'));
         if (aiSettingsDialog) {
             const closeBtns = aiSettingsDialog.querySelectorAll('[command="close"][commandfor="aiSettingsDialog"]');
             closeBtns.forEach(btn => {
@@ -2015,7 +2706,7 @@ document.addEventListener('DOMContentLoaded', () => {
         document.addEventListener('click', (e) => {
             const trigger = e.target.closest('[data-open-ai-settings="true"]');
             if (trigger) {
-                openAiSettingsModal();
+                navigateTo(buildContextualHref('/app/settings/ai'));
             }
         });
 
@@ -2066,7 +2757,8 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         // CodeGraph Listeners
-        if (btnLoadCodeGraph) btnLoadCodeGraph.addEventListener('click', loadCodeGraph);
+        if (btnLoadCodeGraph) btnLoadCodeGraph.addEventListener('click', () => loadCodeGraph());
+        if (cgKindSelect) cgKindSelect.addEventListener('change', () => loadCodeGraph());
         if (btnGraphZoomIn) {
             btnGraphZoomIn.addEventListener('click', () => {
                 if (!cgNetwork) return;
@@ -2116,15 +2808,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 const val = e.target.value.trim();
                 activeUser = val || 'default';
                 if (currentProjectSelect) {
-                    const base = val.includes(':') ? val.split(':')[0] : (val || 'default');
+                    const colonIdx = val.indexOf(':');
+                    const base = colonIdx >= 0 ? val.slice(0, colonIdx) : (val || 'default');
+                    const br = colonIdx >= 0 ? val.slice(colonIdx + 1) : '';
                     if (Array.from(currentProjectSelect.options).some(o => o.value === base)) {
                         currentProjectSelect.value = base;
+                        localStorage.setItem('activeProject', base);
                         updateBranchDropdown(base);
+                        if (br && currentBranchSelect && Array.from(currentBranchSelect.options).some(o => o.value === br)) {
+                            currentBranchSelect.value = br;
+                            localStorage.setItem(`branch_${base}`, br);
+                        }
                     }
                 }
+                recalculateActiveUser();
+                syncCurrentRouteUrl({ replace: true });
                 loadStats();
                 loadMemories();
-                loadCodeGraph();
+                loadCodeGraph({ skipUrlSync: true });
             });
         }
 
@@ -2272,8 +2973,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         tagSpan.textContent = `${tagName}${tagCount}`;
                         tagSpan.addEventListener('click', () => {
                             if (searchQuery) searchQuery.value = `tag:${tagName}`;
-                            switchTab('searchTab');
-                            performSearch();
+                            navigateTo(buildContextualHref('/app/workspace/search', {
+                                extraParams: { q: `tag:${tagName}`, mode: 'rag' }
+                            }));
                         });
                         activeTags.appendChild(tagSpan);
                     });
@@ -2830,11 +3532,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function renderAiSettingsStatusBanner(data) {
-        if (!aiSettingsStatusBanner || !data) return;
-        const summaryEl = aiSettingsStatusBanner.querySelector('.ai-status-summary');
-        if (!summaryEl) return;
-
+    function renderAiStatusSummaryHtml(data) {
         const resolvedProvider = data.resolved_provider || 'local_rag';
         const resolvedLabel = toDisplayText(data.resolved_label, getShortProviderLabel(resolvedProvider));
         const engineTagClass = resolvedProvider === 'local_rag' ? 'info' : 'success';
@@ -2853,7 +3551,7 @@ document.addEventListener('DOMContentLoaded', () => {
             ? `Ollama: Ready (${ollamaModels.length > 0 ? ollamaModels.slice(0, 3).join(', ') + (ollamaModels.length > 3 ? ` +${ollamaModels.length - 3}` : '') : '0 models'})`
             : 'Ollama: Offline';
 
-        summaryEl.innerHTML = `
+        return `
             <span class="status-tag ${engineTagClass}">Resolved: ${escapeHTML(resolvedLabel)}</span>
             <span class="status-tag ${data.has_gemini_key ? 'success' : 'warning'}">${escapeHTML(geminiText)}</span>
             <span class="status-tag ${data.has_openai_key ? 'success' : 'warning'}">${escapeHTML(openaiText)}</span>
@@ -2861,35 +3559,80 @@ document.addEventListener('DOMContentLoaded', () => {
         `;
     }
 
-    function populateAiSettingsForm(data) {
+    function renderAiSettingsStatusBanner(data) {
         if (!data) return;
-        if (aiProviderSelect) aiProviderSelect.value = data.provider || 'auto';
-        if (aiEmbedSelect) aiEmbedSelect.value = data.emb_kind || 'synthetic';
-        if (aiFallbackLocalRag) aiFallbackLocalRag.checked = data.fallback_to_local_rag !== false;
+        const summaryHtml = renderAiStatusSummaryHtml(data);
+        [aiSettingsStatusBanner, aiPageStatusBanner].forEach(bannerEl => {
+            if (!bannerEl) return;
+            const summaryEl = bannerEl.querySelector('.ai-status-summary');
+            if (summaryEl) summaryEl.innerHTML = summaryHtml;
+        });
+    }
 
-        if (aiGeminiKey) aiGeminiKey.value = '';
-        if (aiClearGeminiKey) aiClearGeminiKey.checked = false;
-        if (aiGeminiKeyHint) {
-            aiGeminiKeyHint.textContent = data.has_gemini_key
+    function populateAiFormByPrefix(prefix, data) {
+        if (!data) return;
+        const el = (suffix) => document.getElementById(`${prefix}${suffix}`);
+
+        const providerSel = el('ProviderSelect');
+        const embedSel = el('EmbedSelect');
+        const fallbackChk = el('FallbackLocalRag');
+        if (providerSel) providerSel.value = data.provider || 'auto';
+        if (embedSel) embedSel.value = data.emb_kind || 'synthetic';
+        if (fallbackChk) fallbackChk.checked = data.fallback_to_local_rag !== false;
+
+        const geminiKey = el('GeminiKey');
+        const clearGemini = el('ClearGeminiKey');
+        const geminiHint = el('GeminiKeyHint');
+        const geminiModel = el('GeminiModel');
+        const geminiBase = el('GeminiBaseUrl');
+        if (geminiKey) geminiKey.value = '';
+        if (clearGemini) clearGemini.checked = false;
+        if (geminiHint) {
+            geminiHint.textContent = data.has_gemini_key
                 ? `Saved: ${toDisplayText(data.gemini_key_masked, 'Configured')}`
                 : 'Not configured';
         }
-        if (aiGeminiModel) aiGeminiModel.value = toDisplayText(data.gemini_model, 'gemini-2.5-flash');
-        if (aiGeminiBaseUrl) aiGeminiBaseUrl.value = toDisplayText(data.gemini_base_url, '');
+        if (geminiModel) geminiModel.value = toDisplayText(data.gemini_model, 'gemini-2.5-flash');
+        if (geminiBase) geminiBase.value = toDisplayText(data.gemini_base_url, '');
 
-        if (aiOpenaiKey) aiOpenaiKey.value = '';
-        if (aiClearOpenaiKey) aiClearOpenaiKey.checked = false;
-        if (aiOpenaiKeyHint) {
-            aiOpenaiKeyHint.textContent = data.has_openai_key
+        const openaiKey = el('OpenaiKey');
+        const clearOpenai = el('ClearOpenaiKey');
+        const openaiHint = el('OpenaiKeyHint');
+        const openaiBase = el('OpenaiBaseUrl');
+        const openaiModel = el('OpenaiModel');
+        if (openaiKey) openaiKey.value = '';
+        if (clearOpenai) clearOpenai.checked = false;
+        if (openaiHint) {
+            openaiHint.textContent = data.has_openai_key
                 ? `Saved: ${toDisplayText(data.openai_key_masked, 'Configured')}`
                 : 'Not configured';
         }
-        if (aiOpenaiBaseUrl) aiOpenaiBaseUrl.value = toDisplayText(data.openai_base_url, 'https://api.openai.com/v1');
-        if (aiOpenaiModel) aiOpenaiModel.value = toDisplayText(data.openai_model, 'gpt-4o-mini');
+        if (openaiBase) openaiBase.value = toDisplayText(data.openai_base_url, 'https://api.openai.com/v1');
+        if (openaiModel) openaiModel.value = toDisplayText(data.openai_model, 'gpt-4o-mini');
 
-        if (aiOllamaUrl) aiOllamaUrl.value = toDisplayText(data.ollama_url, 'http://localhost:11434');
-        if (aiOllamaModel) aiOllamaModel.value = toDisplayText(data.ollama_model, 'llama3.2');
-        if (aiOllamaVisionModel) aiOllamaVisionModel.value = toDisplayText(data.ollama_vision_model, 'qwen2.5vl:7b');
+        const ollamaUrl = el('OllamaUrl');
+        const ollamaModel = el('OllamaModel');
+        const ollamaVision = el('OllamaVisionModel');
+        if (ollamaUrl) ollamaUrl.value = toDisplayText(data.ollama_url, 'http://localhost:11434');
+        if (ollamaModel) ollamaModel.value = toDisplayText(data.ollama_model, 'llama3.2');
+        if (ollamaVision) ollamaVision.value = toDisplayText(data.ollama_vision_model, 'qwen2.5vl:7b');
+
+        const localBase = el('LocalAiBaseUrl');
+        const localModel = el('LocalAiModel');
+        const localKey = el('LocalAiKey');
+        const clearLocal = el('ClearLocalAiKey');
+        const localHint = el('LocalAiKeyHint');
+        if (localBase) localBase.value = toDisplayText(data.local_ai_base_url, '');
+        if (localModel) localModel.value = toDisplayText(data.local_ai_model, '');
+        if (localKey) localKey.value = '';
+        if (clearLocal) clearLocal.checked = false;
+        if (localHint) {
+            localHint.textContent = data.has_local_ai_key ? 'Saved (hidden)' : 'Not configured';
+        }
+    }
+
+    function populateAiSettingsForm(data) {
+        if (!data) return;
         if (ollamaModelSuggestions) {
             const models = Array.isArray(data.ollama_models)
                 ? data.ollama_models.map(m => toDisplayText(m)).filter(Boolean)
@@ -2898,36 +3641,50 @@ document.addEventListener('DOMContentLoaded', () => {
                 .map(m => `<option value="${escapeHTML(m)}"></option>`)
                 .join('');
         }
-
-        if (aiLocalAiBaseUrl) aiLocalAiBaseUrl.value = toDisplayText(data.local_ai_base_url, '');
-        if (aiLocalAiModel) aiLocalAiModel.value = toDisplayText(data.local_ai_model, '');
-        if (aiLocalAiKey) aiLocalAiKey.value = '';
-        if (aiClearLocalAiKey) aiClearLocalAiKey.checked = false;
-        if (aiLocalAiKeyHint) {
-            aiLocalAiKeyHint.textContent = data.has_local_ai_key ? 'Saved (hidden)' : 'Not configured';
-        }
+        populateAiFormByPrefix('ai', data);
+        populateAiFormByPrefix('aiPage', data);
     }
 
-    function collectAiSettingsPayload() {
+    function collectAiSettingsPayload(prefix = 'ai') {
+        const el = (suffix) => document.getElementById(`${prefix}${suffix}`);
+        const providerSel = el('ProviderSelect');
+        const fallbackChk = el('FallbackLocalRag');
+        const embedSel = el('EmbedSelect');
+        const geminiKey = el('GeminiKey');
+        const clearGemini = el('ClearGeminiKey');
+        const geminiModel = el('GeminiModel');
+        const geminiBase = el('GeminiBaseUrl');
+        const openaiKey = el('OpenaiKey');
+        const clearOpenai = el('ClearOpenaiKey');
+        const openaiBase = el('OpenaiBaseUrl');
+        const openaiModel = el('OpenaiModel');
+        const ollamaUrl = el('OllamaUrl');
+        const ollamaModel = el('OllamaModel');
+        const ollamaVision = el('OllamaVisionModel');
+        const localBase = el('LocalAiBaseUrl');
+        const localModel = el('LocalAiModel');
+        const localKey = el('LocalAiKey');
+        const clearLocal = el('ClearLocalAiKey');
+
         return {
-            provider: aiProviderSelect ? aiProviderSelect.value : 'auto',
-            fallback_to_local_rag: aiFallbackLocalRag ? Boolean(aiFallbackLocalRag.checked) : true,
-            emb_kind: aiEmbedSelect ? aiEmbedSelect.value : 'synthetic',
-            gemini_key: aiGeminiKey ? aiGeminiKey.value.trim() : '',
-            clear_gemini_key: aiClearGeminiKey ? Boolean(aiClearGeminiKey.checked) : false,
-            gemini_model: (aiGeminiModel?.value || '').trim() || 'gemini-2.5-flash',
-            gemini_base_url: (aiGeminiBaseUrl?.value || '').trim(),
-            openai_key: aiOpenaiKey ? aiOpenaiKey.value.trim() : '',
-            clear_openai_key: aiClearOpenaiKey ? Boolean(aiClearOpenaiKey.checked) : false,
-            openai_base_url: (aiOpenaiBaseUrl?.value || '').trim() || 'https://api.openai.com/v1',
-            openai_model: (aiOpenaiModel?.value || '').trim() || 'gpt-4o-mini',
-            ollama_url: (aiOllamaUrl?.value || '').trim() || 'http://localhost:11434',
-            ollama_model: (aiOllamaModel?.value || '').trim() || 'llama3.2',
-            ollama_vision_model: (aiOllamaVisionModel?.value || '').trim() || 'qwen2.5vl:7b',
-            local_ai_base_url: (aiLocalAiBaseUrl?.value || '').trim(),
-            local_ai_model: (aiLocalAiModel?.value || '').trim(),
-            local_ai_api_key: aiLocalAiKey ? aiLocalAiKey.value.trim() : '',
-            clear_local_ai_key: aiClearLocalAiKey ? Boolean(aiClearLocalAiKey.checked) : false
+            provider: providerSel ? providerSel.value : 'auto',
+            fallback_to_local_rag: fallbackChk ? Boolean(fallbackChk.checked) : true,
+            emb_kind: embedSel ? embedSel.value : 'synthetic',
+            gemini_key: geminiKey ? geminiKey.value.trim() : '',
+            clear_gemini_key: clearGemini ? Boolean(clearGemini.checked) : false,
+            gemini_model: (geminiModel?.value || '').trim() || 'gemini-2.5-flash',
+            gemini_base_url: (geminiBase?.value || '').trim(),
+            openai_key: openaiKey ? openaiKey.value.trim() : '',
+            clear_openai_key: clearOpenai ? Boolean(clearOpenai.checked) : false,
+            openai_base_url: (openaiBase?.value || '').trim() || 'https://api.openai.com/v1',
+            openai_model: (openaiModel?.value || '').trim() || 'gpt-4o-mini',
+            ollama_url: (ollamaUrl?.value || '').trim() || 'http://localhost:11434',
+            ollama_model: (ollamaModel?.value || '').trim() || 'llama3.2',
+            ollama_vision_model: (ollamaVision?.value || '').trim() || 'qwen2.5vl:7b',
+            local_ai_base_url: (localBase?.value || '').trim(),
+            local_ai_model: (localModel?.value || '').trim(),
+            local_ai_api_key: localKey ? localKey.value.trim() : '',
+            clear_local_ai_key: clearLocal ? Boolean(clearLocal.checked) : false
         };
     }
 
@@ -2964,28 +3721,32 @@ document.addEventListener('DOMContentLoaded', () => {
         await loadAiSettings({ probeOllama: true });
     }
 
-    async function testAiSettingsConnection() {
-        if (!aiSettingsTestOutput) return;
-        const origHtml = btnTestAiSettings ? btnTestAiSettings.innerHTML : '';
-        if (btnTestAiSettings) {
-            btnTestAiSettings.disabled = true;
-            btnTestAiSettings.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Testing...';
+    async function testAiSettingsConnection(prefix = 'ai') {
+        const isPage = prefix === 'aiPage';
+        const outputEl = isPage ? aiPageTestOutput : aiSettingsTestOutput;
+        const btnEl = isPage ? btnPageTestAi : btnTestAiSettings;
+        if (!outputEl) return;
+
+        const origHtml = btnEl ? btnEl.innerHTML : '';
+        if (btnEl) {
+            btnEl.disabled = true;
+            btnEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Testing...';
         }
-        aiSettingsTestOutput.hidden = false;
-        aiSettingsTestOutput.className = 'ai-test-banner';
-        aiSettingsTestOutput.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Probing AI provider connection...';
+        outputEl.hidden = false;
+        outputEl.className = isPage ? 'ai-test-banner section-spacer-sm' : 'ai-test-banner';
+        outputEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Probing AI provider connection...';
 
         try {
             const res = await fetch('/pm/ai-settings/test', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(collectAiSettingsPayload())
+                body: JSON.stringify(collectAiSettingsPayload(prefix))
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok || !data.ok) {
                 const errText = toDisplayText(data?.error || data?.detail, `Test failed (HTTP ${res.status})`);
-                aiSettingsTestOutput.className = 'ai-test-banner is-error';
-                aiSettingsTestOutput.innerHTML = `
+                outputEl.className = isPage ? 'ai-test-banner section-spacer-sm is-error' : 'ai-test-banner is-error';
+                outputEl.innerHTML = `
                     <div class="ai-test-meta">
                         <i class="fa-solid fa-circle-xmark" aria-hidden="true"></i>
                         <span>Connection Test Failed</span>
@@ -3000,8 +3761,8 @@ document.addEventListener('DOMContentLoaded', () => {
             const modelUsed = toDisplayText(data.model_used, '');
             const latency = data.latency_ms !== undefined && data.latency_ms !== null ? `${round(data.latency_ms, 1)} ms` : '';
             const replyPreview = toDisplayText(data.reply, 'OK');
-            aiSettingsTestOutput.className = 'ai-test-banner is-success';
-            aiSettingsTestOutput.innerHTML = `
+            outputEl.className = isPage ? 'ai-test-banner section-spacer-sm is-success' : 'ai-test-banner is-success';
+            outputEl.innerHTML = `
                 <div class="ai-test-meta">
                     <i class="fa-solid fa-circle-check" aria-hidden="true"></i>
                     <span>Connection Verified</span>
@@ -3012,8 +3773,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div class="ai-test-reply">${escapeHTML(replyPreview)}</div>
             `;
         } catch (err) {
-            aiSettingsTestOutput.className = 'ai-test-banner is-error';
-            aiSettingsTestOutput.innerHTML = `
+            outputEl.className = isPage ? 'ai-test-banner section-spacer-sm is-error' : 'ai-test-banner is-error';
+            outputEl.innerHTML = `
                 <div class="ai-test-meta">
                     <i class="fa-solid fa-circle-xmark" aria-hidden="true"></i>
                     <span>Connection Test Failed</span>
@@ -3021,26 +3782,28 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div class="ai-test-reply">${escapeHTML(toDisplayText(err?.message, 'Network error'))}</div>
             `;
         } finally {
-            if (btnTestAiSettings) {
-                btnTestAiSettings.disabled = false;
-                btnTestAiSettings.innerHTML = origHtml || '<i class="fa-solid fa-plug-circle-check" aria-hidden="true"></i> Test Connection';
+            if (btnEl) {
+                btnEl.disabled = false;
+                btnEl.innerHTML = origHtml || '<i class="fa-solid fa-plug-circle-check" aria-hidden="true"></i> Test Connection';
             }
         }
     }
 
-    async function saveAiSettings(e) {
+    async function saveAiSettings(e, prefix = 'ai') {
         e.preventDefault();
-        const origHtml = btnSaveAiSettings ? btnSaveAiSettings.innerHTML : '';
-        if (btnSaveAiSettings) {
-            btnSaveAiSettings.disabled = true;
-            btnSaveAiSettings.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Saving...';
+        const isPage = prefix === 'aiPage';
+        const btnEl = isPage ? btnPageSaveAi : btnSaveAiSettings;
+        const origHtml = btnEl ? btnEl.innerHTML : '';
+        if (btnEl) {
+            btnEl.disabled = true;
+            btnEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Saving...';
         }
 
         try {
             const res = await fetch('/pm/ai-settings', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(collectAiSettingsPayload())
+                body: JSON.stringify(collectAiSettingsPayload(prefix))
             });
             if (!res.ok) {
                 throw new Error(await extractErrorMessage(res, 'Failed to save AI & LLM settings.'));
@@ -3050,7 +3813,7 @@ document.addEventListener('DOMContentLoaded', () => {
             updateAiEngineBadges(updated);
             renderAiSettingsStatusBanner(updated);
             populateAiSettingsForm(updated);
-            if (aiSettingsDialog?.open) {
+            if (!isPage && aiSettingsDialog?.open) {
                 aiSettingsDialog.close('saved');
             }
             const label = toDisplayText(updated.resolved_label || updated.provider, 'updated');
@@ -3058,9 +3821,11 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (err) {
             showToast('Failed to save AI settings: ' + err.message, 'error');
         } finally {
-            if (btnSaveAiSettings) {
-                btnSaveAiSettings.disabled = false;
-                btnSaveAiSettings.innerHTML = origHtml || '<i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save Settings';
+            if (btnEl) {
+                btnEl.disabled = false;
+                btnEl.innerHTML = origHtml || (isPage
+                    ? '<i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save AI Settings'
+                    : '<i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save Settings');
             }
         }
     }
@@ -3068,9 +3833,12 @@ document.addEventListener('DOMContentLoaded', () => {
     // =========================================================================
     // 13. Semantic Search & PM Copilot
     // =========================================================================
-    async function performSearch() {
+    async function performSearch({ skipUrlSync = false } = {}) {
         const query = (searchQuery?.value || '').trim();
         if (!query || !searchResults) return;
+        if (!skipUrlSync) {
+            syncCurrentRouteUrl({ replace: true });
+        }
 
         searchResults.innerHTML = '<div class="loader"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Searching ProjectBrain...</div>';
         const modeEl = document.querySelector('input[name="searchMode"]:checked');
@@ -3730,8 +4498,11 @@ document.addEventListener('DOMContentLoaded', () => {
         cgResizeObserver.observe(targetEl);
     }
 
-    async function loadCodeGraph() {
+    async function loadCodeGraph({ skipUrlSync = false } = {}) {
         if (!graphLoader || !graphEmptyState || !nodeDetailsPanel) return;
+        if (!skipUrlSync) {
+            syncCurrentRouteUrl({ replace: true });
+        }
         graphLoader.style.display = 'flex';
         graphEmptyState.style.display = 'none';
         nodeDetailsPanel.style.display = 'none';
@@ -4262,15 +5033,43 @@ document.addEventListener('DOMContentLoaded', () => {
                     optGlobal.textContent = `${group.id}${ipSuffix}`;
                     currentProjectSelect.appendChild(optGlobal);
                 });
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlProject = (urlParams.get('project') || '').trim();
+                const rawUrlBranch = (urlParams.get('branch') || '').trim();
+                const urlBranch = rawUrlBranch === 'all' ? '%' : rawUrlBranch;
                 const savedProject = localStorage.getItem('activeProject');
-                const projectToRestore = savedProject || currentGlobalVal || 'default';
+                const projectToRestore = urlProject || savedProject || currentGlobalVal || 'default';
+                if (urlProject && !Array.from(currentProjectSelect.options).some(o => o.value === urlProject)) {
+                    const optUrlProj = document.createElement('option');
+                    optUrlProj.value = urlProject;
+                    optUrlProj.textContent = urlProject;
+                    currentProjectSelect.appendChild(optUrlProj);
+                }
                 if (projectToRestore && Array.from(currentProjectSelect.options).some(o => o.value === projectToRestore)) {
                     currentProjectSelect.value = projectToRestore;
                 } else {
                     currentProjectSelect.value = 'default';
                 }
                 updateBranchDropdown(currentProjectSelect.value);
+                if (urlBranch && currentBranchSelect) {
+                    if (!Array.from(currentBranchSelect.options).some(o => o.value === urlBranch)) {
+                        if (branchSelectorContainer) branchSelectorContainer.style.display = 'flex';
+                        const optUrlBranch = document.createElement('option');
+                        optUrlBranch.value = urlBranch;
+                        optUrlBranch.textContent = urlBranch;
+                        currentBranchSelect.appendChild(optUrlBranch);
+                    }
+                    currentBranchSelect.value = urlBranch;
+                    localStorage.setItem(`branch_${currentProjectSelect.value}`, urlBranch);
+                }
                 recalculateActiveUser();
+                if (cgProjectSelect) {
+                    const desiredCg = activeUser === 'default' ? '' : activeUser;
+                    if (desiredCg && Array.from(cgProjectSelect.options).some(o => o.value === desiredCg)) {
+                        cgProjectSelect.value = desiredCg;
+                    }
+                }
+                refreshAllRouteLinks();
             } else {
                 updateActiveTenantStorageHint();
             }
@@ -4506,12 +5305,15 @@ document.addEventListener('DOMContentLoaded', () => {
         return el;
     }
 
-    async function compareVersions() {
+    async function compareVersions({ skipUrlSync = false } = {}) {
         const base = diffBaseProject ? diffBaseProject.value : '';
         const target = diffTargetProject ? diffTargetProject.value : '';
         if (!base || !target) {
             showToast('Please select both base and target versions.', 'warning');
             return;
+        }
+        if (!skipUrlSync) {
+            syncCurrentRouteUrl({ replace: true });
         }
 
         if (btnCompareVersions) {
@@ -5849,7 +6651,11 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to revoke session.'));
             if (isCurrent) {
                 setStoredToken('');
-                showLoginGate();
+                currentAccount = null;
+                userRole = 'reader';
+                isInitialized = false;
+                window.history.pushState({ auth: true }, '', '/login');
+                showLoginGate({ preserveAuthUrl: true });
                 showToast('Current session revoked.', 'info');
             } else {
                 showToast('Session revoked.', 'success');

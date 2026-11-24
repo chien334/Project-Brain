@@ -11,7 +11,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="/static/style.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
 </head>
@@ -173,9 +173,20 @@
             <button type="button" id="btnToggleSidebar" class="btn-icon-only" aria-label="Toggle navigation sidebar" aria-expanded="true" title="Toggle Sidebar">
                 <i class="fa-solid fa-bars-staggered" aria-hidden="true"></i>
             </button>
-            <div class="view-breadcrumb">
-                <span class="breadcrumb-domain" id="activeViewDomain">Workspace &amp; Memory</span>
-                <h1 id="activeViewTitle">Overview</h1>
+            <div class="header-route-stack">
+                <nav class="breadcrumb" aria-label="Breadcrumbs">
+                    <ol id="headerBreadcrumbList">
+                        <li><a href="/app/overview" data-route="/app/overview" data-route-link>Workbench</a></li>
+                        <li><a href="/app/overview" id="breadcrumbDomainLink" data-route="/app/overview" data-route-link>Workspace</a></li>
+                        <li><a href="/app/overview" id="breadcrumbPageLink" aria-current="page" data-route="/app/overview" data-route-link>Overview</a></li>
+                    </ol>
+                </nav>
+                <div class="route-url-bar">
+                    <code id="activeRoutePathBadge" class="route-path-chip code-font">/app/overview</code>
+                    <button type="button" id="btnCopyRouteUrl" class="btn-route-copy" title="Copy shareable route URL" aria-label="Copy shareable route URL">
+                        <i class="fa-regular fa-copy" aria-hidden="true"></i>
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -229,9 +240,9 @@
                     <span class="widget-role" id="userProfileRole"></span>
                 </div>
                 <input type="text" id="currentUser" class="visually-hidden" aria-label="Current user identifier">
-                <button type="button" id="btnQuickProfile" class="btn-icon-only" data-tab-jump="profileTab" title="My Profile &amp; API Keys" aria-label="My Profile and API Keys">
+                <a href="/app/settings/profile" id="btnQuickProfile" class="btn-icon-only" data-route="/app/settings/profile" data-route-link title="My Profile &amp; Keys" aria-label="My Profile and Keys">
                     <i class="fa-solid fa-id-badge" aria-hidden="true"></i>
-                </button>
+                </a>
                 <button type="button" id="btnLogout" title="Sign Out" aria-label="Sign Out">
                     <i class="fa-solid fa-right-from-bracket" aria-hidden="true"></i>
                 </button>
@@ -243,7 +254,7 @@
     <main class="dashboard-container">
         <!-- Unified Left-Rail Sidebar -->
         <aside class="sidebar-panel navigation-sidebar" aria-label="Primary workbench navigation">
-            <div class="sidebar-logo">
+            <a href="/app/overview" class="sidebar-logo" data-route="/app/overview" data-route-link>
                 <span class="brand-glyph brand-glyph-sm" aria-hidden="true">
                     <i class="fa-solid fa-diagram-project"></i>
                 </span>
@@ -251,82 +262,89 @@
                     <span class="sidebar-brand-name">ProjectBrain</span>
                     <span class="sidebar-brand-tag">v3.0 Studio</span>
                 </div>
-            </div>
+            </a>
 
             <nav class="nav-menu" aria-label="Workbench domains">
                 <div class="nav-domain-group">
-                    <span class="nav-domain-label">Workspace &amp; Memory</span>
-                    <button type="button" class="menu-link active" data-tab="dashboardTab" data-domain="Workspace &amp; Memory">
+                    <span class="nav-domain-label">Workspace</span>
+                    <a href="/app/overview" class="menu-link active" aria-current="page" id="btnTabDashboard" data-tab="dashboardTab" data-route="/app/overview" data-domain="Workspace" data-route-link>
                         <i class="fa-solid fa-gauge-high" aria-hidden="true"></i>
                         <span class="nav-label">Overview</span>
-                    </button>
-                    <button type="button" class="menu-link" data-tab="memoriesTab" data-domain="Workspace &amp; Memory">
+                    </a>
+                    <a href="/app/workspace/projects" class="menu-link" id="btnTabProjectRegistry" data-tab="projectRegistryTab" data-route="/app/workspace/projects" data-domain="Workspace" data-route-link>
+                        <i class="fa-solid fa-folder-tree" aria-hidden="true"></i>
+                        <span class="nav-label">Projects &amp; Databases</span>
+                    </a>
+                    <a href="/app/workspace/memories" class="menu-link" id="btnTabMemories" data-tab="memoriesTab" data-route="/app/workspace/memories" data-domain="Workspace" data-route-link>
                         <i class="fa-solid fa-layer-group" aria-hidden="true"></i>
-                        <span class="nav-label">Memory &amp; Docs</span>
-                    </button>
-                    <button type="button" class="menu-link" data-tab="searchTab" data-domain="Workspace &amp; Memory">
+                        <span class="nav-label">Memories &amp; Docs</span>
+                    </a>
+                    <a href="/app/workspace/search" class="menu-link" id="btnTabSearch" data-tab="searchTab" data-route="/app/workspace/search" data-domain="Workspace" data-route-link>
                         <i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i>
                         <span class="nav-label">Semantic Search</span>
-                    </button>
+                    </a>
                 </div>
 
                 <div class="nav-domain-group">
-                    <span class="nav-domain-label">Code &amp; Knowledge Graph</span>
-                    <button type="button" class="menu-link" data-tab="codeGraphTab" id="btnTabCodeGraph" data-domain="Code &amp; Knowledge Graph">
+                    <span class="nav-domain-label">Code &amp; Knowledge</span>
+                    <a href="/app/graph/explorer" class="menu-link" id="btnTabCodeGraph" data-tab="codeGraphTab" data-route="/app/graph/explorer" data-domain="Code &amp; Knowledge" data-route-link>
                         <i class="fa-solid fa-circle-nodes" aria-hidden="true"></i>
                         <span class="nav-label">Graph Explorer</span>
-                    </button>
-                    <button type="button" class="menu-link" data-tab="compareTab" id="btnTabCompare" data-domain="Code &amp; Knowledge Graph">
+                    </a>
+                    <a href="/app/graph/diff" class="menu-link" id="btnTabCompare" data-tab="compareTab" data-route="/app/graph/diff" data-domain="Code &amp; Knowledge" data-route-link>
                         <i class="fa-solid fa-code-compare" aria-hidden="true"></i>
                         <span class="nav-label">Branch Diff</span>
-                    </button>
-                    <button type="button" class="menu-link" data-tab="kbTab" id="btnTabKb" data-domain="Code &amp; Knowledge Graph">
+                    </a>
+                    <a href="/app/kb" class="menu-link" id="btnTabKb" data-tab="kbTab" data-route="/app/kb" data-domain="Code &amp; Knowledge" data-route-link>
                         <i class="fa-solid fa-book-atlas" aria-hidden="true"></i>
                         <span class="nav-label">Unified KB &amp; Trace</span>
-                    </button>
-                    <button type="button" class="menu-link" data-tab="copilotTab" data-domain="Code &amp; Knowledge Graph">
+                    </a>
+                    <a href="/app/copilot" class="menu-link" id="btnTabCopilot" data-tab="copilotTab" data-route="/app/copilot" data-domain="Code &amp; Knowledge" data-route-link>
                         <i class="fa-solid fa-file-pen" aria-hidden="true"></i>
                         <span class="nav-label">PM Copilot</span>
-                    </button>
+                    </a>
                 </div>
 
                 <div class="nav-domain-group">
-                    <span class="nav-domain-label">Microkernel &amp; v3 QA</span>
-                    <button type="button" class="menu-link" data-tab="pluginsTab" id="btnTabPlugins" data-domain="Microkernel &amp; v3 QA">
+                    <span class="nav-domain-label">Platform &amp; QA</span>
+                    <a href="/app/platform/plugins" class="menu-link" id="btnTabPlugins" data-tab="pluginsTab" data-route="/app/platform/plugins" data-domain="Platform &amp; QA" data-route-link>
                         <i class="fa-solid fa-cubes" aria-hidden="true"></i>
                         <span class="nav-label">Plugins &amp; Hardware</span>
                         <span class="nav-badge mono-num">26</span>
-                    </button>
-                    <button type="button" class="menu-link" data-tab="v3TestingTab" id="btnTabV3" data-domain="Microkernel &amp; v3 QA">
+                    </a>
+                    <a href="/app/platform/qa" class="menu-link" id="btnTabV3" data-tab="v3TestingTab" data-route="/app/platform/qa" data-domain="Platform &amp; QA" data-route-link>
                         <i class="fa-solid fa-vial-circle-check" aria-hidden="true"></i>
-                        <span class="nav-label">v3.0 Testing Layer 1</span>
-                    </button>
-                    <button type="button" class="menu-link" data-tab="projectRegistryTab" id="btnTabProjectRegistry" data-domain="Microkernel &amp; v3 QA">
-                        <i class="fa-solid fa-folder-tree" aria-hidden="true"></i>
-                        <span class="nav-label">Projects &amp; Databases</span>
-                    </button>
-                    <button type="button" class="menu-link" data-tab="mcpTab" data-domain="Microkernel &amp; v3 QA">
+                        <span class="nav-label">v3.0 QA Layer 1</span>
+                    </a>
+                    <a href="/app/platform/mcp" class="menu-link" id="btnTabMcp" data-tab="mcpTab" data-route="/app/platform/mcp" data-domain="Platform &amp; QA" data-route-link>
                         <i class="fa-solid fa-network-wired" aria-hidden="true"></i>
                         <span class="nav-label">MCP Clients</span>
-                    </button>
+                    </a>
                 </div>
 
                 <div class="nav-domain-group">
-                    <span class="nav-domain-label">Identity &amp; Security</span>
-                    <button type="button" class="menu-link" data-tab="profileTab" id="btnTabProfile" data-domain="Identity &amp; Security">
-                        <i class="fa-solid fa-id-card-clip" aria-hidden="true"></i>
-                        <span class="nav-label">My Profile &amp; API Keys</span>
-                    </button>
-                    <button type="button" class="menu-link" data-tab="authTab" id="btnTabAuth" data-domain="Identity &amp; Security">
+                    <span class="nav-domain-label">Settings &amp; IAM</span>
+                    <a href="/app/settings/ai" class="menu-link" id="btnTabAiSettings" data-tab="aiSettingsTab" data-route="/app/settings/ai" data-domain="Settings &amp; IAM" data-route-link>
+                        <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>
+                        <span class="nav-label">AI &amp; LLM Settings</span>
+                    </a>
+                    <a href="/app/settings/profile" class="menu-link" id="btnTabProfile" data-tab="profileTab" data-route="/app/settings/profile" data-domain="Settings &amp; IAM" data-route-link>
+                        <i class="fa-solid fa-id-badge" aria-hidden="true"></i>
+                        <span class="nav-label">My Profile &amp; Keys</span>
+                    </a>
+                    <a href="/app/settings/iam" class="menu-link" id="btnTabAuth" data-tab="authAdminTab" data-route="/app/settings/iam" data-domain="Settings &amp; IAM" data-route-link>
                         <i class="fa-solid fa-user-shield" aria-hidden="true"></i>
-                        <span class="nav-label">Identity &amp; RBAC Admin</span>
-                    </button>
+                        <span class="nav-label">Identity &amp; RBAC</span>
+                    </a>
                 </div>
             </nav>
         </aside>
 
         <!-- Main Content Area -->
-        <section class="main-content" aria-label="Active workbench panel">
+        <section class="main-content workspace-panel" aria-label="Active workbench panel">
+            <nav id="domainSubnavBar" class="domain-subnav-bar" aria-label="Section routes">
+                <ul id="domainSubnavList" class="domain-subnav-list"></ul>
+            </nav>
             <!-- Tab 0: Overview (System Dashboard) -->
             <div class="tab-content active" id="dashboardTab">
                 <div class="view-header">
@@ -425,21 +443,24 @@
                                 <h3><i class="fa-solid fa-bolt" aria-hidden="true"></i> Quick Workbench Actions</h3>
                             </div>
                             <div class="quick-actions-grid">
-                                <button type="button" class="btn btn-secondary" data-tab-jump="memoriesTab">
+                                <a href="/app/workspace/projects" class="btn btn-secondary" data-route="/app/workspace/projects" data-route-link>
+                                    <i class="fa-solid fa-folder-tree" aria-hidden="true"></i> Projects &amp; Databases
+                                </a>
+                                <a href="/app/workspace/memories" class="btn btn-secondary" data-route="/app/workspace/memories" data-route-link>
                                     <i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i> Ingest Document
-                                </button>
-                                <button type="button" class="btn btn-secondary" data-tab-jump="kbTab">
+                                </a>
+                                <a href="/app/kb" class="btn btn-secondary" data-route="/app/kb" data-route-link>
                                     <i class="fa-solid fa-book-atlas" aria-hidden="true"></i> Build Unified KB
-                                </button>
-                                <button type="button" class="btn btn-secondary" data-tab-jump="pluginsTab">
+                                </a>
+                                <a href="/app/platform/plugins" class="btn btn-secondary" data-route="/app/platform/plugins" data-route-link>
                                     <i class="fa-solid fa-cubes" aria-hidden="true"></i> Inspect Plugins
-                                </button>
-                                <button type="button" class="btn btn-secondary" data-tab-jump="v3TestingTab">
-                                    <i class="fa-solid fa-vial-circle-check" aria-hidden="true"></i> v3.0 Layer 1 QA
-                                </button>
-                                <button type="button" id="btnOpenAiSettingsOverview" class="btn btn-secondary">
-                                    <i class="fa-solid fa-sliders" aria-hidden="true"></i> AI &amp; LLM Settings
-                                </button>
+                                </a>
+                                <a href="/app/platform/qa" class="btn btn-secondary" data-route="/app/platform/qa" data-route-link>
+                                    <i class="fa-solid fa-vial-circle-check" aria-hidden="true"></i> v3.0 QA Layer 1
+                                </a>
+                                <a href="/app/settings/ai" id="btnOpenAiSettingsOverview" class="btn btn-secondary" data-route="/app/settings/ai" data-route-link>
+                                    <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> AI &amp; LLM Settings
+                                </a>
                             </div>
                         </div>
 
@@ -582,9 +603,9 @@
                         </div>
                         <div class="search-provider-bar">
                             <span id="searchActiveAiBadge" class="status-tag info">Engine: Auto (Local RAG)</span>
-                            <button type="button" id="btnOpenAiSettingsSearch" class="btn btn-secondary btn-sm">
-                                <i class="fa-solid fa-sliders" aria-hidden="true"></i> AI Settings
-                            </button>
+                            <a href="/app/settings/ai" id="btnOpenAiSettingsSearch" class="btn btn-secondary btn-sm" data-route="/app/settings/ai" data-route-link>
+                                <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> AI Settings
+                            </a>
                         </div>
                     </div>
                 </div>
@@ -606,9 +627,9 @@
                     </div>
                     <div class="copilot-provider-bar">
                         <span id="copilotActiveAiBadge" class="status-tag info">Engine: Auto</span>
-                        <button type="button" id="btnOpenAiSettingsCopilot" class="btn btn-secondary btn-sm">
-                            <i class="fa-solid fa-sliders" aria-hidden="true"></i> AI Settings
-                        </button>
+                        <a href="/app/settings/ai" id="btnOpenAiSettingsCopilot" class="btn btn-secondary btn-sm" data-route="/app/settings/ai" data-route-link>
+                            <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> AI Settings
+                        </a>
                     </div>
                 </div>
 
@@ -1212,6 +1233,219 @@
                 </div>
             </div>
 
+            <!-- Tab: AI & LLM Provider Settings (Dedicated Route /app/settings/ai) -->
+            <div class="tab-content" id="aiSettingsTab">
+                <div class="card-header-action">
+                    <div>
+                        <h2>AI &amp; LLM Provider Settings</h2>
+                        <p class="description-text">Configure cloud LLM credentials (Gemini, OpenAI, MiniMax), local inference servers (Ollama, vLLM), vector embeddings, and zero-key Offline Local RAG fallback.</p>
+                    </div>
+                    <button type="button" id="btnPageProbeAi" class="btn btn-secondary">
+                        <i class="fa-solid fa-rotate" aria-hidden="true"></i> Probe Local AI
+                    </button>
+                </div>
+
+                <div class="ai-studio-layout">
+                    <!-- Left Column: Live Provider Resolution & Deterministic Routing Architecture -->
+                    <div class="stack-col">
+                        <div class="card">
+                            <div class="card-title-row">
+                                <h3><i class="fa-solid fa-satellite-dish" aria-hidden="true"></i> Resolved Engine &amp; Runtimes</h3>
+                                <span class="status-tag info">Live Probe</span>
+                            </div>
+                            <div id="aiPageStatusBanner" class="ai-status-banner" aria-live="polite">
+                                <div class="ai-status-summary">
+                                    <span class="status-tag info">Resolved Engine: Detecting...</span>
+                                </div>
+                            </div>
+                            <div id="aiPageTestOutput" class="ai-test-banner section-spacer-sm" hidden aria-live="polite"></div>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-title-row">
+                                <h3><i class="fa-solid fa-route" aria-hidden="true"></i> Deterministic Fallback Chain</h3>
+                            </div>
+                            <ol class="ai-routing-chain">
+                                <li>
+                                    <strong>1. Cloud API Provider (when configured)</strong>
+                                    <span>Uses Google Gemini, OpenAI-compatible, or MiniMax keys for high-depth synthesis.</span>
+                                </li>
+                                <li>
+                                    <strong>2. Local Inference Server (Ollama / vLLM)</strong>
+                                    <span>Routes on-premise to <code>localhost:11434</code> or OpenAI-compatible local endpoints with zero external egress.</span>
+                                </li>
+                                <li>
+                                    <strong>3. Built-in Offline Local RAG</strong>
+                                    <span>Always-on deterministic keyword + vector + graph synthesis requiring zero API keys or GPU servers.</span>
+                                </li>
+                            </ol>
+                            <div class="quick-actions-grid section-spacer-sm">
+                                <a href="/app/workspace/search" class="btn btn-secondary btn-sm" data-route="/app/workspace/search" data-route-link>
+                                    <i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i> Open Semantic Search
+                                </a>
+                                <a href="/app/copilot" class="btn btn-secondary btn-sm" data-route="/app/copilot" data-route-link>
+                                    <i class="fa-solid fa-file-pen" aria-hidden="true"></i> Open PM Copilot
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Right Column: Full-Page Provider & Credentials Configuration Form -->
+                    <div class="card">
+                        <h3><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Provider &amp; Credential Configuration</h3>
+                        <form id="aiPageForm" class="stack-form ai-settings-form">
+                            <div class="ai-settings-row">
+                                <div class="form-group">
+                                    <label for="aiPageProviderSelect">Active AI Chat / RAG Provider</label>
+                                    <select id="aiPageProviderSelect">
+                                        <option value="auto">Auto (Cloud Key &rarr; Local Ollama/vLLM &rarr; Offline Local RAG)</option>
+                                        <option value="local_rag">Built-in Offline Local RAG (No API Key Required)</option>
+                                        <option value="gemini">Google Gemini / AI Studio / OpenRouter</option>
+                                        <option value="openai">OpenAI / vLLM / LM Studio Compatible</option>
+                                        <option value="ollama">Ollama Local Server</option>
+                                        <option value="minimax">MiniMax API</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="aiPageEmbedSelect">Vector Embedding Provider</label>
+                                    <select id="aiPageEmbedSelect">
+                                        <option value="synthetic">Synthetic Hash (Offline &middot; Instant &middot; Zero Key)</option>
+                                        <option value="gemini">Google Gemini Embeddings</option>
+                                        <option value="openai">OpenAI Embeddings</option>
+                                        <option value="ollama">Ollama Embeddings (nomic-embed-text)</option>
+                                        <option value="minimax">MiniMax Embeddings</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <label class="checkbox-row" for="aiPageFallbackLocalRag">
+                                <input type="checkbox" id="aiPageFallbackLocalRag" checked>
+                                <span>Auto-fallback to Offline Local RAG when Cloud/Ollama is unreachable or unconfigured</span>
+                            </label>
+
+                            <fieldset class="ai-provider-fieldset">
+                                <legend><i class="fa-solid fa-sparkles" aria-hidden="true"></i> Google Gemini / OpenRouter</legend>
+                                <div class="form-group">
+                                    <label for="aiPageGeminiKey">GEMINI_API_KEY</label>
+                                    <div class="password-field-wrap">
+                                        <input type="password" id="aiPageGeminiKey" autocomplete="off" spellcheck="false" placeholder="Paste AIza... or sk-or-... (leave blank to keep saved key)">
+                                        <button type="button" id="btnToggleAiPageGeminiKey" class="btn-password-toggle" aria-label="Show Gemini API key" aria-pressed="false">
+                                            <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                                        </button>
+                                    </div>
+                                    <div class="ai-key-meta-row">
+                                        <span id="aiPageGeminiKeyHint" class="field-hint">Not configured</span>
+                                        <label class="checkbox-row" for="aiPageClearGeminiKey">
+                                            <input type="checkbox" id="aiPageClearGeminiKey">
+                                            <span>Clear saved key</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="ai-settings-row">
+                                    <div class="form-group">
+                                        <label for="aiPageGeminiModel">Gemini Model</label>
+                                        <input type="text" id="aiPageGeminiModel" list="geminiModelSuggestions" placeholder="gemini-2.5-flash">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="aiPageGeminiBaseUrl">Custom Base URL (Optional)</label>
+                                        <input type="url" id="aiPageGeminiBaseUrl" spellcheck="false" placeholder="https://generativelanguage.googleapis.com/v1beta">
+                                    </div>
+                                </div>
+                            </fieldset>
+
+                            <fieldset class="ai-provider-fieldset">
+                                <legend><i class="fa-solid fa-microchip" aria-hidden="true"></i> OpenAI / vLLM / LM Studio (OpenAI-Compatible)</legend>
+                                <div class="form-group">
+                                    <label for="aiPageOpenaiKey">OPENAI_API_KEY</label>
+                                    <div class="password-field-wrap">
+                                        <input type="password" id="aiPageOpenaiKey" autocomplete="off" spellcheck="false" placeholder="Paste sk-... or local token (leave blank to keep)">
+                                        <button type="button" id="btnToggleAiPageOpenaiKey" class="btn-password-toggle" aria-label="Show OpenAI API key" aria-pressed="false">
+                                            <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                                        </button>
+                                    </div>
+                                    <div class="ai-key-meta-row">
+                                        <span id="aiPageOpenaiKeyHint" class="field-hint">Not configured</span>
+                                        <label class="checkbox-row" for="aiPageClearOpenaiKey">
+                                            <input type="checkbox" id="aiPageClearOpenaiKey">
+                                            <span>Clear saved key</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="ai-settings-row">
+                                    <div class="form-group">
+                                        <label for="aiPageOpenaiBaseUrl">Base URL</label>
+                                        <input type="url" id="aiPageOpenaiBaseUrl" spellcheck="false" placeholder="https://api.openai.com/v1 or http://localhost:1234/v1">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="aiPageOpenaiModel">Model</label>
+                                        <input type="text" id="aiPageOpenaiModel" spellcheck="false" placeholder="gpt-4o-mini">
+                                    </div>
+                                </div>
+                            </fieldset>
+
+                            <fieldset class="ai-provider-fieldset">
+                                <legend><i class="fa-solid fa-server" aria-hidden="true"></i> Ollama Local AI</legend>
+                                <div class="form-group">
+                                    <label for="aiPageOllamaUrl">Ollama Server URL</label>
+                                    <input type="url" id="aiPageOllamaUrl" spellcheck="false" placeholder="http://localhost:11434">
+                                </div>
+                                <div class="ai-settings-row">
+                                    <div class="form-group">
+                                        <label for="aiPageOllamaModel">Chat Model</label>
+                                        <input type="text" id="aiPageOllamaModel" list="ollamaModelSuggestions" spellcheck="false" placeholder="llama3.2">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="aiPageOllamaVisionModel">Vision OCR Model</label>
+                                        <input type="text" id="aiPageOllamaVisionModel" spellcheck="false" placeholder="qwen2.5vl:7b">
+                                    </div>
+                                </div>
+                            </fieldset>
+
+                            <details class="ai-advanced-details">
+                                <summary>Local AI / vLLM Endpoint Override (Optional)</summary>
+                                <div class="ai-advanced-body">
+                                    <div class="ai-settings-row">
+                                        <div class="form-group">
+                                            <label for="aiPageLocalAiBaseUrl">Local AI Base URL</label>
+                                            <input type="url" id="aiPageLocalAiBaseUrl" spellcheck="false" placeholder="http://localhost:8000/v1">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="aiPageLocalAiModel">Local AI Model</label>
+                                            <input type="text" id="aiPageLocalAiModel" spellcheck="false" placeholder="Qwen/Qwen2.5-7B-Instruct">
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="aiPageLocalAiKey">Local AI API Key (Optional)</label>
+                                        <div class="password-field-wrap">
+                                            <input type="password" id="aiPageLocalAiKey" autocomplete="off" spellcheck="false" placeholder="Leave blank to keep saved key">
+                                            <button type="button" id="btnToggleAiPageLocalAiKey" class="btn-password-toggle" aria-label="Show Local AI key" aria-pressed="false">
+                                                <i class="fa-regular fa-eye" aria-hidden="true"></i>
+                                            </button>
+                                        </div>
+                                        <div class="ai-key-meta-row">
+                                            <span id="aiPageLocalAiKeyHint" class="field-hint">Not configured</span>
+                                            <label class="checkbox-row" for="aiPageClearLocalAiKey">
+                                                <input type="checkbox" id="aiPageClearLocalAiKey">
+                                                <span>Clear saved key</span>
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </details>
+
+                            <div class="dialog-actions">
+                                <button type="button" id="btnPageTestAi" class="btn btn-secondary">
+                                    <i class="fa-solid fa-plug-circle-check" aria-hidden="true"></i> Test Connection
+                                </button>
+                                <button type="submit" id="btnPageSaveAi" class="btn btn-primary">
+                                    <i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save AI Settings
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
             <!-- Tab: My Profile & Security (NEW, All Roles) -->
             <div class="tab-content" id="profileTab">
                 <div class="view-header">
@@ -1374,7 +1608,7 @@
             </div>
 
             <!-- Tab: Identity & RBAC Admin (Upgraded) -->
-            <div class="tab-content" id="authTab">
+            <div class="tab-content" id="authAdminTab">
                 <div class="view-header">
                     <div>
                         <h2>Identity &amp; RBAC Administration</h2>
@@ -1697,11 +1931,16 @@
     <dialog id="aiSettingsDialog" aria-labelledby="aiSettingsDialogTitle" class="wb-dialog wb-dialog-lg">
         <div class="dialog-header">
             <h2 id="aiSettingsDialogTitle"><i class="fa-solid fa-sliders" aria-hidden="true"></i> AI &amp; LLM Provider Settings</h2>
-            <form method="dialog">
-                <button type="submit" value="cancel" class="btn-icon-only" aria-label="Close dialog">
-                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
-                </button>
-            </form>
+            <div class="dialog-header-actions">
+                <a href="/app/settings/ai" id="btnOpenFullAiPage" class="btn btn-secondary btn-sm" data-route="/app/settings/ai" data-route-link>
+                    <i class="fa-solid fa-up-right-from-square" aria-hidden="true"></i> Full Page
+                </a>
+                <form method="dialog">
+                    <button type="submit" value="cancel" class="btn-icon-only" aria-label="Close dialog">
+                        <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                    </button>
+                </form>
+            </div>
         </div>
 
         <div id="aiSettingsStatusBanner" class="ai-status-banner" aria-live="polite">
@@ -1889,6 +2128,6 @@
     <div id="toastRegion" role="region" aria-label="Notifications" class="toast-region"></div>
     <div id="srAnnouncer" aria-live="polite" class="visually-hidden"></div>
 
-    <script src="app.js"></script>
+    <script src="/static/app.js"></script>
 </body>
 </html>
