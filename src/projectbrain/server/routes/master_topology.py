@@ -142,6 +142,9 @@ def collect_master_topology(project_id: Optional[str] = None) -> Dict[str, Any]:
                     "created_at": p.get("created_at"),
                     "updated_at": p.get("updated_at"),
                     "branches": formatted_branches,
+                    "sources": list(p.get("sources") or []),
+                    "shared_doc_count": int(p.get("shared_doc_count", 0) or 0),
+                    "relation_count": int(p.get("relation_count", 0) or 0),
                 }
             )
     finally:

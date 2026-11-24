@@ -33,7 +33,9 @@ from ..core.db import (
 )
 from ..core.tenant_manager import (
     _effective_root_branch,
+    get_current_source,
     parse_tenant_from_user_id,
+    parse_tenant_spec,
     tenant_context,
     tenant_manager,
 )
@@ -69,20 +71,105 @@ def derive_doc_key(filename: str, explicit_doc_key: Optional[str] = None) -> str
     return slug or "document"
 
 
-def resolve_doc_user_id(project_id: str, branch: Optional[str] = "main") -> Tuple[str, str, str]:
-    """Resolve (target_proj, target_branch, effective_user_id)."""
+def _ctx_source_arg(eff_source: Optional[str]) -> Optional[str]:
+    """Convert normalized effective source_id into `tenant_context(..., source_id=...)` arg."""
+    if not eff_source or eff_source == "__default__":
+        return None
+    return eff_source
+
+
+def _resolve_doc_target(
+    project_id: str,
+    branch: Optional[str] = "main",
+    source_id: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> Tuple[str, str, str, str, str]:
+    """Resolve `(target_proj, target_branch, effective_user_id, effective_source_id, effective_scope)`."""
     raw_proj = (project_id or "default").strip() or "default"
-    raw_branch = (branch or "main").strip() or "main"
-    if ":" in raw_proj:
-        p_part, b_part = raw_proj.split(":", 1)
-        target_proj = p_part.strip() or "default"
-        proj_br = b_part.strip()
-        target_branch = raw_branch if (raw_branch and raw_branch != "main") else (proj_br or "main")
-        effective_user_id = f"{target_proj}:{target_branch}"
+    raw_branch = (branch or "").strip()
+    eff_default_br = raw_branch or "main"
+    arg_src = str(source_id).strip() or None if source_id is not None else None
+
+    proj, parsed_src, parsed_br = parse_tenant_spec(
+        raw_proj,
+        default_branch=eff_default_br,
+        default_source=arg_src,
+    )
+    if arg_src is not None and "@" not in raw_proj:
+        parsed_src = arg_src
+
+    if ":" in raw_proj and raw_branch and raw_branch != "main":
+        clean_branch = raw_branch
     else:
-        target_proj = raw_proj
-        target_branch = raw_branch or "main"
-        effective_user_id = target_proj if target_branch == "main" else f"{target_proj}:{target_branch}"
+        clean_branch = parsed_br
+
+    clean_scope = (scope or "").strip()
+    if clean_scope == "project_shared" or parsed_src == "__shared__" or arg_src == "__shared__":
+        eff_source = "__shared__"
+        eff_scope = "project_shared"
+        effective_user_id = f"{proj}@__shared__:{clean_branch}"
+    elif parsed_src and parsed_src != "__default__":
+        eff_source = parsed_src
+        eff_scope = "source"
+        effective_user_id = f"{proj}@{eff_source}:{clean_branch}"
+    else:
+        eff_source = "__default__"
+        eff_scope = "source"
+        if ":" in raw_proj:
+            effective_user_id = f"{proj}:{clean_branch}"
+        else:
+            effective_user_id = (
+                proj if clean_branch == "main" else f"{proj}:{clean_branch}"
+            )
+    return proj, clean_branch, effective_user_id, eff_source, eff_scope
+
+
+def _get_doc_branch_lineage(
+    project_id: str,
+    branch: str,
+    effective_source: str = "__default__",
+    max_depth: int = 8,
+) -> List[str]:
+    """Return branch lineage `[branch, ..., root]` scoped to project root or a sub-source."""
+    if effective_source in ("__default__", "__shared__"):
+        return get_memory_branch_lineage(project_id, branch, max_depth=max_depth)
+
+    br = (branch or "").strip()
+    if not br:
+        return []
+    lineage: List[str] = [br]
+    visited = {br}
+    cur = br
+    while len(lineage) <= max_depth:
+        if not tenant_manager._master_table_exists("master_source_branches"):
+            break
+        row = tenant_manager._master_fetchone(
+            "SELECT base_branch FROM master_source_branches "
+            "WHERE project_id=? AND source_id=? AND branch_name=?",
+            (project_id, effective_source, cur),
+        )
+        parent = str(row["base_branch"]).strip() if row and row.get("base_branch") else None
+        if not parent or parent == cur or parent in visited:
+            break
+        lineage.append(parent)
+        visited.add(parent)
+        cur = parent
+    return lineage
+
+
+def resolve_doc_user_id(
+    project_id: str,
+    branch: Optional[str] = "main",
+    source_id: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    """Resolve `(base_project, clean_branch, effective_user_id)`."""
+    target_proj, target_branch, effective_user_id, _, _ = _resolve_doc_target(
+        project_id,
+        branch=branch,
+        source_id=source_id,
+        scope=scope,
+    )
     return target_proj, target_branch, effective_user_id
 
 
@@ -91,24 +178,38 @@ def next_doc_version(
     branch: str,
     doc_key: str,
     base_branch: Optional[str] = None,
+    source_id: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> str:
     """Compute the next sequential version string (v1, v2, ...) for a doc_key."""
     ensure_doc_versioning_tables()
-    target_proj, target_branch, _ = resolve_doc_user_id(project_id, branch)
-    with tenant_context(target_proj, target_branch):
-        rows = db.fetchall(
-            "SELECT version FROM document_versions WHERE project_id=? AND branch=? AND doc_key=?",
-            (target_proj, target_branch, doc_key),
-        )
+    target_proj, target_branch, _, eff_source, _ = _resolve_doc_target(
+        project_id,
+        branch=branch,
+        source_id=source_id,
+        scope=scope,
+    )
+    ctx_src = _ctx_source_arg(eff_source)
+    is_child_src = eff_source not in ("__default__", "__shared__")
+
+    rows: List[Dict[str, Any]] = []
+    if not is_child_src or tenant_manager.has_branch(target_proj, target_branch, source_id=ctx_src):
+        with tenant_context(target_proj, target_branch, source_id=ctx_src):
+            rows = db.fetchall(
+                "SELECT version FROM document_versions WHERE project_id=? AND branch=? AND doc_key=?",
+                (target_proj, target_branch, doc_key),
+            )
     if not rows:
         candidate_branches: List[str] = []
         if base_branch and base_branch != target_branch:
             candidate_branches.append(base_branch)
-        for b in get_memory_branch_lineage(target_proj, target_branch):
+        for b in _get_doc_branch_lineage(target_proj, target_branch, eff_source):
             if b != target_branch and b not in candidate_branches:
                 candidate_branches.append(b)
         for cand_br in candidate_branches:
-            with tenant_context(target_proj, cand_br):
+            if is_child_src and not tenant_manager.has_branch(target_proj, cand_br, source_id=ctx_src):
+                continue
+            with tenant_context(target_proj, cand_br, source_id=ctx_src):
                 cand_rows = db.fetchall(
                     "SELECT version FROM document_versions WHERE project_id=? AND branch=? AND doc_key=?",
                     (target_proj, cand_br, doc_key),
@@ -433,14 +534,20 @@ async def clone_memory_with_vectors(
     new_meta: Dict[str, Any],
     source_project_id: Optional[str] = None,
     source_branch: Optional[str] = None,
+    source_id: Optional[str] = None,
+    scope: Optional[str] = None,
+    doc_role: Optional[str] = None,
 ) -> Optional[str]:
     """Clone an existing memory row and all its vectors with ZERO LLM/embedding calls."""
     if source_project_id is not None:
-        src_proj, inf_src_br = parse_tenant_from_user_id(
-            source_project_id, default_branch=source_branch or _effective_root_branch()
+        src_proj, inf_src_src, inf_src_br = parse_tenant_spec(
+            source_project_id,
+            default_branch=source_branch or _effective_root_branch(),
+            default_source=source_id,
         )
         src_br = (source_branch or inf_src_br or _effective_root_branch()).strip() or _effective_root_branch()
-        with tenant_context(src_proj, src_br):
+        src_ctx = _ctx_source_arg(inf_src_src)
+        with tenant_context(src_proj, src_br, source_id=src_ctx):
             old = q.get_mem(old_memory_id)
             if not old:
                 return None
@@ -451,20 +558,54 @@ async def clone_memory_with_vectors(
             if not old:
                 return None
             hint = tenant_manager.lookup_memory_hint(old_memory_id)
+            hint_src = tenant_manager.lookup_memory_source_hint(old_memory_id)
             if hint is not None:
-                with tenant_context(hint[0], hint[1]):
+                with tenant_context(hint[0], hint[1], source_id=hint_src):
                     vectors = await vector_store.getVectorsById(old_memory_id)
             else:
                 vectors = await vector_store.getVectorsById(old_memory_id)
 
     eff_uid = target_user_id or old.get("user_id") or "anonymous"
-    target_proj, target_br = parse_tenant_from_user_id(
-        eff_uid, default_branch=_effective_root_branch()
+    target_proj, inf_tgt_src, target_br = parse_tenant_spec(
+        eff_uid,
+        default_branch=_effective_root_branch(),
+        default_source=source_id,
     )
     if isinstance(new_meta, dict) and new_meta.get("project_id"):
-        target_proj = parse_tenant_from_user_id(str(new_meta["project_id"]))[0]
+        target_proj = parse_tenant_spec(str(new_meta["project_id"]))[0]
         if new_meta.get("branch"):
             target_br = str(new_meta["branch"]).strip() or target_br
+
+    meta_src = new_meta.get("source_id") if isinstance(new_meta, dict) else None
+    meta_scope = new_meta.get("scope") if isinstance(new_meta, dict) else None
+    meta_role = new_meta.get("doc_role") if isinstance(new_meta, dict) else None
+
+    tgt_eff_src = (
+        str(meta_src).strip()
+        if meta_src is not None and str(meta_src).strip()
+        else (inf_tgt_src or (old.get("source_id") if old.get("source_id") else "__default__"))
+    )
+    tgt_eff_scope = (
+        str(meta_scope).strip()
+        if meta_scope is not None and str(meta_scope).strip()
+        else (
+            "project_shared"
+            if (tgt_eff_src == "__shared__" or scope == "project_shared")
+            else (str(old.get("scope") or "").strip() or "source")
+        )
+    )
+    if tgt_eff_scope == "project_shared":
+        tgt_eff_src = "__shared__"
+    tgt_eff_role = (
+        str(meta_role).strip()
+        if meta_role is not None and str(meta_role).strip()
+        else (
+            str(doc_role).strip()
+            if doc_role is not None and str(doc_role).strip()
+            else (str(old.get("doc_role") or "").strip() or "general")
+        )
+    )
+    tgt_ctx = _ctx_source_arg(tgt_eff_src)
 
     now_ms = int(time.time() * 1000)
 
@@ -482,7 +623,7 @@ async def clone_memory_with_vectors(
     merged_meta.update(new_meta)
 
     new_id = str(uuid.uuid4())
-    with tenant_context(target_proj, target_br):
+    with tenant_context(target_proj, target_br, source_id=tgt_ctx):
         if target_user_id:
             db.execute(
                 "INSERT OR IGNORE INTO users(user_id, summary, reflection_count, created_at, updated_at) VALUES (?,?,?,?,?)",
@@ -510,12 +651,125 @@ async def clone_memory_with_vectors(
             compressed_vec=old.get("compressed_vec"),
             feedback_score=old.get("feedback_score", 0),
         )
+        db.execute(
+            "UPDATE memories SET source_id=?, scope=?, doc_role=? WHERE id=?",
+            (tgt_eff_src, tgt_eff_scope, tgt_eff_role, new_id),
+        )
+        db.commit()
 
         for vr in vectors:
             await vector_store.storeVector(new_id, vr.sector, vr.vector, vr.dim, eff_uid)
-        tenant_manager.remember_memory_id(new_id, target_proj, target_br)
+        tenant_manager.remember_memory_id(
+            new_id, target_proj, target_br, source_id=tgt_ctx
+        )
 
     return new_id
+
+
+async def _finalize_ingested_memory(
+    mid: str,
+    target_proj: str,
+    target_branch: str,
+    effective_user_id: str,
+    effective_source: str,
+    effective_scope: str,
+    doc_role: str,
+) -> None:
+    """Ensure ingested memory resides in target source schema and records source_id/scope/doc_role."""
+    ctx_src = _ctx_source_arg(effective_source)
+    with tenant_context(target_proj, target_branch, source_id=ctx_src):
+        existing_row = q.get_mem(mid)
+
+    if existing_row is None and effective_source not in ("__default__", "__shared__"):
+        with tenant_context(target_proj, target_branch, source_id="__default__"):
+            src_row = q.get_mem(mid)
+            if src_row is not None:
+                vecs = await vector_store.getVectorsById(mid)
+                wps = db.fetchall(
+                    "SELECT * FROM waypoints WHERE src_id=? OR dst_id=?",
+                    (mid, mid),
+                )
+                user_row = db.fetchone(
+                    "SELECT * FROM users WHERE user_id=?",
+                    (effective_user_id,),
+                )
+                await vector_store.deleteVectors(mid)
+                q.del_mem(mid)
+            else:
+                vecs = []
+                wps = []
+                user_row = None
+
+        if src_row is not None:
+            with tenant_context(target_proj, target_branch, source_id=ctx_src):
+                if user_row is not None:
+                    db.execute(
+                        "INSERT OR IGNORE INTO users(user_id, summary, reflection_count, created_at, updated_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (
+                            user_row.get("user_id") or effective_user_id,
+                            user_row.get("summary") or "User profile initializing...",
+                            user_row.get("reflection_count", 0),
+                            user_row.get("created_at") or int(time.time() * 1000),
+                            user_row.get("updated_at") or int(time.time() * 1000),
+                        ),
+                    )
+                elif effective_user_id:
+                    now_ms = int(time.time() * 1000)
+                    db.execute(
+                        "INSERT OR IGNORE INTO users(user_id, summary, reflection_count, created_at, updated_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (effective_user_id, "User profile initializing...", 0, now_ms, now_ms),
+                    )
+                q.ins_mem(
+                    id=src_row["id"],
+                    user_id=src_row.get("user_id") or effective_user_id,
+                    segment=src_row.get("segment", 0),
+                    content=src_row.get("content"),
+                    simhash=src_row.get("simhash"),
+                    primary_sector=src_row.get("primary_sector"),
+                    tags=src_row.get("tags"),
+                    meta=src_row.get("meta"),
+                    created_at=src_row.get("created_at"),
+                    updated_at=src_row.get("updated_at"),
+                    last_seen_at=src_row.get("last_seen_at"),
+                    salience=src_row.get("salience", 1.0),
+                    decay_lambda=src_row.get("decay_lambda", 0.02),
+                    version=src_row.get("version", 1),
+                    mean_dim=src_row.get("mean_dim"),
+                    mean_vec=src_row.get("mean_vec"),
+                    compressed_vec=src_row.get("compressed_vec"),
+                    feedback_score=src_row.get("feedback_score", 0),
+                )
+                for vr in vecs:
+                    await vector_store.storeVector(
+                        mid, vr.sector, vr.vector, vr.dim, effective_user_id
+                    )
+                for wp in wps:
+                    db.execute(
+                        "INSERT OR IGNORE INTO waypoints(src_id, dst_id, dst_sector, user_id, weight, created_at, updated_at) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (
+                            wp.get("src_id"),
+                            wp.get("dst_id"),
+                            wp.get("dst_sector"),
+                            wp.get("user_id") or effective_user_id,
+                            wp.get("weight", 1.0),
+                            wp.get("created_at"),
+                            wp.get("updated_at"),
+                        ),
+                    )
+                db.commit()
+
+    with tenant_context(target_proj, target_branch, source_id=ctx_src):
+        db.execute(
+            "UPDATE memories SET source_id=?, scope=?, doc_role=? WHERE id=?",
+            (effective_source, effective_scope, doc_role, mid),
+        )
+        db.commit()
+    tenant_manager.remember_memory_id(
+        mid, target_proj, target_branch, source_id=ctx_src
+    )
 
 
 def _resolve_parent_version(
@@ -524,10 +778,19 @@ def _resolve_parent_version(
     doc_key: str,
     base_version: Optional[str] = None,
     base_branch: Optional[str] = None,
+    source_id: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Resolve (parent_version, parent_branch) for delta reuse."""
-    target_proj, target_branch, _ = resolve_doc_user_id(project_id, branch)
-    lineage = get_memory_branch_lineage(target_proj, target_branch)
+    target_proj, target_branch, _, eff_source, _ = _resolve_doc_target(
+        project_id,
+        branch=branch,
+        source_id=source_id,
+        scope=scope,
+    )
+    ctx_src = _ctx_source_arg(eff_source)
+    is_child_src = eff_source not in ("__default__", "__shared__")
+    lineage = _get_doc_branch_lineage(target_proj, target_branch, eff_source)
     search_branches: List[str] = []
     if base_version:
         if base_branch:
@@ -538,7 +801,9 @@ def _resolve_parent_version(
             if b not in search_branches:
                 search_branches.append(b)
         for b in search_branches:
-            with tenant_context(target_proj, b):
+            if is_child_src and not tenant_manager.has_branch(target_proj, b, source_id=ctx_src):
+                continue
+            with tenant_context(target_proj, b, source_id=ctx_src):
                 row = db.fetchone(
                     "SELECT version, branch FROM document_versions "
                     "WHERE project_id=? AND branch=? AND doc_key=? AND version=? "
@@ -550,15 +815,16 @@ def _resolve_parent_version(
         return base_version, (base_branch or target_branch)
 
     # No explicit base_version: check active version on target branch first
-    with tenant_context(target_proj, target_branch):
-        row = db.fetchone(
-            "SELECT version, branch FROM document_versions "
-            "WHERE project_id=? AND branch=? AND doc_key=? AND status='active' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (target_proj, target_branch, doc_key),
-        )
-    if row:
-        return row["version"], row["branch"]
+    if not is_child_src or tenant_manager.has_branch(target_proj, target_branch, source_id=ctx_src):
+        with tenant_context(target_proj, target_branch, source_id=ctx_src):
+            row = db.fetchone(
+                "SELECT version, branch FROM document_versions "
+                "WHERE project_id=? AND branch=? AND doc_key=? AND status='active' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (target_proj, target_branch, doc_key),
+            )
+        if row:
+            return row["version"], row["branch"]
 
     # Then check explicit base_branch and registered branch lineage
     fallback_branches: List[str] = []
@@ -569,7 +835,9 @@ def _resolve_parent_version(
             fallback_branches.append(b)
 
     for b in fallback_branches:
-        with tenant_context(target_proj, b):
+        if is_child_src and not tenant_manager.has_branch(target_proj, b, source_id=ctx_src):
+            continue
+        with tenant_context(target_proj, b, source_id=ctx_src):
             row = db.fetchone(
                 "SELECT version, branch FROM document_versions "
                 "WHERE project_id=? AND branch=? AND doc_key=? AND status='active' "
@@ -588,23 +856,33 @@ def lookup_parent_units_by_hash(
     doc_key: str,
     base_version: Optional[str] = None,
     base_branch: Optional[str] = None,
+    source_id: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], Dict[str, List[Dict[str, Any]]]]:
     """
     Look up parent version's units keyed by unit_sha256 (FIFO queue per hash).
     Used by both ingest_document_versioned and DocumentPipeline pre-OCR reuse.
     """
     ensure_doc_versioning_tables()
-    target_proj, target_branch, _ = resolve_doc_user_id(project_id, branch)
+    target_proj, target_branch, _, eff_source, _ = _resolve_doc_target(
+        project_id,
+        branch=branch,
+        source_id=source_id,
+        scope=scope,
+    )
+    ctx_src = _ctx_source_arg(eff_source)
     parent_version, parent_branch = _resolve_parent_version(
         project_id=target_proj,
         branch=target_branch,
         doc_key=doc_key,
         base_version=base_version,
         base_branch=base_branch,
+        source_id=ctx_src,
+        scope=scope,
     )
     by_hash: Dict[str, List[Dict[str, Any]]] = {}
     if parent_version and parent_branch:
-        with tenant_context(target_proj, parent_branch):
+        with tenant_context(target_proj, parent_branch, source_id=ctx_src):
             rows = db.fetchall(
                 "SELECT * FROM document_units "
                 "WHERE project_id=? AND branch=? AND doc_key=? AND version=? "
@@ -630,6 +908,9 @@ async def ingest_document_versioned(
     doc_version: Optional[str] = None,
     base_version: Optional[str] = None,
     base_branch: Optional[str] = None,
+    source_id: Optional[str] = None,
+    scope: str = "source",
+    doc_role: str = "general",
 ) -> Dict[str, Any]:
     """
     Versioned document ingestion with Pre-OCR & Pre-Embedding Unit Delta Engine.
@@ -640,9 +921,26 @@ async def ingest_document_versioned(
     - Same-branch update supersedes prior active version and cleans up old memories.
     - Cross-branch update preserves parent branch intact and records branch overlay
       link + doc tombstone.
+    - Multi-source aware: routes child sub-sources (`source_id`) to `pb_src_*` and
+      project-shared docs (`scope='project_shared'` or `source_id='__shared__'`)
+      to `pb_root` with `master_shared_doc_bindings` registration.
     """
     ensure_doc_versioning_tables()
-    target_proj, target_branch, effective_user_id = resolve_doc_user_id(project_id, branch)
+    (
+        target_proj,
+        target_branch,
+        effective_user_id,
+        effective_source,
+        effective_scope,
+    ) = _resolve_doc_target(
+        project_id,
+        branch=branch,
+        source_id=source_id,
+        scope=scope,
+    )
+    eff_doc_role = (doc_role or "general").strip() or "general"
+    ctx_src = _ctx_source_arg(effective_source)
+    is_child_src = effective_source not in ("__default__", "__shared__")
     d_key = derive_doc_key(filename, doc_key)
 
     parent_version, parent_branch, parent_by_hash = lookup_parent_units_by_hash(
@@ -651,6 +949,8 @@ async def ingest_document_versioned(
         doc_key=d_key,
         base_version=base_version,
         base_branch=base_branch,
+        source_id=ctx_src,
+        scope=effective_scope,
     )
 
     effective_base_branch = base_branch or (
@@ -659,20 +959,46 @@ async def ingest_document_versioned(
     d_ver = (
         doc_version.strip()
         if (doc_version and str(doc_version).strip())
-        else next_doc_version(target_proj, target_branch, d_key, base_branch=effective_base_branch)
+        else next_doc_version(
+            target_proj,
+            target_branch,
+            d_key,
+            base_branch=effective_base_branch,
+            source_id=ctx_src,
+            scope=effective_scope,
+        )
     )
     has_explicit_base = bool(
         effective_base_branch and effective_base_branch != target_branch
     )
-    proj_meta = tenant_manager.ensure_branch_schema(
-        target_proj,
-        target_branch,
-        base_branch=effective_base_branch or _effective_root_branch(),
-        author=author or "system",
-        has_doc=True,
-        record_lineage=has_explicit_base,
-        preserve_existing_base=not has_explicit_base,
-    )
+    if is_child_src:
+        if tenant_manager.get_project_source(target_proj, effective_source) is None:
+            tenant_manager.register_project_source(
+                target_proj,
+                effective_source,
+                root_branch=_effective_root_branch(),
+            )
+        proj_meta = tenant_manager.ensure_source_branch_schema(
+            target_proj,
+            effective_source,
+            target_branch,
+            base_branch=effective_base_branch or _effective_root_branch(),
+            author=author or "system",
+            has_doc=True,
+        )
+    else:
+        proj_meta = tenant_manager.ensure_branch_schema(
+            target_proj,
+            target_branch,
+            base_branch=effective_base_branch or _effective_root_branch(),
+            author=author or "system",
+            has_doc=True,
+            record_lineage=has_explicit_base,
+            preserve_existing_base=not has_explicit_base,
+        )
+
+    with tenant_context(target_proj, target_branch, source_id=ctx_src):
+        ensure_doc_versioning_tables()
 
     # Build raw candidate units
     raw_units: List[Dict[str, Any]] = []
@@ -815,6 +1141,9 @@ async def ingest_document_versioned(
                     "unit_type": p["unit_type"],
                     "project_id": target_proj,
                     "branch": target_branch,
+                    "source_id": effective_source,
+                    "scope": effective_scope,
+                    "doc_role": eff_doc_role,
                     "reused_from_version": parent_version,
                     "reused_from_branch": parent_branch,
                 }
@@ -826,6 +1155,9 @@ async def ingest_document_versioned(
                     new_meta,
                     source_project_id=target_proj,
                     source_branch=parent_branch,
+                    source_id=ctx_src,
+                    scope=effective_scope,
+                    doc_role=eff_doc_role,
                 )
                 if cloned_id:
                     cloned_ids.append(cloned_id)
@@ -846,7 +1178,7 @@ async def ingest_document_versioned(
     )
 
     if same_branch_update:
-        with tenant_context(target_proj, target_branch):
+        with tenant_context(target_proj, target_branch, source_id=ctx_src):
             for old_mid in all_parent_memory_ids:
                 await vector_store.deleteVectors(old_mid)
                 q.del_mem(old_mid)
@@ -857,20 +1189,21 @@ async def ingest_document_versioned(
             )
             db.commit()
     elif cross_branch_update:
-        if base_branch and base_branch != target_branch:
-            register_memory_branch(target_proj, target_branch, base_branch)
-        elif parent_branch and parent_branch != target_branch:
-            register_memory_branch(target_proj, target_branch, parent_branch)
-        with tenant_context(target_proj, target_branch):
+        if not is_child_src:
+            if base_branch and base_branch != target_branch:
+                register_memory_branch(target_proj, target_branch, base_branch)
+            elif parent_branch and parent_branch != target_branch:
+                register_memory_branch(target_proj, target_branch, parent_branch)
+        with tenant_context(target_proj, target_branch, source_id=ctx_src):
             record_memory_tombstone(target_proj, target_branch, "doc", d_key)
 
-    if len(get_memory_branch_lineage(target_proj, target_branch)) > 1:
-        with tenant_context(target_proj, target_branch):
+    if len(_get_doc_branch_lineage(target_proj, target_branch, effective_source)) > 1:
+        with tenant_context(target_proj, target_branch, source_id=ctx_src):
             record_memory_tombstone(target_proj, target_branch, "doc", d_key)
 
     # Step 3: Embed missed units (or preserve legacy explicit chunks on initial push-processed)
     use_explicit_chunks = bool(chunks and parent_version is None)
-    with tenant_context(target_proj, target_branch):
+    with tenant_context(target_proj, target_branch, source_id=ctx_src):
         if use_explicit_chunks:
             chunk_mids: List[str] = []
             for idx_c, ch in enumerate(chunks or []):
@@ -892,6 +1225,9 @@ async def ingest_document_versioned(
                     "chunk_id": ch.get("chunk_id") or f"p_{idx_c + 1}",
                     "project_id": target_proj,
                     "branch": target_branch,
+                    "source_id": effective_source,
+                    "scope": effective_scope,
+                    "doc_role": eff_doc_role,
                 }
                 if author:
                     ch_meta["author"] = author
@@ -903,6 +1239,15 @@ async def ingest_document_versioned(
                 )
                 mid = res_mem.get("id")
                 if mid:
+                    await _finalize_ingested_memory(
+                        mid,
+                        target_proj,
+                        target_branch,
+                        effective_user_id,
+                        effective_source,
+                        effective_scope,
+                        eff_doc_role,
+                    )
                     chunk_mids.append(mid)
                     all_memory_ids.append(mid)
             if planned_units:
@@ -948,6 +1293,9 @@ async def ingest_document_versioned(
                         "chunk_index": c_idx,
                         "project_id": target_proj,
                         "branch": target_branch,
+                        "source_id": effective_source,
+                        "scope": effective_scope,
+                        "doc_role": eff_doc_role,
                     }
                     if author:
                         unit_meta["author"] = author
@@ -959,6 +1307,15 @@ async def ingest_document_versioned(
                     )
                     mid = res_mem.get("id")
                     if mid:
+                        await _finalize_ingested_memory(
+                            mid,
+                            target_proj,
+                            target_branch,
+                            effective_user_id,
+                            effective_source,
+                            effective_scope,
+                            eff_doc_role,
+                        )
                         unit_mids.append(mid)
                         all_memory_ids.append(mid)
                 p["memory_ids"] = unit_mids
@@ -969,8 +1326,9 @@ async def ingest_document_versioned(
         db.execute(
             "INSERT OR REPLACE INTO document_versions("
             "id, project_id, branch, doc_key, version, parent_version, base_branch, "
-            "filename, file_sha256, total_units, reused_units, new_units, deleted_units, status, created_at"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "filename, file_sha256, total_units, reused_units, new_units, deleted_units, status, created_at, "
+            "source_id, scope, doc_role"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 ver_id,
                 target_proj,
@@ -987,7 +1345,15 @@ async def ingest_document_versioned(
                 deleted_units,
                 "active",
                 now_ms,
+                effective_source,
+                effective_scope,
+                eff_doc_role,
             ),
+        )
+        db.execute(
+            "UPDATE document_versions SET source_id=?, scope=?, doc_role=? "
+            "WHERE project_id=? AND branch=? AND doc_key=? AND version=?",
+            (effective_source, effective_scope, eff_doc_role, target_proj, target_branch, d_key, d_ver),
         )
 
         # Clear any pre-existing units for this exact (project, branch, doc_key, version) if re-written
@@ -1000,8 +1366,9 @@ async def ingest_document_versioned(
             db.execute(
                 "INSERT OR REPLACE INTO document_units("
                 "id, project_id, branch, doc_key, version, unit_index, unit_type, "
-                "unit_title, unit_sha256, markdown_text, memory_ids_json"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "unit_title, unit_sha256, markdown_text, memory_ids_json, "
+                "source_id, scope, doc_role"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     unit_id,
                     target_proj,
@@ -1014,18 +1381,34 @@ async def ingest_document_versioned(
                     p["unit_sha256"],
                     p["markdown_text"],
                     json.dumps(p.get("memory_ids") or []),
+                    effective_source,
+                    effective_scope,
+                    eff_doc_role,
                 ),
             )
         db.commit()
+
+    shared_binding: Optional[Dict[str, Any]] = None
+    if effective_scope == "project_shared" or effective_source == "__shared__":
+        shared_binding = tenant_manager.bind_shared_doc(
+            target_proj,
+            d_key,
+            target_source_id="*",
+            binding_role=eff_doc_role,
+        )
+
     _hsg_mod.invalidate_query_cache()
 
-    return {
+    res_payload: Dict[str, Any] = {
         "doc_key": d_key,
         "doc_version": d_ver,
         "parent_version": parent_version,
         "base_branch": effective_base_branch,
         "db_name": proj_meta["db_name"],
         "doc_schema": proj_meta["schema_name"],
+        "source_id": effective_source,
+        "scope": effective_scope,
+        "doc_role": eff_doc_role,
         "total_units": total_units,
         "reused_units": reused_units,
         "new_units": new_units,
@@ -1034,24 +1417,115 @@ async def ingest_document_versioned(
         "memory_ids": all_memory_ids,
         "memories_created": len(all_memory_ids),
     }
+    if shared_binding is not None:
+        res_payload["shared_binding"] = shared_binding
+    return res_payload
+
+
+def _tag_doc_row(
+    row: Dict[str, Any],
+    default_source: str = "__default__",
+    default_scope: str = "source",
+) -> Dict[str, Any]:
+    out = dict(row)
+    src_val = str(out.get("source_id") or "").strip() or default_source
+    scope_val = str(out.get("scope") or "").strip() or (
+        "project_shared" if src_val == "__shared__" else default_scope
+    )
+    role_val = str(out.get("doc_role") or "").strip() or "general"
+    out["source_id"] = src_val
+    out["scope"] = scope_val
+    out["doc_role"] = role_val
+    return out
+
+
+def _resolve_project_root_branch(project_id: str) -> str:
+    if tenant_manager._master_table_exists("master_projects"):
+        row = tenant_manager._master_fetchone(
+            "SELECT root_branch FROM master_projects WHERE project_id = ?",
+            (project_id,),
+        )
+        if row and row.get("root_branch"):
+            return str(row["root_branch"]).strip() or _effective_root_branch()
+    return _effective_root_branch()
+
+
+def _fetch_shared_docs_for_project(
+    target_proj: str,
+    eff_branch: Optional[str],
+    status: str,
+) -> List[Dict[str, Any]]:
+    """Fetch `project_shared` / `__shared__` docs from `pb_root` (and optional branch)."""
+    clauses = [
+        "project_id=?",
+        "(scope='project_shared' OR source_id='__shared__')",
+    ]
+    params: List[Any] = [target_proj]
+    if status and status != "all":
+        clauses.append("status=?")
+        params.append(status)
+    sql = (
+        f"SELECT * FROM document_versions WHERE {' AND '.join(clauses)} "
+        "ORDER BY created_at DESC"
+    )
+    root_br = _resolve_project_root_branch(target_proj)
+    candidate_branches: List[str] = []
+    if eff_branch:
+        if eff_branch != root_br:
+            candidate_branches.append(eff_branch)
+        candidate_branches.append(root_br)
+    else:
+        registered = tenant_manager.list_project_branches(target_proj)
+        if registered:
+            candidate_branches.extend(registered)
+        else:
+            candidate_branches.append(root_br)
+
+    shared_rows: List[Dict[str, Any]] = []
+    for cand_br in candidate_branches:
+        if not tenant_manager.has_branch(target_proj, cand_br, source_id="__shared__"):
+            continue
+        with tenant_context(target_proj, cand_br, source_id="__shared__"):
+            for r in db.fetchall(sql, tuple(params)):
+                shared_rows.append(
+                    _tag_doc_row(
+                        r,
+                        default_source="__shared__",
+                        default_scope="project_shared",
+                    )
+                )
+    return shared_rows
 
 
 def list_documents(
     project_id: str,
     branch: Optional[str] = None,
     status: str = "active",
+    source_id: Optional[str] = None,
+    include_shared: bool = True,
 ) -> List[Dict[str, Any]]:
-    """List documents registered in document_versions for a project/branch."""
+    """List documents registered in document_versions for a project/branch/source."""
     ensure_doc_versioning_tables()
     raw_proj = (project_id or "default").strip() or "default"
-    if ":" in raw_proj:
-        target_proj, inferred_br = parse_tenant_from_user_id(raw_proj)
-        eff_branch = branch or inferred_br
-    else:
-        target_proj = raw_proj
-        eff_branch = branch
+    arg_src = str(source_id).strip() or None if source_id is not None else None
+    parsed_proj, parsed_src, parsed_br = parse_tenant_spec(
+        raw_proj,
+        default_branch=branch or _effective_root_branch(),
+        default_source=arg_src,
+    )
+    if arg_src is not None and "@" not in raw_proj:
+        parsed_src = arg_src
 
-    if eff_branch:
+    target_proj = parsed_proj
+    eff_branch = branch if branch is not None else (parsed_br if ":" in raw_proj else None)
+    eff_source = parsed_src.strip() if parsed_src and str(parsed_src).strip() else None
+    is_child_src = bool(eff_source and eff_source not in ("__default__", "__shared__"))
+    ctx_src = _ctx_source_arg(eff_source)
+
+    source_rows: List[Dict[str, Any]] = []
+    if eff_source == "__shared__":
+        source_rows = _fetch_shared_docs_for_project(target_proj, eff_branch, status)
+    elif eff_branch:
         clauses = ["project_id=?", "branch=?"]
         params: List[Any] = [target_proj, eff_branch]
         if status and status != "all":
@@ -1061,63 +1535,123 @@ def list_documents(
             f"SELECT * FROM document_versions WHERE {' AND '.join(clauses)} "
             "ORDER BY created_at DESC"
         )
-        with tenant_context(target_proj, eff_branch):
-            rows = db.fetchall(sql, tuple(params))
+        has_br = (
+            tenant_manager.has_branch(target_proj, eff_branch, source_id=ctx_src)
+            if is_child_src
+            else True
+        )
+        rows: List[Dict[str, Any]] = []
+        if has_br:
+            with tenant_context(target_proj, eff_branch, source_id=ctx_src):
+                rows = db.fetchall(sql, tuple(params))
         if rows:
-            return rows
-
-        lineage = get_memory_branch_lineage(target_proj, eff_branch)
-        if len(lineage) > 1:
-            tombstoned_docs: set = set()
-            for anc_idx in range(len(lineage)):
-                b_name = lineage[anc_idx]
-                with tenant_context(target_proj, b_name):
-                    t_map = get_memory_tombstones(target_proj, b_name)
-                    tombstoned_docs.update(t_map.get("doc", set()))
-                if anc_idx == 0:
-                    continue
-                anc_clauses = ["project_id=?", "branch=?"]
-                anc_params: List[Any] = [target_proj, b_name]
-                if status and status != "all":
-                    anc_clauses.append("status=?")
-                    anc_params.append(status)
-                anc_sql = (
-                    f"SELECT * FROM document_versions WHERE {' AND '.join(anc_clauses)} "
-                    "ORDER BY created_at DESC"
+            source_rows = [
+                _tag_doc_row(
+                    r,
+                    default_source=eff_source or "__default__",
+                    default_scope="source",
                 )
-                with tenant_context(target_proj, b_name):
-                    anc_rows = db.fetchall(anc_sql, tuple(anc_params))
-                filtered = [
-                    r for r in anc_rows
-                    if r.get("doc_key") not in tombstoned_docs
-                ]
-                if filtered:
-                    return filtered
-        return []
+                for r in rows
+            ]
+        else:
+            lineage = _get_doc_branch_lineage(
+                target_proj, eff_branch, eff_source or "__default__"
+            )
+            if len(lineage) > 1:
+                tombstoned_docs: set = set()
+                for anc_idx in range(len(lineage)):
+                    b_name = lineage[anc_idx]
+                    if is_child_src and not tenant_manager.has_branch(
+                        target_proj, b_name, source_id=ctx_src
+                    ):
+                        continue
+                    with tenant_context(target_proj, b_name, source_id=ctx_src):
+                        t_map = get_memory_tombstones(target_proj, b_name)
+                        tombstoned_docs.update(t_map.get("doc", set()))
+                    if anc_idx == 0:
+                        continue
+                    anc_clauses = ["project_id=?", "branch=?"]
+                    anc_params: List[Any] = [target_proj, b_name]
+                    if status and status != "all":
+                        anc_clauses.append("status=?")
+                        anc_params.append(status)
+                    anc_sql = (
+                        f"SELECT * FROM document_versions WHERE {' AND '.join(anc_clauses)} "
+                        "ORDER BY created_at DESC"
+                    )
+                    with tenant_context(target_proj, b_name, source_id=ctx_src):
+                        anc_rows = db.fetchall(anc_sql, tuple(anc_params))
+                    filtered = [
+                        _tag_doc_row(
+                            r,
+                            default_source=eff_source or "__default__",
+                            default_scope="source",
+                        )
+                        for r in anc_rows
+                        if r.get("doc_key") not in tombstoned_docs
+                    ]
+                    if filtered:
+                        source_rows = filtered
+                        break
+    else:
+        clauses = ["project_id=?"]
+        params = [target_proj]
+        if status and status != "all":
+            clauses.append("status=?")
+            params.append(status)
+        sql = (
+            f"SELECT * FROM document_versions WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at DESC"
+        )
+        registered_branches = tenant_manager.list_project_branches(
+            target_proj, source_id=ctx_src
+        )
+        if not registered_branches:
+            if not is_child_src:
+                with tenant_context(None):
+                    source_rows = [
+                        _tag_doc_row(r, default_source="__default__", default_scope="source")
+                        for r in db.fetchall(sql, tuple(params))
+                    ]
+        else:
+            for br in registered_branches:
+                with tenant_context(target_proj, br, source_id=ctx_src):
+                    for r in db.fetchall(sql, tuple(params)):
+                        source_rows.append(
+                            _tag_doc_row(
+                                r,
+                                default_source=eff_source or "__default__",
+                                default_scope="source",
+                            )
+                        )
 
-    clauses = ["project_id=?"]
-    params = [target_proj]
-    if status and status != "all":
-        clauses.append("status=?")
-        params.append(status)
-    sql = (
-        f"SELECT * FROM document_versions WHERE {' AND '.join(clauses)} "
-        "ORDER BY created_at DESC"
-    )
-    registered_branches = tenant_manager.list_project_branches(target_proj)
-    if not registered_branches:
-        with tenant_context(None):
-            return db.fetchall(sql, tuple(params))
+    if not include_shared and eff_source != "__shared__":
+        source_rows = [
+            r
+            for r in source_rows
+            if r.get("scope") != "project_shared" and r.get("source_id") != "__shared__"
+        ]
+    elif is_child_src and include_shared:
+        source_rows.extend(_fetch_shared_docs_for_project(target_proj, eff_branch, status))
 
     merged: List[Dict[str, Any]] = []
     seen_ids: set = set()
-    for br in registered_branches:
-        with tenant_context(target_proj, br):
-            for r in db.fetchall(sql, tuple(params)):
-                rid = r.get("id") or (r.get("project_id"), r.get("branch"), r.get("doc_key"), r.get("version"))
-                if rid not in seen_ids:
-                    seen_ids.add(rid)
-                    merged.append(r)
+    seen_sigs: set = set()
+    for r in source_rows:
+        rid = r.get("id")
+        sig = (
+            r.get("project_id"),
+            r.get("branch"),
+            r.get("doc_key"),
+            r.get("version"),
+            r.get("source_id"),
+        )
+        if (rid is not None and rid in seen_ids) or sig in seen_sigs:
+            continue
+        if rid is not None:
+            seen_ids.add(rid)
+        seen_sigs.add(sig)
+        merged.append(r)
     merged.sort(key=lambda r: int(r.get("created_at") or 0), reverse=True)
     return merged
 
@@ -1126,43 +1660,74 @@ def list_document_versions(
     project_id: str,
     doc_key: str,
     branch: Optional[str] = None,
+    source_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """List all versions of a specific doc_key for a project (optionally filtered by branch)."""
+    """List all versions of a specific doc_key for a project (optionally filtered by branch/source)."""
     ensure_doc_versioning_tables()
     raw_proj = (project_id or "default").strip() or "default"
-    if ":" in raw_proj:
-        target_proj, inferred_br = parse_tenant_from_user_id(raw_proj)
-        eff_branch = branch or inferred_br
-    else:
-        target_proj = raw_proj
-        eff_branch = branch
+    arg_src = str(source_id).strip() or None if source_id is not None else None
+    target_proj, parsed_src, parsed_br = parse_tenant_spec(
+        raw_proj,
+        default_branch=branch or _effective_root_branch(),
+        default_source=arg_src,
+    )
+    if arg_src is not None and "@" not in raw_proj:
+        parsed_src = arg_src
+
+    eff_branch = branch if branch is not None else (parsed_br if ":" in raw_proj else None)
+    eff_source = parsed_src.strip() if parsed_src and str(parsed_src).strip() else None
+    is_child_src = bool(eff_source and eff_source not in ("__default__", "__shared__"))
+    ctx_src = _ctx_source_arg(eff_source)
 
     if eff_branch:
         sql = (
             "SELECT * FROM document_versions WHERE project_id=? AND doc_key=? AND branch=? "
             "ORDER BY created_at DESC"
         )
-        with tenant_context(target_proj, eff_branch):
-            return db.fetchall(sql, (target_proj, doc_key, eff_branch))
+        if is_child_src and not tenant_manager.has_branch(target_proj, eff_branch, source_id=ctx_src):
+            return []
+        with tenant_context(target_proj, eff_branch, source_id=ctx_src):
+            rows = db.fetchall(sql, (target_proj, doc_key, eff_branch))
+            return [
+                _tag_doc_row(
+                    r,
+                    default_source=eff_source or "__default__",
+                    default_scope="project_shared" if eff_source == "__shared__" else "source",
+                )
+                for r in rows
+            ]
 
     sql = (
         "SELECT * FROM document_versions WHERE project_id=? AND doc_key=? "
         "ORDER BY created_at DESC"
     )
-    registered_branches = tenant_manager.list_project_branches(target_proj)
+    registered_branches = tenant_manager.list_project_branches(
+        target_proj, source_id=ctx_src
+    )
     if not registered_branches:
+        if is_child_src:
+            return []
         with tenant_context(None):
-            return db.fetchall(sql, (target_proj, doc_key))
+            return [
+                _tag_doc_row(r, default_source="__default__", default_scope="source")
+                for r in db.fetchall(sql, (target_proj, doc_key))
+            ]
 
     merged: List[Dict[str, Any]] = []
     seen_ids: set = set()
     for br in registered_branches:
-        with tenant_context(target_proj, br):
+        with tenant_context(target_proj, br, source_id=ctx_src):
             for r in db.fetchall(sql, (target_proj, doc_key)):
                 rid = r.get("id") or (r.get("project_id"), r.get("branch"), r.get("doc_key"), r.get("version"))
                 if rid not in seen_ids:
                     seen_ids.add(rid)
-                    merged.append(r)
+                    merged.append(
+                        _tag_doc_row(
+                            r,
+                            default_source=eff_source or "__default__",
+                            default_scope="project_shared" if eff_source == "__shared__" else "source",
+                        )
+                    )
     merged.sort(key=lambda r: int(r.get("created_at") or 0), reverse=True)
     return merged
 
@@ -1175,14 +1740,25 @@ def diff_document_versions(
     branch: str = "main",
     from_branch: Optional[str] = None,
     to_branch: Optional[str] = None,
+    source_id: Optional[str] = None,
+    from_source_id: Optional[str] = None,
+    to_source_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute unit-level diff between two versions of a document."""
     ensure_doc_versioning_tables()
-    target_proj = parse_tenant_from_user_id(project_id)[0]
+    target_proj, parsed_src, _ = parse_tenant_spec(
+        project_id,
+        default_branch=branch or "main",
+        default_source=source_id,
+    )
+    if source_id is not None and "@" not in str(project_id or ""):
+        parsed_src = str(source_id).strip() or None
     f_br = from_branch or branch or "main"
     t_br = to_branch or branch or "main"
+    f_src = _ctx_source_arg(from_source_id or parsed_src)
+    t_src = _ctx_source_arg(to_source_id or parsed_src)
 
-    with tenant_context(target_proj, f_br):
+    with tenant_context(target_proj, f_br, source_id=f_src):
         from_meta = db.fetchone(
             "SELECT * FROM document_versions WHERE project_id=? AND branch=? AND doc_key=? AND version=?",
             (target_proj, f_br, doc_key, from_version),
@@ -1196,7 +1772,7 @@ def diff_document_versions(
             (target_proj, f_br, doc_key, from_version),
         )
 
-    with tenant_context(target_proj, t_br):
+    with tenant_context(target_proj, t_br, source_id=t_src):
         to_meta = db.fetchone(
             "SELECT * FROM document_versions WHERE project_id=? AND branch=? AND doc_key=? AND version=?",
             (target_proj, t_br, doc_key, to_version),

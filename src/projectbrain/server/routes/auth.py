@@ -187,7 +187,7 @@ def _intersect_scopes(scope_a: Optional[str], scope_b: Optional[str]) -> str:
 
 
 def is_project_allowed(project_id: Optional[str], allowed_projects_str: Optional[str]) -> bool:
-    """Check if project_id (or its base project before ':branch') is permitted."""
+    """Check if project_id (or its base project / project@source before ':branch') is permitted."""
     if not project_id:
         return True
     raw_allowed = (allowed_projects_str or "*").strip()
@@ -201,8 +201,13 @@ def is_project_allowed(project_id: Optional[str], allowed_projects_str: Optional
     if "*" in allowed_items:
         return True
     candidate = project_id.strip()
-    base_project = candidate.split(":", 1)[0].strip()
-    return candidate in allowed_items or base_project in allowed_items
+    project_and_source = candidate.split(":", 1)[0].strip()
+    base_project = project_and_source.split("@", 1)[0].strip()
+    return (
+        candidate in allowed_items
+        or project_and_source in allowed_items
+        or base_project in allowed_items
+    )
 
 
 def _client_ip(request: Optional[Request]) -> Optional[str]:

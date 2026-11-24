@@ -10,6 +10,7 @@ POST /sources/webhook/{source}
 from fastapi import APIRouter, Request, HTTPException, File, UploadFile, Form
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, ConfigDict
+import inspect
 import logging
 import os
 
@@ -45,6 +46,27 @@ def _get_store():
     return get_graph_store(db_path=db_path)
 
 
+def _filter_supported_kwargs(fn: Any, candidate_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Pass only keyword arguments accepted by `fn` (supports gradual Wave 1B rollout)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(candidate_kwargs)
+    return {k: v for k, v in candidate_kwargs.items() if k in params}
+
+
+def _effective_graph_project_id(
+    project_id: str, source_id: Optional[str], scope: str
+) -> str:
+    if source_id:
+        return f"{project_id}@{source_id}"
+    if scope == "project_shared":
+        return f"{project_id}@__shared__"
+    return project_id
+
+
 class PushDocumentRequest(BaseModel):
     project_id: str = "default"
     branch: str = "main"
@@ -54,6 +76,9 @@ class PushDocumentRequest(BaseModel):
     doc_version: Optional[str] = None
     base_version: Optional[str] = None
     base_branch: Optional[str] = None
+    source_id: Optional[str] = None
+    scope: str = "source"
+    doc_role: str = "general"
 
     model_config = ConfigDict(extra="allow")
 
@@ -80,6 +105,14 @@ async def push_processed(req: PushDocumentRequest):
         doc_version = doc.get("doc_version") or req.doc_version
         base_version = doc.get("base_version") or req.base_version
         base_branch = doc.get("base_branch") or req.base_branch
+        raw_source_id = doc.get("source_id") if doc.get("source_id") is not None else req.source_id
+        eff_source_id = (
+            raw_source_id.strip()
+            if isinstance(raw_source_id, str) and raw_source_id.strip()
+            else None
+        )
+        eff_scope = str(doc.get("scope") or req.scope or "source").strip() or "source"
+        eff_doc_role = str(doc.get("doc_role") or req.doc_role or "general").strip() or "general"
 
         # 1. Versioned ingestion into HSG memory (with unit reuse & superseding)
 
@@ -89,6 +122,14 @@ async def push_processed(req: PushDocumentRequest):
         elif not isinstance(doc_tags, list):
             doc_tags = ["document", file_type] if file_type else ["document"]
 
+        extra_ingest = _filter_supported_kwargs(
+            ingest_document_versioned,
+            {
+                "source_id": eff_source_id,
+                "scope": eff_scope,
+                "doc_role": eff_doc_role,
+            },
+        )
         ver_res = await ingest_document_versioned(
             filename=filename,
             markdown_content=markdown_content,
@@ -102,6 +143,7 @@ async def push_processed(req: PushDocumentRequest):
             doc_version=doc_version,
             base_version=base_version,
             base_branch=base_branch,
+            **extra_ingest,
         )
         memories_created = ver_res["memories_created"]
         effective_markdown = ver_res.get("markdown_content") or markdown_content
@@ -110,6 +152,9 @@ async def push_processed(req: PushDocumentRequest):
         from ...graphify_engine.models import GraphDelta
         from ...graphify_engine.extractor import GraphifyExtractor
 
+        effective_project_for_graph = _effective_graph_project_id(
+            project_id, eff_source_id, eff_scope
+        )
         if req.graph_delta and isinstance(req.graph_delta, dict):
             delta = GraphDelta(
                 project_id=project_id,
@@ -124,24 +169,29 @@ async def push_processed(req: PushDocumentRequest):
             )
         else:
             extractor = GraphifyExtractor()
+            doc_meta = {
+                "author": author,
+                "sha256": sha256,
+                "file_type": file_type,
+                "doc_key": ver_res["doc_key"],
+                "doc_version": ver_res["doc_version"],
+                "scope": eff_scope,
+                "doc_role": eff_doc_role,
+            }
+            if eff_source_id:
+                doc_meta["source_id"] = eff_source_id
             delta = extractor.extract_document_graph(
                 file_path=filename,
                 markdown_content=effective_markdown,
                 project_id=project_id,
                 branch=branch,
-                metadata={
-                    "author": author,
-                    "sha256": sha256,
-                    "file_type": file_type,
-                    "doc_key": ver_res["doc_key"],
-                    "doc_version": ver_res["doc_version"],
-                },
+                metadata=doc_meta,
             )
 
         store = _get_store()
         try:
             sync_res = store.sync_branch_delta(
-                project_id=project_id,
+                project_id=effective_project_for_graph,
                 branch_name=branch,
                 delta=delta,
                 partial=True,
@@ -159,6 +209,8 @@ async def push_processed(req: PushDocumentRequest):
             "status": "success",
             "project_id": project_id,
             "branch": branch,
+            "source_id": eff_source_id,
+            "scope": eff_scope,
             "schema_used": schema_used,
             "db_name": sync_res.get("db_name") or ver_res.get("db_name"),
             "doc_schema": ver_res.get("doc_schema"),
@@ -191,6 +243,9 @@ async def upload_document(
     doc_version: Optional[str] = Form(None),
     base_version: Optional[str] = Form(None),
     base_branch: Optional[str] = Form(None),
+    source_id: Optional[str] = Form(None),
+    scope: str = Form("source"),
+    doc_role: str = Form("general"),
     ocr_engine: Optional[str] = Form(None),
     ocr_device: Optional[str] = Form(None),
     local_ai_model: Optional[str] = Form(None),
@@ -199,6 +254,10 @@ async def upload_document(
 ):
     from pathlib import Path
     _check_read_only()
+
+    eff_source_id = source_id.strip() if source_id and source_id.strip() else None
+    eff_scope = (scope or "source").strip() or "source"
+    eff_doc_role = (doc_role or "general").strip() or "general"
 
     safe_name = Path(file.filename or "uploaded_file").name
     max_mb = float(os.getenv("PB_MAX_UPLOAD_MB", "50"))
@@ -256,6 +315,14 @@ async def upload_document(
             ocr_options["local_ai_url"] = eff_local_ai_url
 
         try:
+            extra_ingest = _filter_supported_kwargs(
+                ingest_document_versioned,
+                {
+                    "source_id": eff_source_id,
+                    "scope": eff_scope,
+                    "doc_role": eff_doc_role,
+                },
+            )
             with ocr_options_context(ocr_options or None):
                 ver_res = await ingest_document_versioned(
                     filename=filename,
@@ -268,6 +335,7 @@ async def upload_document(
                     doc_version=doc_version,
                     base_version=base_version,
                     base_branch=base_branch,
+                    **extra_ingest,
                 )
         except ValueError as ve:
             raise HTTPException(400, str(ve))
@@ -284,7 +352,11 @@ async def upload_document(
             "branch": branch,
             "doc_key": ver_res["doc_key"],
             "doc_version": ver_res["doc_version"],
+            "scope": eff_scope,
+            "doc_role": eff_doc_role,
         }
+        if eff_source_id:
+            meta["source_id"] = eff_source_id
         if author:
             meta["author"] = author
 
@@ -293,6 +365,9 @@ async def upload_document(
         edges_upserted = 0
         graphify_synced = False
         sync_res: Dict[str, Any] = {}
+        effective_project_for_graph = _effective_graph_project_id(
+            project_id, eff_source_id, eff_scope
+        )
         try:
             from ...graphify_engine.extractor import GraphifyExtractor
             extractor = GraphifyExtractor()
@@ -306,7 +381,7 @@ async def upload_document(
             store = _get_store()
             try:
                 sync_res = store.sync_branch_delta(
-                    project_id=project_id,
+                    project_id=effective_project_for_graph,
                     branch_name=branch,
                     delta=delta,
                     partial=True,
@@ -335,6 +410,8 @@ async def upload_document(
             "filename": filename,
             "project_id": project_id,
             "branch": branch,
+            "source_id": eff_source_id,
+            "scope": eff_scope,
             "schema_used": schema_used,
             "db_name": sync_res.get("db_name") or ver_res.get("db_name"),
             "doc_schema": doc_schema,
@@ -362,14 +439,31 @@ async def get_documents(
     project_id: str = "default",
     branch: Optional[str] = None,
     status: str = "active",
+    source_id: Optional[str] = None,
+    include_shared: bool = True,
 ):
     from ...graphify_engine.doc_versioning import list_documents
+    eff_source_id = source_id.strip() if source_id and source_id.strip() else None
     try:
-        docs = list_documents(project_id=project_id, branch=branch, status=status)
+        extra_list = _filter_supported_kwargs(
+            list_documents,
+            {
+                "source_id": eff_source_id,
+                "include_shared": include_shared,
+            },
+        )
+        docs = list_documents(
+            project_id=project_id,
+            branch=branch,
+            status=status,
+            **extra_list,
+        )
         return {
             "project_id": project_id,
             "branch": branch,
             "status": status,
+            "source_id": eff_source_id,
+            "include_shared": include_shared,
             "documents": docs,
         }
     except Exception as e:
